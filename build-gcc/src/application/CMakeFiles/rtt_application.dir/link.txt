@@ -1,2 +1,0 @@
-C:\msys64\ucrt64\bin\ar.exe qc librtt_application.a CMakeFiles/rtt_application.dir/src/feasibility_assessor.cpp.obj CMakeFiles/rtt_application.dir/src/realtime_transcriber.cpp.obj
-C:\msys64\ucrt64\bin\ranlib.exe librtt_application.a

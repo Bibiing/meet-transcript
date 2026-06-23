@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "realtime-transcriber-python"
+version = "0.1.0"
+description = "Realtime transcriber backend Python berbasis MVVM dengan pipeline Phase 3"
+requires-python = ">=3.13"
+dependencies = [
+  "cffi>=2.0.0",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["test"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["rttranscriber*"]

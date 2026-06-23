@@ -1,28 +1,52 @@
 # Realtime Transcriber
 
-Workspace ini mengikuti clean architecture untuk realtime transcriber lintas platform yang dijelaskan di `PLAN.md`. Fokus awalnya adalah membuat boundary yang bersih antara domain transcription, orchestration/use case, adapter platform audio, dan bootstrap app.
+Workspace ini mengikuti `PLAN.md` dengan backend Python penuh dan arsitektur `MVVM`. Jalur primary sekarang sudah mencakup Phase 1, Phase 2, dan Phase 3.
 
-## Struktur
+## Primary Workspace
 
-- `apps/cli`: entrypoint sederhana untuk wiring dependency dan smoke test pipeline
-- `src/domain`: entity, value object, dan port yang stabil terhadap perubahan framework
-- `src/application`: use case dan coordinator pipeline
-- `src/infrastructure`: adapter logging, transcript sink, stub engine, dan placeholder audio source
-- `src/infrastructure/platform`: target adapter konkret untuk Windows dan macOS
-- `tests`: smoke test level workspace
+- `rttranscriber/model`
+- `rttranscriber/services`
+- `rttranscriber/viewmodels`
+- `rttranscriber/views`
+- `run_realtime_transcriber.py`
+- `test`
+- `docs`
 
-## Build
+## Secondary Workspace
+
+- `run_audio_chunk_debug.py`
+- `rttranscriber/audio_chunk_debug_session.py`
+- `vendor/pysoundio`
+- `vendor/libsoundio`
+
+## Workflow
 
 ```powershell
-cmake -S . -B build
-cmake --build build
-ctest --test-dir build
+uv sync
+uv run pytest test -q
+uv run python run_realtime_transcriber.py
 ```
 
-`libsoundio` sekarang di-vendor pada `vendor/libsoundio` dan dibangun otomatis lewat CMake root.
+Jika cache `uv` ke profil user dibatasi:
+
+```powershell
+$env:UV_CACHE_DIR="$PWD/.uv-cache"
+uv sync
+uv run pytest test -q
+uv run python run_realtime_transcriber.py
+```
+
+## Dokumen
+
+- Arsitektur: `docs/architecture.md`
+- Phase 1: `docs/phase-1-feasibility.md`
+- Phase 2: `docs/phase-2-audio-pipeline.md`
+- Phase 3: `docs/phase-3-realtime-transcription.md`
+- Runbook: `docs/runbook-python-windows.md`
 
 ## Next Step
 
-- tambah adapter `libsoundio` di layer infrastructure/platform
-- tambah worker `whisper.cpp`
-- sambungkan VAD, sliding window chunker, dan transcript merger sebagai service application
+- tambah VAD
+- tambah transcript stabilization lintas overlap
+- tambah backpressure handling
+- tambah product layer di atas ViewModel

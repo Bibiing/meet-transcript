@@ -1,2 +1,0 @@
-C:\msys64\ucrt64\bin\ar.exe qc librtt_infrastructure.a CMakeFiles/rtt_infrastructure.dir/src/console_logger.cpp.obj CMakeFiles/rtt_infrastructure.dir/src/console_transcript_sink.cpp.obj CMakeFiles/rtt_infrastructure.dir/src/null_audio_source.cpp.obj CMakeFiles/rtt_infrastructure.dir/src/static_audio_backend_probe.cpp.obj CMakeFiles/rtt_infrastructure.dir/src/stub_transcript_engine.cpp.obj CMakeFiles/rtt_infrastructure.dir/src/system_platform_info_provider.cpp.obj
-C:\msys64\ucrt64\bin\ranlib.exe librtt_infrastructure.a

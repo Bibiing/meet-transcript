@@ -1,2 +1,0 @@
-C:\msys64\ucrt64\bin\ar.exe qc libsoundio.a CMakeFiles/libsoundio_static.dir/src/soundio.c.obj CMakeFiles/libsoundio_static.dir/src/util.c.obj CMakeFiles/libsoundio_static.dir/src/os.c.obj CMakeFiles/libsoundio_static.dir/src/dummy.c.obj CMakeFiles/libsoundio_static.dir/src/channel_layout.c.obj CMakeFiles/libsoundio_static.dir/src/ring_buffer.c.obj CMakeFiles/libsoundio_static.dir/src/wasapi.c.obj
-C:\msys64\ucrt64\bin\ranlib.exe libsoundio.a
