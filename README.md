@@ -1,6 +1,6 @@
 # Realtime Transcriber
 
-Workspace ini mengikuti `PLAN.md` dengan backend Python penuh dan arsitektur `MVVM`. Jalur primary sekarang sudah mencakup Phase 1, Phase 2, dan Phase 3.
+Workspace ini memakai backend Python penuh dengan arsitektur `MVVM`. Jalur primary saat ini sudah mencakup audio pipeline dan realtime transcription yang tervalidasi.
 
 ## Primary Workspace
 
@@ -10,7 +10,6 @@ Workspace ini mengikuti `PLAN.md` dengan backend Python penuh dan arsitektur `MV
 - `rttranscriber/views`
 - `run_realtime_transcriber.py`
 - `test`
-- `docs`
 
 ## Secondary Workspace
 
@@ -35,14 +34,6 @@ uv sync
 uv run pytest test -q
 uv run python run_realtime_transcriber.py
 ```
-
-## Dokumen
-
-- Arsitektur: `docs/architecture.md`
-- Phase 1: `docs/phase-1-feasibility.md`
-- Phase 2: `docs/phase-2-audio-pipeline.md`
-- Phase 3: `docs/phase-3-realtime-transcription.md`
-- Runbook: `docs/runbook-python-windows.md`
 
 ## Next Step
 
