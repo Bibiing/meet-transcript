@@ -1,0 +1,12 @@
+{
+	"InstallScripts" : 
+	[
+		"D:/PLN/build-gcc/cmake_install.cmake",
+		"D:/PLN/build-gcc/src/domain/cmake_install.cmake",
+		"D:/PLN/build-gcc/src/application/cmake_install.cmake",
+		"D:/PLN/build-gcc/src/infrastructure/cmake_install.cmake",
+		"D:/PLN/build-gcc/apps/cli/cmake_install.cmake",
+		"D:/PLN/build-gcc/tests/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

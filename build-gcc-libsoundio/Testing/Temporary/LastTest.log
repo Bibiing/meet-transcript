@@ -1,0 +1,51 @@
+Start testing: Jun 23 10:33 SE Asia Standard Time
+----------------------------------------------------------
+1/3 Testing: rtt_smoke_test
+1/3 Test: rtt_smoke_test
+Command: "D:/PLN/build-gcc-libsoundio/tests/rtt_smoke_test.exe"
+Directory: D:/PLN/build-gcc-libsoundio/tests
+"rtt_smoke_test" start time: Jun 23 10:33 SE Asia Standard Time
+Output:
+----------------------------------------------------------
+[info] starting realtime transcriber
+[partial] stub transcript chunk
+[info] stopping realtime transcriber
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"rtt_smoke_test" end time: Jun 23 10:33 SE Asia Standard Time
+"rtt_smoke_test" time elapsed: 00:00:00
+----------------------------------------------------------
+
+2/3 Testing: rtt_feasibility_test
+2/3 Test: rtt_feasibility_test
+Command: "D:/PLN/build-gcc-libsoundio/tests/rtt_feasibility_test.exe"
+Directory: D:/PLN/build-gcc-libsoundio/tests
+"rtt_feasibility_test" start time: Jun 23 10:33 SE Asia Standard Time
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"rtt_feasibility_test" end time: Jun 23 10:33 SE Asia Standard Time
+"rtt_feasibility_test" time elapsed: 00:00:00
+----------------------------------------------------------
+
+3/3 Testing: rtt_libsoundio_probe_test
+3/3 Test: rtt_libsoundio_probe_test
+Command: "D:/PLN/build-gcc-libsoundio/tests/rtt_libsoundio_probe_test.exe"
+Directory: D:/PLN/build-gcc-libsoundio/tests
+"rtt_libsoundio_probe_test" start time: Jun 23 10:33 SE Asia Standard Time
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.22 sec
+----------------------------------------------------------
+Test Passed.
+"rtt_libsoundio_probe_test" end time: Jun 23 10:33 SE Asia Standard Time
+"rtt_libsoundio_probe_test" time elapsed: 00:00:00
+----------------------------------------------------------
+
+End testing: Jun 23 10:33 SE Asia Standard Time

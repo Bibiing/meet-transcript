@@ -1,0 +1,36 @@
+Start testing: Jun 23 10:10 SE Asia Standard Time
+----------------------------------------------------------
+1/2 Testing: rtt_smoke_test
+1/2 Test: rtt_smoke_test
+Command: "D:/PLN/build-gcc/tests/rtt_smoke_test.exe"
+Directory: D:/PLN/build-gcc/tests
+"rtt_smoke_test" start time: Jun 23 10:10 SE Asia Standard Time
+Output:
+----------------------------------------------------------
+[info] starting realtime transcriber
+[partial] stub transcript chunk
+[info] stopping realtime transcriber
+<end of output>
+Test time =   0.26 sec
+----------------------------------------------------------
+Test Passed.
+"rtt_smoke_test" end time: Jun 23 10:10 SE Asia Standard Time
+"rtt_smoke_test" time elapsed: 00:00:00
+----------------------------------------------------------
+
+2/2 Testing: rtt_feasibility_test
+2/2 Test: rtt_feasibility_test
+Command: "D:/PLN/build-gcc/tests/rtt_feasibility_test.exe"
+Directory: D:/PLN/build-gcc/tests
+"rtt_feasibility_test" start time: Jun 23 10:10 SE Asia Standard Time
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.07 sec
+----------------------------------------------------------
+Test Passed.
+"rtt_feasibility_test" end time: Jun 23 10:10 SE Asia Standard Time
+"rtt_feasibility_test" time elapsed: 00:00:00
+----------------------------------------------------------
+
+End testing: Jun 23 10:10 SE Asia Standard Time

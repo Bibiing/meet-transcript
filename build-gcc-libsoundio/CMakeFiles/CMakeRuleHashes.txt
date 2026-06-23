@@ -1,0 +1,2 @@
+# Hashes of file build rules.
+fae662585e5489f71ff534eb02e732ac vendor/libsoundio/CMakeFiles/doc

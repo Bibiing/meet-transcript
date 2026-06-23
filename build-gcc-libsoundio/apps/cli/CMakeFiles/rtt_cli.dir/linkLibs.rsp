@@ -1,0 +1,1 @@
+ ../../src/application/librtt_application.a ../../src/infrastructure/librtt_infrastructure.a ../../src/application/librtt_application.a ../../vendor/libsoundio/libsoundio.a -lkernel32 -luser32 -lgdi32 -lwinspool -lshell32 -lole32 -loleaut32 -luuid -lcomdlg32 -ladvapi32 
