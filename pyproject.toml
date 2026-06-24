@@ -1,24 +1,20 @@
-[build-system]
-requires = ["setuptools>=69"]
-build-backend = "setuptools.build_meta"
-
 [project]
-name = "realtime-transcriber-python"
+name = "multi-transcriber"
 version = "0.1.0"
-description = "Realtime transcriber backend Python berbasis MVVM dengan pipeline Phase 3"
-requires-python = ">=3.13"
+description = "Multiplatform real-time meeting transcriber foundation."
+readme = "README.md"
+requires-python = ">=3.10"
 dependencies = [
-  "cffi>=2.0.0",
+    "numpy>=1.26",
+    "sounddevice>=0.4.6",
+    "pyobjc-framework-ScreenCaptureKit>=10.0; sys_platform == 'darwin'",
 ]
 
 [dependency-groups]
 dev = [
-  "pytest>=9.1.1",
+    "pytest>=8.0",
 ]
 
 [tool.pytest.ini_options]
-testpaths = ["test"]
-
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["rttranscriber*"]
+testpaths = ["tests"]
+pythonpath = ["."]

@@ -1,43 +1,40 @@
-# Realtime Transcriber
+# Multiplatform Real-Time Transcriber
 
-Workspace ini memakai backend Python penuh dengan arsitektur `MVVM`. Jalur primary saat ini sudah mencakup audio pipeline dan realtime transcription yang tervalidasi.
+Fondasi aplikasi transkripsi rapat real-time multiplatform berbasis Python.
+Fase 1 menyiapkan struktur project, manajemen dependensi, deteksi OS, dan
+entrypoint smoke-run. Belum ada audio capture sungguhan pada fase ini.
 
-## Primary Workspace
-
-- `rttranscriber/model`
-- `rttranscriber/services`
-- `rttranscriber/viewmodels`
-- `rttranscriber/views`
-- `run_realtime_transcriber.py`
-- `test`
-
-## Secondary Workspace
-
-- `run_audio_chunk_debug.py`
-- `rttranscriber/audio_chunk_debug_session.py`
-- `vendor/pysoundio`
-- `vendor/libsoundio`
-
-## Workflow
+## Setup
 
 ```powershell
 uv sync
-uv run pytest test -q
-uv run python run_realtime_transcriber.py
 ```
 
-Jika cache `uv` ke profil user dibatasi:
+## Run
 
 ```powershell
-$env:UV_CACHE_DIR="$PWD/.uv-cache"
-uv sync
-uv run pytest test -q
-uv run python run_realtime_transcriber.py
+uv run python -m src.main
 ```
 
-## Next Step
+Contoh output:
 
-- tambah VAD
-- tambah transcript stabilization lintas overlap
-- tambah backpressure handling
-- tambah product layer di atas ViewModel
+```text
+Detected OS: windows
+Audio backend: wasapi_loopback
+Phase 1 smoke run completed.
+```
+
+## Test
+
+```powershell
+uv run pytest -q
+```
+
+## Platform Backend
+
+| OS | Backend fase 1 |
+| --- | --- |
+| Windows | `wasapi_loopback` |
+| macOS | `screencapturekit` |
+| Linux | `sounddevice_input` |
+| Lainnya | `unsupported` |
