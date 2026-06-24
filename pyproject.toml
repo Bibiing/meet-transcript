@@ -8,6 +8,7 @@ dependencies = [
     "numpy>=1.26",
     "sounddevice>=0.4.6",
     "pyobjc-framework-ScreenCaptureKit>=10.0; sys_platform == 'darwin'",
+    "soundcard>=0.4.6",
 ]
 
 [dependency-groups]
@@ -16,5 +17,6 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
+addopts = "-p no:cacheprovider"
 testpaths = ["tests"]
 pythonpath = ["."]

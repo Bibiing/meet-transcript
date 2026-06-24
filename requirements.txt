@@ -1,4 +1,5 @@
 sounddevice
+soundcard
 numpy
 pytest
 pyobjc-framework-ScreenCaptureKit; sys_platform == "darwin"
