@@ -31,7 +31,8 @@ class WhisperLiveReplayConfig:
     use_wss: bool = False
     api_key: str | None = None
     ready_timeout: float = DEFAULT_READY_TIMEOUT_SECONDS
-    chunk_seconds: float = 2.5
+    chunk_seconds: float = 0.5
+    audio_format: Literal["float32", "int16", "uint8"] = "int16"
     realtime: bool = False
     profile: WhisperLiveProfile = field(default_factory=WhisperLiveProfile)
 
@@ -46,7 +47,12 @@ def replay_wav_to_whisperlive(config: WhisperLiveReplayConfig) -> WhisperLiveRep
     """Preprocess a WAV file and stream it as one source to WhisperLive."""
 
     frame = _read_wav_as_frame(config.wav_path, config.source)
-    preprocessor = AudioPreprocessor(PreprocessConfig(chunk_seconds=config.chunk_seconds))
+    preprocessor = AudioPreprocessor(
+        PreprocessConfig(
+            chunk_seconds=config.chunk_seconds,
+            min_chunk_seconds=config.chunk_seconds,
+        )
+    )
     chunks = preprocessor.preprocess_frames([frame])
     if not chunks:
         raise ValueError(f"no speech chunks produced from {config.wav_path}")
@@ -67,6 +73,7 @@ def replay_wav_to_whisperlive(config: WhisperLiveReplayConfig) -> WhisperLiveRep
         use_wss=config.use_wss,
         api_key=config.api_key,
         ready_timeout=config.ready_timeout,
+        audio_format=config.audio_format,
         profile=config.profile,
     )
     client = WhisperLiveStreamClient(config.source, connection, on_transcript=on_transcript)

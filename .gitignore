@@ -1,3 +1,4 @@
+.env
 .venv/
 .uv-cache/
 .pytest_cache/
@@ -12,8 +13,8 @@ build-gcc-libsoundio/
 build-pysoundio-libs/
 artifacts/
 tmp/
-PLAN.md
-docs/
+/PLAN.md
+WhisperLive/docs/
 vendor/whisper.cpp/build/
 vendor/whisper.cpp/models/ggml-*.bin
 run*.py

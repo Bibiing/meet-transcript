@@ -158,6 +158,7 @@ def test_live_session_returns_stats_and_calls_on_result(monkeypatch: pytest.Monk
     cfg = LiveSessionConfig(
         chunk_seconds=4.0,
         source="both",  # speaker will be skipped gracefully
+        max_chunks_processed=1,
         whisper_config=__import__("src.engine.whisper", fromlist=["WhisperConfig"]).WhisperConfig(
             model_name="tiny",
             fp16=False,

@@ -21,11 +21,11 @@ _log = logging.getLogger(__name__)
 DEFAULT_READY_TIMEOUT_SECONDS = 300.0
 
 DEFAULT_INITIAL_PROMPT = (
-    "Transkrip rapat Bahasa Indonesia. Gunakan ejaan baku Bahasa Indonesia "
-    "(EYD/PUEBI) hanya untuk kata yang terdengar jelas. Jangan menambah "
-    "informasi, jangan mengganti makna, dan jangan menebak kreatif saat audio "
-    "tidak jelas atau hening. Pertahankan istilah teknis, singkatan, nama "
-    "sistem, dan kata serapan yang umum apa adanya."
+    "Indonesian meeting transcript. Transcribe the audio in Indonesian; do not "
+    "translate to English. Use standard Indonesian spelling only when the words "
+    "are clearly audible. Do not add information, change meaning, or guess when "
+    "the audio is unclear or silent. Preserve technical terms, abbreviations, "
+    "system names, and common loanwords as spoken."
 )
 
 
@@ -49,16 +49,16 @@ class WhisperLiveProfile:
 
     language: str = "id"
     task: Literal["transcribe", "translate"] = "transcribe"
-    model: str = "large-v3-turbo"
-    use_vad: bool = True
+    model: str = "small"
+    use_vad: bool = False
     vad_threshold: float = 0.55
     vad_min_speech_duration_ms: int = 250
     vad_min_silence_duration_ms: int = 500
     vad_speech_pad_ms: int = 200
-    no_speech_thresh: float = 0.45
-    decode_no_speech_threshold: float = 0.6
-    log_prob_threshold: float = -0.8
-    compression_ratio_threshold: float = 2.2
+    no_speech_thresh: float = 0.75
+    decode_no_speech_threshold: float = 0.75
+    log_prob_threshold: float = -1.2
+    compression_ratio_threshold: float = 2.6
     condition_on_previous_text: bool = False
     repetition_penalty: float = 1.15
     no_repeat_ngram_size: int = 3
@@ -70,12 +70,15 @@ class WhisperLiveProfile:
     send_last_n_segments: int = 10
     word_timestamps: bool = True
     local_agreement: bool = True
-    local_agreement_window_seconds: float = 15.0
-    local_agreement_hop_seconds: float = 2.0
+    local_agreement_window_seconds: float = 20.0
+    local_agreement_hop_seconds: float = 3.0
     local_agreement_trailing_guard_seconds: float = 0.6
     local_agreement_retain_seconds: float = 1.0
     dynamic_prompt: bool = True
     dynamic_prompt_max_chars: int = 700
+    speech_boundary_detection: bool = True
+    speech_boundary_silence_seconds: float = 0.8
+    speech_boundary_max_wait_seconds: float = 5.0
     initial_prompt: str = DEFAULT_INITIAL_PROMPT
     hotwords: str = DEFAULT_HOTWORDS
 
@@ -95,7 +98,7 @@ class WhisperLiveConnectionConfig:
     use_wss: bool = False
     sample_rate: int = 16_000
     channels: int = 1
-    audio_format: Literal["float32", "int16", "uint8"] = "float32"
+    audio_format: Literal["float32", "int16", "uint8"] = "int16"
     connect_timeout: float = 10.0
     ready_timeout: float = DEFAULT_READY_TIMEOUT_SECONDS
     api_key: str | None = None
@@ -138,6 +141,7 @@ class WhisperLiveStreamClient:
         self._bytes_sent = 0
         self._messages_received = 0
         self._segments_received = 0
+        self._audio_finished = False
 
     @property
     def is_ready(self) -> bool:
@@ -212,8 +216,8 @@ class WhisperLiveStreamClient:
         samples = np.asarray(chunk.samples, dtype=np.float32)
         if samples.ndim != 1:
             raise ValueError("WhisperLive chunks must be mono 1D float32 samples")
-        samples = np.ascontiguousarray(np.clip(samples, -1.0, 1.0), dtype=np.float32)
-        payload = samples.tobytes()
+        samples = np.clip(samples, -1.0, 1.0)
+        payload = _encode_audio_payload(samples, self.config.audio_format)
         self._socket.send_binary(payload)
         self._chunks_sent += 1
         self._bytes_sent += len(payload)
@@ -227,18 +231,26 @@ class WhisperLiveStreamClient:
             len(payload),
         )
 
+    def finish_audio(self) -> None:
+        if self._socket is None or self._closed or self._audio_finished:
+            return
+        try:
+            self._socket.send_binary(self.END_OF_AUDIO)
+            self._audio_finished = True
+            self._emit_status("CLIENT_AUDIO_FINISHED", **self._diagnostics())
+        except Exception:
+            pass
+
     def close(self) -> None:
         was_closed = self._closed
-        self._closed = True
         self._stop_event.set()
         if not was_closed:
             self._emit_status("CLIENT_CLOSING", **self._diagnostics())
         socket = self._socket
         if socket is not None:
-            try:
-                socket.send_binary(self.END_OF_AUDIO)
-            except Exception:
-                pass
+            self.finish_audio()
+        self._closed = True
+        if socket is not None:
             try:
                 socket.close()
             except Exception:
@@ -280,6 +292,9 @@ class WhisperLiveStreamClient:
             "local_agreement_retain_seconds": profile.local_agreement_retain_seconds,
             "dynamic_prompt": profile.dynamic_prompt,
             "dynamic_prompt_max_chars": profile.dynamic_prompt_max_chars,
+            "speech_boundary_detection": profile.speech_boundary_detection,
+            "speech_boundary_silence_seconds": profile.speech_boundary_silence_seconds,
+            "speech_boundary_max_wait_seconds": profile.speech_boundary_max_wait_seconds,
             "initial_prompt": profile.initial_prompt,
             "hotwords": profile.hotwords,
             "source": self.source,
@@ -383,6 +398,18 @@ def _tag_segments(source: str, segments: list[dict[str, Any]]) -> list[dict[str,
         copied.setdefault("source", source)
         tagged.append(copied)
     return tagged
+
+
+def _encode_audio_payload(samples: np.ndarray, audio_format: Literal["float32", "int16", "uint8"]) -> bytes:
+    if audio_format == "float32":
+        return np.ascontiguousarray(samples, dtype=np.float32).tobytes()
+    if audio_format == "int16":
+        pcm16 = np.round(samples * 32767.0).astype(np.int16)
+        return np.ascontiguousarray(pcm16).tobytes()
+    if audio_format == "uint8":
+        pcm8 = np.round((samples + 1.0) * 127.5).astype(np.uint8)
+        return np.ascontiguousarray(pcm8).tobytes()
+    raise ValueError(f"unsupported WhisperLive audio format: {audio_format}")
 
 
 def _default_websocket_factory() -> WebSocketFactory:

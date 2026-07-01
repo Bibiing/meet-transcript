@@ -2,21 +2,18 @@ services:
   whisperlive:
     build:
       context: .
-      dockerfile: docker/Dockerfile.gpu
-    image: ${WHISPERLIVE_IMAGE:-pln-whisperlive:gpu}
+      dockerfile: docker/Dockerfile.cpu
+    image: ${WHISPERLIVE_CPU_IMAGE:-pln-whisperlive:cpu}
     ports:
       - "${WHISPERLIVE_WS_PORT:-9090}:9090"
     volumes:
       - whisperlive-cache:/models
     environment:
-      OMP_NUM_THREADS: "${WHISPERLIVE_OMP_NUM_THREADS:-1}"
-      NVIDIA_VISIBLE_DEVICES: all
-      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      OMP_NUM_THREADS: "${WHISPERLIVE_CPU_OMP_NUM_THREADS:-4}"
       WHISPERLIVE_INITIAL_PROMPT: "${WHISPERLIVE_INITIAL_PROMPT:-}"
       WHISPERLIVE_HOTWORDS: "${WHISPERLIVE_HOTWORDS:-}"
       WHISPERLIVE_FORCE_SERVER_PROMPT: "${WHISPERLIVE_FORCE_SERVER_PROMPT:-true}"
       WHISPERLIVE_DEFAULT_MODEL: "${WHISPERLIVE_DEFAULT_MODEL:-small}"
-    gpus: all
     command:
       - python
       - run_server.py
@@ -27,7 +24,7 @@ services:
       - --default_model
       - "${WHISPERLIVE_DEFAULT_MODEL:-small}"
       - --max_clients
-      - "${WHISPERLIVE_MAX_CLIENTS:-4}"
+      - "${WHISPERLIVE_CPU_MAX_CLIENTS:-2}"
       - --max_connection_time
       - "${WHISPERLIVE_MAX_CONNECTION_TIME:-600}"
       - --cache_path
