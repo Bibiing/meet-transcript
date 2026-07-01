@@ -1,7 +1,4 @@
-"""Shared audio frame model for capture modules."""
-
 from __future__ import annotations
-
 from dataclasses import dataclass
 from typing import Literal
 
@@ -10,17 +7,15 @@ import numpy as np
 
 AudioSource = Literal["mic", "speaker"]
 
-
 @dataclass(frozen=True, slots=True)
 class AudioFrame:
-    """A raw audio block captured from one source."""
-
+    """Block raw audio captured dari satu sumber."""
     source: AudioSource
-    samples: np.ndarray
-    sample_rate: int
-    channels: int
-    timestamp_seconds: float
-    status: str = ""
+    samples: np.ndarray         # data audio dalam bentuk np
+    sample_rate: int            # kecepatan hz per detik
+    channels: int               # jumlah saluran audio (1 mono, 2 stereo)
+    timestamp_seconds: float    # waktu dalam detik saat frame audio
+    status: str = ""            # status tambahan untuk frame audio 
 
     @property
     def frame_count(self) -> int:
@@ -34,10 +29,10 @@ class AudioFrame:
 
 
 def normalize_samples(samples: np.ndarray, channels: int) -> np.ndarray:
-    """Return samples as copied float32 array with shape (frames, channels)."""
+    """Mengembalikan sampel audio sebagai array float32 yang disalin dengan bentuk (frame, saluran)."""
 
-    audio = np.asarray(samples, dtype=np.float32)
-    if audio.ndim == 1:
+    audio = np.asarray(samples, dtype=np.float32) # convert ke float32
+    if audio.ndim == 1: 
         audio = audio.reshape(-1, 1)
     if audio.ndim != 2:
         raise ValueError("audio samples must be a 1D or 2D array")

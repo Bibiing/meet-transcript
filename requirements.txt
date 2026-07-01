@@ -1,5 +1,9 @@
 sounddevice
 soundcard
 numpy
+scipy
+openai-whisper
+numba>=0.62
+websocket-client
 pytest
 pyobjc-framework-ScreenCaptureKit; sys_platform == "darwin"
