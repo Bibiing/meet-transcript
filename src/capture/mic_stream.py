@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from typing import Any
 
 import sounddevice as sd
 
 from src.capture.queued_stream import QueuedAudioStream, StreamFactory
+
+_log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,12 +38,23 @@ class MicrophoneStream(QueuedAudioStream):
         default_device_info = sd.query_devices(kind='input')
         
         actual_sample_rate = self.config.sample_rate or int(default_device_info['default_samplerate'])
-        actual_channels = self.config.channels or int(default_device_info['max_input_channels'])
+        # RC#2: Force mono capture for mic -- mic should always be mono.
+        # Capturing multi-channel and then averaging in preprocessing wastes
+        # bandwidth; take mono directly from the device.
+        actual_channels = self.config.channels or 1
         
         stream_kwargs: dict[str, Any] = {
             "device": self.config.device,
             "latency": self.config.latency,
         }
+        _log.info(
+            "microphone device selected: name=%r device=%r channels=%s sample_rate=%s block_size=%s",
+            default_device_info.get("name", "default"),
+            self.config.device,
+            actual_channels,
+            actual_sample_rate,
+            self.config.block_size,
+        )
 
         super().__init__(
             source="mic",

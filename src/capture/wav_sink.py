@@ -1,4 +1,4 @@
-"""WAV writer utilities for phase 2 capture smoke tests."""
+"""WAV writer utilities for captured and processed audio."""
 
 from __future__ import annotations
 

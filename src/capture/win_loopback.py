@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 import platform
 from queue import Empty, Full, Queue
 from threading import Event, Thread
@@ -15,6 +16,8 @@ import sounddevice as sd
 
 from src.capture.audio_frame import AudioFrame, normalize_samples
 from src.capture.errors import CaptureNotSupportedError
+
+_log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +68,14 @@ class WindowsLoopbackStream:
         self._stop_event = Event()
         self._thread: Thread | None = None
         self._recorder: Any | None = None
+        self._first_rms_logged = False
+        _log.info(
+            "loopback device selected: index=%s name=%r channels=%s sample_rate=%s",
+            self.device.index,
+            self.device.name,
+            self.channels,
+            self.sample_rate,
+        )
 
         if self.sample_rate <= 0:
             raise ValueError("sample_rate must be positive")
@@ -165,6 +176,18 @@ class WindowsLoopbackStream:
             timestamp_seconds=perf_counter(),
         )
         self.frames_received += frame.frame_count
+
+        # RC#5: Log RMS of the first batch to confirm signal is present
+        if not self._first_rms_logged:
+            batch_rms = float(np.sqrt(np.mean(np.square(audio.astype(np.float32)))))
+            _log.info(
+                "loopback first-batch RMS=%.6f device=%r -- %s",
+                batch_rms,
+                self.device.name,
+                "signal detected" if batch_rms > 1e-6 else "WARNING: silent capture",
+            )
+            self._first_rms_logged = True
+
         self._put_latest(frame)
 
     def _put_latest(self, frame: AudioFrame) -> None:
@@ -197,7 +220,13 @@ def select_soundcard_loopback_device(
         for index, device in enumerate(microphones)
         if bool(getattr(device, "isloopback", False))
     ]
+
+    # RC#5: Log all available loopback devices for diagnostics
+    _log.info("available loopback devices (%d found):", len(loopbacks))
+    for idx, dev in loopbacks:
+        _log.info("  [%d] %s (channels=%s)", idx, getattr(dev, "name", "?"), getattr(dev, "channels", "?"))
     if not loopbacks:
+        _log.warning("no loopback recording device found -- speaker capture will be skipped")
         raise CaptureNotSupportedError("no Windows loopback recording device is available")
 
     if isinstance(preferred_device, int):

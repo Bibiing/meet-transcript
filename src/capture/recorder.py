@@ -1,12 +1,15 @@
-"""Manual phase 2 capture smoke recorder."""
+"""Phase 2 audio capture recorder."""
 
 from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import logging
 from pathlib import Path
 from time import monotonic, sleep
 from typing import Literal
+
+import numpy as np
 
 from src.capture.audio_frame import AudioFrame
 from src.capture.errors import CaptureError
@@ -15,6 +18,8 @@ from src.capture.mic_stream import MicrophoneConfig, MicrophoneStream
 from src.capture.wav_sink import write_frames_to_wav
 from src.capture.win_loopback import WindowsLoopbackConfig, WindowsLoopbackStream
 from src.utils.os_detector import OperatingSystem, detect_os
+
+_log = logging.getLogger(__name__)
 
 
 CaptureSource = Literal["mic", "speaker", "both"]
@@ -93,15 +98,6 @@ def run_phase2_capture(options: Phase2CaptureOptions) -> list[CaptureResult]:
     return results
 
 
-def run_phase2_smoke(output_dir: Path, seconds: float) -> tuple[list[Path], list[str]]:
-    """Backward-compatible wrapper for direct phase 2 smoke command."""
-
-    results = run_phase2_capture(Phase2CaptureOptions(seconds=seconds, output_dir=output_dir))
-    created = [result.path for result in results if result.path is not None]
-    warnings = [f"{result.source} capture failed: {result.warning}" for result in results if result.warning]
-    return created, warnings
-
-
 def _record_microphone(options: Phase2CaptureOptions) -> CaptureResult:
     try:
         stream = MicrophoneStream(
@@ -160,6 +156,32 @@ def _write_result(source: str, output_path: Path, frames: list[AudioFrame]) -> C
     sample_rate = frames[0].sample_rate
     channels = frames[0].channels
     duration_seconds = frame_count / sample_rate if sample_rate else 0.0
+
+    # RC#5: Zero-signal detection -- warn if captured audio is pure silence
+    all_samples = np.concatenate(
+        [frame.samples.flatten() for frame in frames if frame.frame_count > 0]
+    )
+    rms = float(np.sqrt(np.mean(np.square(all_samples.astype(np.float32))))) if all_samples.size else 0.0
+    if rms < 1e-8:
+        _log.warning(
+            "capture source=%s produced all-zeros audio (RMS=0) -- "
+            "loopback device may not be receiving any audio signal",
+            source,
+        )
+        return CaptureResult(
+            source=source,
+            path=path,
+            frame_count=frame_count,
+            duration_seconds=duration_seconds,
+            sample_rate=sample_rate,
+            channels=channels,
+            warning=(
+                f"captured audio is silent (RMS=0); "
+                f"check that audio is playing and the loopback device is active"
+            ),
+        )
+
+    _log.debug("capture source=%s rms=%.5f duration=%.2fs", source, rms, duration_seconds)
     return CaptureResult(
         source=source,
         path=path,
@@ -171,7 +193,7 @@ def _write_result(source: str, output_path: Path, frames: list[AudioFrame]) -> C
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Record phase 2 mic/speaker WAV smoke files.")
+    parser = argparse.ArgumentParser(description="Record phase 2 mic/speaker WAV files.")
     parser.add_argument("--seconds", type=float, default=3.0)
     parser.add_argument("--output-dir", type=Path, default=Path("audio"))
     parser.add_argument("--source", choices=("mic", "speaker", "both"), default="both")
