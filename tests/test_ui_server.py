@@ -14,6 +14,7 @@ def test_build_live_command_uses_python_module_and_transcript_log(tmp_path: Path
             port=9090,
             source="speaker",
             model="medium",
+            chunk_seconds=0.5,
             vad_threshold=0.5,
             no_speech_thresh=0.45,
             local_agreement=True,
@@ -32,11 +33,15 @@ def test_build_live_command_uses_python_module_and_transcript_log(tmp_path: Path
     assert "speaker" in command
     assert "--whisper-model" in command
     assert "medium" in command
+    assert "--live-chunk-seconds" in command
+    assert "0.5" in command
     assert "--transcript-log" in command
     assert str(transcript_log) in command
     assert "--hide-partials" in command
     assert "--local-agreement" in command
     assert "--dynamic-prompt" in command
+    assert "--speech-boundary-detection" in command
+    assert "--speech-boundary-silence-seconds" in command
     assert "--local-agreement-window-seconds" in command
 
 

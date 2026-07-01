@@ -22,12 +22,29 @@ from enum import Enum
 import numpy as np
 from whisper_live import metrics as wl_metrics
 from websockets.sync.server import serve
-from websockets.exceptions import ConnectionClosed
+from websockets.exceptions import ConnectionClosed, InvalidMessage
+from websockets.datastructures import Headers
+from websockets.http11 import Response
 from whisper_live.vad import VoiceActivityDetector
 from whisper_live.backend.base import ServeClientBase
 from whisper_live.defaults import DEFAULT_HOTWORDS, DEFAULT_INITIAL_PROMPT
 
 logging.basicConfig(level=logging.INFO)
+logging.getLogger("faster_whisper").setLevel(logging.WARNING)
+logging.getLogger("websockets.server").setLevel(logging.WARNING)
+
+
+class _InvalidHandshakeNoiseFilter(logging.Filter):
+    def filter(self, record):
+        if record.name != "websockets.server" or record.getMessage() != "opening handshake failed":
+            return True
+        exc = record.exc_info[1] if record.exc_info else None
+        if isinstance(exc, InvalidMessage) and "did not receive a valid HTTP request" in str(exc):
+            return False
+        return True
+
+
+logging.getLogger("websockets.server").addFilter(_InvalidHandshakeNoiseFilter())
 
 class ClientManager:
     def __init__(self, max_clients=4, max_connection_time=600):
@@ -182,6 +199,7 @@ class TranscriptionServer:
         self.segment_post_processor = None
         self.default_initial_prompt = DEFAULT_INITIAL_PROMPT
         self.default_hotwords = DEFAULT_HOTWORDS
+        self.default_model = "small"
         self.force_server_prompt = True
 
     def initialize_client(
@@ -319,6 +337,9 @@ class TranscriptionServer:
                     local_agreement_retain_seconds=options.get("local_agreement_retain_seconds", 1.0),
                     dynamic_prompt=options.get("dynamic_prompt", True),
                     dynamic_prompt_max_chars=options.get("dynamic_prompt_max_chars", 700),
+                    speech_boundary_detection=options.get("speech_boundary_detection", True),
+                    speech_boundary_silence_seconds=options.get("speech_boundary_silence_seconds", 0.8),
+                    speech_boundary_max_wait_seconds=options.get("speech_boundary_max_wait_seconds", 5.0),
                 )
 
                 logging.info("Running faster_whisper backend.")
@@ -407,6 +428,7 @@ class TranscriptionServer:
             logging.info("New client connected")
             options = websocket.recv()
             options = json.loads(options)
+            options["model"] = options.get("model") or self.default_model
 
             self.use_vad = options.get('use_vad')
             if self.client_manager.is_server_full(websocket, options):
@@ -440,6 +462,10 @@ class TranscriptionServer:
         if frame_np is False:
             if self.backend.is_tensorrt():
                 client.set_eos(True)
+            elif client is not None:
+                drain_seconds = max(2.0, float(getattr(client, "local_agreement_hop_seconds", 2.0)) + 1.5)
+                logging.info("End of audio received for %s; draining for %.1fs", client.client_uid, drain_seconds)
+                time.sleep(drain_seconds)
             return False
 
         if self.backend.is_tensorrt():
@@ -639,6 +665,7 @@ class TranscriptionServer:
             segment_post_processor=None,
             default_initial_prompt: Optional[str] = None,
             default_hotwords: Optional[str] = None,
+            default_model: str = "small",
             force_server_prompt: bool = True):
         """
         Run the transcription server.
@@ -665,6 +692,7 @@ class TranscriptionServer:
         self.raw_pcm_input = raw_pcm_input
         self.default_initial_prompt = default_initial_prompt or DEFAULT_INITIAL_PROMPT
         self.default_hotwords = default_hotwords or DEFAULT_HOTWORDS
+        self.default_model = default_model or "small"
         self.force_server_prompt = force_server_prompt
 
         if max_clients < 1:
@@ -710,6 +738,10 @@ class TranscriptionServer:
                 self.single_model = True
             else:
                 logging.info("Single model mode currently only works with custom models.")
+
+        if self.single_model and BackendType(backend).is_faster_whisper() and faster_whisper_custom_model_path is None:
+            from whisper_live.backend.faster_whisper_backend import ServeClientFasterWhisper
+            ServeClientFasterWhisper.preload_shared_model(self.default_model, cache_path=self.cache_path)
 
         # Start Prometheus metrics endpoint if port is specified
         if metrics_port > 0:
@@ -894,8 +926,13 @@ class TranscriptionServer:
 
         # Original WebSocket server (always supported)
         extra_ws_kwargs = {}
-        if api_key:
-            def _ws_auth(path, request_headers):
+
+        def _process_request(connection, request):
+            path = request.path
+            request_headers = request.headers
+            if path in {"/health", "/healthz"}:
+                return Response(200, "OK", Headers([("Content-Type", "text/plain")]), b"ok\n")
+            if api_key:
                 auth = request_headers.get("Authorization", "")
                 token_param = None
                 # Check query string for token parameter
@@ -905,8 +942,15 @@ class TranscriptionServer:
                     token_param = parse_qs(parsed.query).get("token", [None])[0]
                 if auth == f"Bearer {api_key}" or token_param == api_key:
                     return None  # Allow connection
-                return (401, [("Content-Type", "text/plain")], b"Unauthorized\n")
-            extra_ws_kwargs["process_request"] = _ws_auth
+                return Response(
+                    401,
+                    "Unauthorized",
+                    Headers([("Content-Type", "text/plain")]),
+                    b"Unauthorized\n",
+                )
+            return None
+
+        extra_ws_kwargs["process_request"] = _process_request
 
         with serve(
             functools.partial(

@@ -92,6 +92,59 @@ class TestAddFrames(unittest.TestCase):
         self.assertGreaterEqual(self.client.timestamp_offset, self.client.frames_offset)
 
 
+class TestSpeechBoundaryDetection(unittest.TestCase):
+    def test_waits_while_audio_is_still_arriving(self):
+        ws = MagicMock()
+        client = ConcreteServeClient(
+            client_uid="boundary",
+            websocket=ws,
+            local_agreement=True,
+            speech_boundary_detection=True,
+            speech_boundary_silence_seconds=0.8,
+            speech_boundary_max_wait_seconds=5.0,
+        )
+        now = 100.0
+        client.session_started_at = now - 1.0
+        client.last_audio_arrived_at = now - 0.2
+        client.last_transcription_at = now - 1.0
+
+        self.assertTrue(client.should_wait_for_speech_boundary(now))
+
+    def test_processes_after_silence_boundary(self):
+        ws = MagicMock()
+        client = ConcreteServeClient(
+            client_uid="boundary",
+            websocket=ws,
+            local_agreement=True,
+            speech_boundary_detection=True,
+            speech_boundary_silence_seconds=0.8,
+            speech_boundary_max_wait_seconds=5.0,
+        )
+        now = 100.0
+        client.session_started_at = now - 1.0
+        client.last_audio_arrived_at = now - 1.0
+        client.last_transcription_at = now - 1.0
+
+        self.assertFalse(client.should_wait_for_speech_boundary(now))
+
+    def test_processes_after_max_wait_even_without_silence(self):
+        ws = MagicMock()
+        client = ConcreteServeClient(
+            client_uid="boundary",
+            websocket=ws,
+            local_agreement=True,
+            speech_boundary_detection=True,
+            speech_boundary_silence_seconds=0.8,
+            speech_boundary_max_wait_seconds=5.0,
+        )
+        now = 100.0
+        client.session_started_at = now - 7.0
+        client.last_audio_arrived_at = now - 0.2
+        client.last_transcription_at = now - 6.0
+
+        self.assertFalse(client.should_wait_for_speech_boundary(now))
+
+
 class TestAddFramesThreadSafety(unittest.TestCase):
     def test_concurrent_add_frames(self):
         ws = MagicMock()

@@ -6,6 +6,7 @@ from whisper_live.postprocessing import (
     SegmentPostProcessorFactory,
     SegmentStabilizer,
     collapse_repeated_words,
+    evaluate_segment,
     is_degenerate_repetition,
 )
 
@@ -137,3 +138,57 @@ def test_send_transcription_sends_processed_segments():
     ws.send.assert_called_once()
     payload = json.loads(ws.send.call_args[0][0])
     assert payload["segments"][0]["text"] == "API API"
+    assert payload["segments"][0]["reliability_score"] >= 0.8
+
+
+def test_reliability_score_penalizes_low_asr_confidence():
+    evaluation = evaluate_segment(
+        {
+            "text": "hasil rapat masih dibahas",
+            "completed": True,
+            "avg_logprob": -1.8,
+            "no_speech_prob": 0.1,
+            "compression_ratio": 1.2,
+        },
+        "hasil rapat masih dibahas",
+    )
+
+    assert evaluation.score < 0.8
+    assert evaluation.action in {"review", "pending"}
+
+
+def test_pending_segment_emits_after_repeated_stable_context():
+    processor = SegmentStabilizer()
+    segment = {
+        "start": "0.000",
+        "end": "2.000",
+        "text": "hasil rapat masih dibahas",
+        "completed": True,
+        "avg_logprob": -1.8,
+        "no_speech_prob": 0.1,
+        "compression_ratio": 1.2,
+    }
+
+    first = processor(segment)
+    second = processor({**segment, "start": "0.500", "end": "2.500"})
+
+    assert first is None
+    assert second is not None
+    assert second["reliability_action"] == "emit"
+    assert second["reliability_score"] >= 0.8
+
+
+def test_very_low_reliability_remains_pending_even_when_repeated():
+    processor = SegmentStabilizer()
+    segment = {
+        "start": "0.000",
+        "end": "2.000",
+        "text": "suara hening tidak jelas",
+        "completed": True,
+        "avg_logprob": -1.8,
+        "no_speech_prob": 0.85,
+        "compression_ratio": 2.9,
+    }
+
+    assert processor(segment) is None
+    assert processor({**segment, "start": "0.500", "end": "2.500"}) is None

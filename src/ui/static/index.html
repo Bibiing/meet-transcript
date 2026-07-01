@@ -382,9 +382,9 @@
           <div class="field">
             <label for="model">Model</label>
             <select id="model">
-              <option value="large-v3-turbo">large-v3-turbo</option>
-              <option value="medium">medium</option>
               <option value="small">small</option>
+              <option value="medium">medium</option>
+              <option value="large-v3-turbo">large-v3-turbo</option>
               <option value="base">base</option>
             </select>
           </div>
@@ -396,7 +396,7 @@
           </div>
           <div class="field">
             <label for="noSpeech">No Speech Filter</label>
-            <input id="noSpeech" type="number" min="0.1" max="0.95" step="0.01" value="0.45" />
+            <input id="noSpeech" type="number" min="0.1" max="0.95" step="0.01" value="0.75" />
           </div>
         </div>
         <div class="inline">
@@ -406,24 +406,40 @@
           </div>
           <div class="field">
             <label for="finalDrain">Final Drain</label>
-            <input id="finalDrain" type="number" min="0" step="1" value="8" />
+            <input id="finalDrain" type="number" min="0" step="1" value="10" />
           </div>
         </div>
         <div class="inline">
           <div class="field">
             <label for="agreementWindow">Agreement Window</label>
-            <input id="agreementWindow" type="number" min="3" max="30" step="1" value="15" />
+            <input id="agreementWindow" type="number" min="3" max="60" step="1" value="20" />
           </div>
           <div class="field">
             <label for="agreementHop">Agreement Hop</label>
-            <input id="agreementHop" type="number" min="0.2" max="5" step="0.1" value="2" />
+            <input id="agreementHop" type="number" min="0.2" max="10" step="0.1" value="3" />
           </div>
         </div>
         <div class="inline">
           <div class="field">
+            <label for="chunkSeconds">Chunk Seconds</label>
+            <input id="chunkSeconds" type="number" min="0.1" max="5" step="0.1" value="0.5" />
+          </div>
+          <div class="field">
+            <label for="boundarySilence">Boundary Silence</label>
+            <input id="boundarySilence" type="number" min="0.1" max="3" step="0.1" value="0.8" />
+          </div>
+        </div>
+        <div class="inline">
+          <div class="field">
+            <label for="boundaryMaxWait">Boundary Max Wait</label>
+            <input id="boundaryMaxWait" type="number" min="1" max="15" step="0.5" value="5" />
+          </div>
+          <div class="field">
             <label for="language">Language</label>
             <input id="language" value="id" autocomplete="off" />
           </div>
+        </div>
+        <div class="inline">
           <div class="field">
             <label for="logLevel">Log Level</label>
             <select id="logLevel">
@@ -436,7 +452,9 @@
         </div>
         <label class="check-row"><input id="localAgreement" type="checkbox" checked /> Local agreement</label>
         <label class="check-row"><input id="dynamicPrompt" type="checkbox" checked /> Dynamic prompt</label>
+        <label class="check-row"><input id="speechBoundary" type="checkbox" checked /> Speech boundary detection</label>
         <label class="check-row"><input id="hidePartials" type="checkbox" checked /> Hide unstable partials</label>
+        <label class="check-row"><input id="debugChunkArchive" type="checkbox" /> Debug chunk archive</label>
         <label class="check-row"><input id="resetTranscript" type="checkbox" checked /> Archive old transcript on start</label>
         <div class="buttons">
           <button id="startBtn" class="primary">Start</button>
@@ -495,16 +513,21 @@
           source: $("source").value,
           model: $("model").value,
           language: $("language").value.trim() || "id",
+          chunkSeconds: Number($("chunkSeconds").value || 0.5),
           vadThreshold: Number($("vad").value || 0.55),
-          noSpeechThresh: Number($("noSpeech").value || 0.45),
+          noSpeechThresh: Number($("noSpeech").value || 0.75),
           readyTimeout: Number($("readyTimeout").value || 300),
-          finalDrainSeconds: Number($("finalDrain").value || 8),
+          finalDrainSeconds: Number($("finalDrain").value || 10),
           localAgreement: $("localAgreement").checked,
-          localAgreementWindowSeconds: Number($("agreementWindow").value || 15),
-          localAgreementHopSeconds: Number($("agreementHop").value || 2),
+          localAgreementWindowSeconds: Number($("agreementWindow").value || 20),
+          localAgreementHopSeconds: Number($("agreementHop").value || 3),
           dynamicPrompt: $("dynamicPrompt").checked,
+          speechBoundaryDetection: $("speechBoundary").checked,
+          speechBoundarySilenceSeconds: Number($("boundarySilence").value || 0.8),
+          speechBoundaryMaxWaitSeconds: Number($("boundaryMaxWait").value || 5),
           logLevel: $("logLevel").value,
           hidePartials: $("hidePartials").checked,
+          debugChunkArchive: $("debugChunkArchive").checked,
           resetTranscript: $("resetTranscript").checked
         };
       }

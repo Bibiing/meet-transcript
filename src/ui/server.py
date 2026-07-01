@@ -13,13 +13,12 @@ import os
 from pathlib import Path
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
 import time
 from typing import Any
-from urllib.error import URLError
-from urllib.request import urlopen
 
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
@@ -32,18 +31,22 @@ DEFAULT_LOG_FILE = ROOT_DIR / "logs" / "transcriber.log"
 class UiOptions:
     host: str = "localhost"
     port: int = 9090
-    metrics_port: int = 9091
     source: str = "both"
-    model: str = "large-v3-turbo"
+    model: str = "small"
     language: str = "id"
+    chunk_seconds: float = 0.5
     vad_threshold: float = 0.55
-    no_speech_thresh: float = 0.45
+    no_speech_thresh: float = 0.75
     ready_timeout: float = 300.0
-    final_drain_seconds: float = 8.0
+    final_drain_seconds: float = 10.0
     local_agreement: bool = True
-    local_agreement_window_seconds: float = 15.0
-    local_agreement_hop_seconds: float = 2.0
+    local_agreement_window_seconds: float = 20.0
+    local_agreement_hop_seconds: float = 3.0
     dynamic_prompt: bool = True
+    speech_boundary_detection: bool = True
+    speech_boundary_silence_seconds: float = 0.8
+    speech_boundary_max_wait_seconds: float = 5.0
+    debug_chunk_archive: bool = False
     log_level: str = "INFO"
     hide_partials: bool = True
     reset_transcript: bool = False
@@ -116,6 +119,8 @@ def build_live_command(options: UiOptions) -> list[str]:
         options.model,
         "--whisper-language",
         options.language,
+        "--live-chunk-seconds",
+        _num(options.chunk_seconds),
         "--vad-threshold",
         _num(options.vad_threshold),
         "--whisperlive-no-speech-thresh",
@@ -126,6 +131,10 @@ def build_live_command(options: UiOptions) -> list[str]:
         _num(options.local_agreement_window_seconds),
         "--local-agreement-hop-seconds",
         _num(options.local_agreement_hop_seconds),
+        "--speech-boundary-silence-seconds",
+        _num(options.speech_boundary_silence_seconds),
+        "--speech-boundary-max-wait-seconds",
+        _num(options.speech_boundary_max_wait_seconds),
         "--transcript-log",
         str(options.transcript_log),
         "--log-level",
@@ -137,6 +146,9 @@ def build_live_command(options: UiOptions) -> list[str]:
         command.append("--hide-partials")
     command.append("--local-agreement" if options.local_agreement else "--no-local-agreement")
     command.append("--dynamic-prompt" if options.dynamic_prompt else "--no-dynamic-prompt")
+    command.append("--speech-boundary-detection" if options.speech_boundary_detection else "--no-speech-boundary-detection")
+    if options.debug_chunk_archive:
+        command.append("--debug-chunk-archive")
     return command
 
 
@@ -250,14 +262,13 @@ def transcript_payload(path: Path = DEFAULT_TRANSCRIPT_LOG) -> dict[str, Any]:
     }
 
 
-def server_health(host: str = "localhost", metrics_port: int = 9091) -> dict[str, Any]:
-    url = f"http://{host}:{metrics_port}/metrics"
+def server_health(host: str = "localhost", port: int = 9090) -> dict[str, Any]:
+    address = f"{host}:{port}"
     try:
-        with urlopen(url, timeout=1.2) as response:
-            healthy = response.status == 200
-            return {"healthy": healthy, "url": url, "status": response.status, "error": None}
-    except (OSError, URLError) as exc:
-        return {"healthy": False, "url": url, "status": None, "error": str(exc)}
+        with socket.create_connection((host, port), timeout=1.2):
+            return {"healthy": True, "url": address, "status": "tcp_open", "error": None}
+    except OSError as exc:
+        return {"healthy": False, "url": address, "status": None, "error": str(exc)}
 
 
 class UiRequestHandler(SimpleHTTPRequestHandler):
@@ -331,18 +342,22 @@ def _parse_options(payload: dict[str, Any]) -> UiOptions:
     return UiOptions(
         host=str(payload.get("host") or "localhost"),
         port=_int(payload.get("port"), 9090),
-        metrics_port=_int(payload.get("metricsPort"), 9091),
         source=_choice(str(payload.get("source") or "both"), {"mic", "speaker", "both"}, "both"),
-        model=str(payload.get("model") or "large-v3-turbo"),
+        model=str(payload.get("model") or "small"),
         language=str(payload.get("language") or "id"),
+        chunk_seconds=_float(payload.get("chunkSeconds"), 0.5),
         vad_threshold=_float(payload.get("vadThreshold"), 0.55),
-        no_speech_thresh=_float(payload.get("noSpeechThresh"), 0.45),
+        no_speech_thresh=_float(payload.get("noSpeechThresh"), 0.75),
         ready_timeout=_float(payload.get("readyTimeout"), 300.0),
-        final_drain_seconds=_float(payload.get("finalDrainSeconds"), 8.0),
+        final_drain_seconds=_float(payload.get("finalDrainSeconds"), 10.0),
         local_agreement=bool(payload.get("localAgreement", True)),
-        local_agreement_window_seconds=_float(payload.get("localAgreementWindowSeconds"), 15.0),
-        local_agreement_hop_seconds=_float(payload.get("localAgreementHopSeconds"), 2.0),
+        local_agreement_window_seconds=_float(payload.get("localAgreementWindowSeconds"), 20.0),
+        local_agreement_hop_seconds=_float(payload.get("localAgreementHopSeconds"), 3.0),
         dynamic_prompt=bool(payload.get("dynamicPrompt", True)),
+        speech_boundary_detection=bool(payload.get("speechBoundaryDetection", True)),
+        speech_boundary_silence_seconds=_float(payload.get("speechBoundarySilenceSeconds"), 0.8),
+        speech_boundary_max_wait_seconds=_float(payload.get("speechBoundaryMaxWaitSeconds"), 5.0),
+        debug_chunk_archive=bool(payload.get("debugChunkArchive", False)),
         log_level=_choice(str(payload.get("logLevel") or "INFO").upper(), {"DEBUG", "INFO", "WARNING", "ERROR"}, "INFO"),
         hide_partials=bool(payload.get("hidePartials", True)),
         reset_transcript=bool(payload.get("resetTranscript", False)),

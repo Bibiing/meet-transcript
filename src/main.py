@@ -1,6 +1,5 @@
 from __future__ import annotations
 import argparse
-import os
 from pathlib import Path
 
 from src.capture.recorder import CaptureResult, Phase2CaptureOptions, run_phase2_capture
@@ -10,6 +9,7 @@ from src.engine.whisper import TranscriptionResult, WhisperConfig, transcribe_pr
 from src.engine.whisperlive_client import DEFAULT_HOTWORDS, DEFAULT_INITIAL_PROMPT, WhisperLiveProfile
 from src.engine.whisperlive_replay import WhisperLiveReplayConfig, replay_wav_to_whisperlive
 from src.engine.whisperlive_session import WhisperLiveSessionConfig, run_whisperlive_session
+from src.runtime.settings import env_bool, env_float, env_int, env_optional, env_str, load_env_file
 from src.utils.app_logging import configure_logging
 from src.utils.formatter import format_transcript_results
 from src.utils.transcript_log import TranscriptLog
@@ -20,8 +20,8 @@ DEFAULT_SERVER_READY_TIMEOUT = 300.0
 
 
 def main(argv: list[str] | None = None) -> int:
-    _load_env_file(Path(".env"))
-    env_model = _env_optional("WHISPERLIVE_MODEL")
+    load_env_file(Path(".env"))
+    env_model = env_optional("WHISPERLIVE_MODEL")
 
     parser = argparse.ArgumentParser(description="Multiplatform real-time transcriber")
     parser.add_argument("--record", action="store_true", help="record phase 2 mic/speaker WAV files")
@@ -32,27 +32,38 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--replay-source", choices=("mic", "speaker"), default="mic", help="source label used by --replay-file")
     parser.add_argument("--replay-realtime", action="store_true", help="send replay chunks with real-time pacing")
     parser.add_argument("--asr-backend", choices=("whisperlive", "local"), default="whisperlive", help="ASR backend for --live: WhisperLive server (default) or local OpenAI Whisper",)
-    parser.add_argument("--server-host", default=_env_str("WHISPERLIVE_HOST", "localhost"), help="WhisperLive server host for --live")
-    parser.add_argument("--server-port", type=int, default=_env_int("WHISPERLIVE_PORT", 9090), help="WhisperLive websocket port for --live")
+    parser.add_argument("--server-host", default=env_str("WHISPERLIVE_HOST", "localhost"), help="WhisperLive server host for --live")
+    parser.add_argument("--server-port", type=int, default=env_int("WHISPERLIVE_PORT", 9090), help="WhisperLive websocket port for --live")
     parser.add_argument("--server-wss", action="store_true", help="Use wss:// for WhisperLive websocket")
     parser.add_argument("--server-api-key", default=None, help="Optional WhisperLive API key")
     parser.add_argument(
         "--server-ready-timeout",
         type=float,
-        default=_env_float("WHISPERLIVE_READY_TIMEOUT", DEFAULT_SERVER_READY_TIMEOUT),
+        default=env_float("WHISPERLIVE_READY_TIMEOUT", DEFAULT_SERVER_READY_TIMEOUT),
         help="seconds to wait for WhisperLive SERVER_READY",
     )
     parser.add_argument(
         "--live-chunk-seconds",
         type=float,
-        default=_env_float("WHISPERLIVE_CLIENT_CHUNK_SECONDS", 1.0),
-        help="seconds of audio per client send in live mode (default: 1.0 with server local agreement)",
+        default=env_float("WHISPERLIVE_CLIENT_CHUNK_SECONDS", 0.5),
+        help="seconds of audio per client send in live mode",
     )
-    parser.add_argument("--final-drain-seconds", type=float, default=8.0, help="seconds to wait for final WhisperLive results after Ctrl+C")
+    parser.add_argument(
+        "--audio-format",
+        choices=("float32", "int16", "uint8"),
+        default=env_str("WHISPERLIVE_AUDIO_FORMAT", "int16"),
+        help="audio payload format sent to WhisperLive",
+    )
+    parser.add_argument(
+        "--final-drain-seconds",
+        type=float,
+        default=env_float("WHISPERLIVE_FINAL_DRAIN_SECONDS", 10.0),
+        help="seconds to wait for final WhisperLive results after Ctrl+C",
+    )
     parser.add_argument(
         "--hide-partials",
         action=argparse.BooleanOptionalAction,
-        default=_env_bool("WHISPERLIVE_HIDE_PARTIALS", True),
+        default=env_bool("WHISPERLIVE_HIDE_PARTIALS", True),
         help="hide unstable live partial transcript previews",
     )
     parser.add_argument("--seconds", type=float, default=3.0, help="recording duration for phase 2 batch mode")
@@ -65,7 +76,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--mic-channels", type=int, default=1, help="microphone channel count")
     parser.add_argument("--speaker-channels", type=int, default=None, help="speaker channel count")
     parser.add_argument("--whisper-model", default=None, help="Whisper model name")
-    parser.add_argument("--whisper-language", default=_env_str("WHISPERLIVE_LANGUAGE", "id"), help="language hint, for example id or en")
+    parser.add_argument("--whisper-language", default=env_str("WHISPERLIVE_LANGUAGE", "id"), help="language hint, for example id or en")
     parser.add_argument("--whisper-task", choices=("transcribe", "translate"), default="transcribe")
     parser.add_argument("--whisper-device", default=None, help="Whisper device override, for example cpu or cuda")
     parser.add_argument("--whisper-fp16", action=argparse.BooleanOptionalAction, default=None)
@@ -74,51 +85,87 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--whisper-min-logprob", type=float, default=-1.0)
     parser.add_argument("--whisper-max-no-speech", type=float, default=0.60)
     parser.add_argument("--whisper-max-compression", type=float, default=2.2)
-    parser.add_argument("--vad-threshold", type=float, default=_env_float("WHISPERLIVE_VAD_THRESHOLD", 0.55), help="WhisperLive server VAD threshold")
+    parser.add_argument("--vad-threshold", type=float, default=env_float("WHISPERLIVE_VAD_THRESHOLD", 0.55), help="WhisperLive server VAD threshold")
+    parser.add_argument(
+        "--server-vad",
+        action=argparse.BooleanOptionalAction,
+        default=env_bool("WHISPERLIVE_USE_VAD", False),
+        help="enable server-side Faster-Whisper VAD in addition to client preprocessing",
+    )
     parser.add_argument(
         "--whisperlive-no-speech-thresh",
         type=float,
-        default=_env_float("WHISPERLIVE_NO_SPEECH_THRESH", 0.45),
+        default=env_float("WHISPERLIVE_NO_SPEECH_THRESH", 0.75),
         help="WhisperLive segment no_speech_prob filter threshold",
     )
     parser.add_argument(
         "--local-agreement",
         action=argparse.BooleanOptionalAction,
-        default=_env_bool("WHISPERLIVE_LOCAL_AGREEMENT", True),
+        default=env_bool("WHISPERLIVE_LOCAL_AGREEMENT", True),
         help="finalize live captions only after consecutive sliding-window hypotheses agree",
     )
     parser.add_argument(
         "--local-agreement-window-seconds",
         type=float,
-        default=_env_float("WHISPERLIVE_LOCAL_AGREEMENT_WINDOW_SECONDS", 15.0),
+        default=env_float("WHISPERLIVE_LOCAL_AGREEMENT_WINDOW_SECONDS", 20.0),
         help="maximum server-side sliding window duration",
     )
     parser.add_argument(
         "--local-agreement-hop-seconds",
         type=float,
-        default=_env_float("WHISPERLIVE_LOCAL_AGREEMENT_HOP_SECONDS", 2.0),
+        default=env_float("WHISPERLIVE_LOCAL_AGREEMENT_HOP_SECONDS", 3.0),
         help="minimum interval between server-side sliding-window transcriptions",
+    )
+    parser.add_argument(
+        "--debug-chunk-archive",
+        action=argparse.BooleanOptionalAction,
+        default=env_bool("WHISPERLIVE_DEBUG_CHUNK_ARCHIVE", False),
+        help="write each live chunk to WAV files for debugging",
+    )
+    parser.add_argument(
+        "--chunk-archive-dir",
+        type=Path,
+        default=Path("audio") / "chunks",
+        help="directory used when --debug-chunk-archive is enabled",
     )
     parser.add_argument(
         "--dynamic-prompt",
         action=argparse.BooleanOptionalAction,
-        default=_env_bool("WHISPERLIVE_DYNAMIC_PROMPT", True),
+        default=env_bool("WHISPERLIVE_DYNAMIC_PROMPT", True),
         help="send confirmed transcript text back to Whisper as decode context",
     )
     parser.add_argument(
+        "--speech-boundary-detection",
+        action=argparse.BooleanOptionalAction,
+        default=env_bool("WHISPERLIVE_SPEECH_BOUNDARY_DETECTION", True),
+        help="delay ASR until recent speech appears to have ended, with a max-wait fallback",
+    )
+    parser.add_argument(
+        "--speech-boundary-silence-seconds",
+        type=float,
+        default=env_float("WHISPERLIVE_SPEECH_BOUNDARY_SILENCE_SECONDS", 0.8),
+        help="seconds without new speech chunks before ASR is triggered",
+    )
+    parser.add_argument(
+        "--speech-boundary-max-wait-seconds",
+        type=float,
+        default=env_float("WHISPERLIVE_SPEECH_BOUNDARY_MAX_WAIT_SECONDS", 5.0),
+        help="maximum seconds to wait before ASR runs during continuous speech",
+    )
+    parser.add_argument(
         "--initial-prompt",
-        default=_env_str("WHISPERLIVE_INITIAL_PROMPT", DEFAULT_INITIAL_PROMPT),
+        default=env_str("WHISPERLIVE_INITIAL_PROMPT", DEFAULT_INITIAL_PROMPT),
         help="WhisperLive initial prompt",
     )
     parser.add_argument(
         "--hotwords",
-        default=_env_str("WHISPERLIVE_HOTWORDS", DEFAULT_HOTWORDS),
+        default=env_str("WHISPERLIVE_HOTWORDS", DEFAULT_HOTWORDS),
         help="WhisperLive hotwords",
     )
     parser.add_argument("--transcript-output", type=Path, default=None, help="JSON output path for phase 4 transcription results",)
     parser.add_argument("--transcript-log", type=Path, default=None, help="realtime transcript backup path",)
     parser.add_argument("--resume-transcript-log", action="store_true", help="append to an existing transcript log")
-    parser.add_argument("--log-level", default=_env_str("LOG_LEVEL", "INFO"), help="DEBUG, INFO, WARNING, ERROR, or CRITICAL")
+    parser.add_argument("--log-level", default=env_str("LOG_LEVEL", "INFO"), help="DEBUG, INFO, WARNING, ERROR, or CRITICAL")
     parser.add_argument("--log-file", type=Path, default=Path("logs") / "transcriber.log")
     args = parser.parse_args(argv)
 
@@ -135,17 +182,21 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.replay_file is not None:
-        replay_model = args.whisper_model or env_model or "large-v3-turbo"
+        replay_model = args.whisper_model or env_model or "small"
         profile = WhisperLiveProfile(
             language=args.whisper_language,
             task=args.whisper_task,
             model=replay_model,
+            use_vad=args.server_vad,
             vad_threshold=args.vad_threshold,
             no_speech_thresh=args.whisperlive_no_speech_thresh,
             local_agreement=args.local_agreement,
             local_agreement_window_seconds=args.local_agreement_window_seconds,
             local_agreement_hop_seconds=args.local_agreement_hop_seconds,
             dynamic_prompt=args.dynamic_prompt,
+            speech_boundary_detection=args.speech_boundary_detection,
+            speech_boundary_silence_seconds=args.speech_boundary_silence_seconds,
+            speech_boundary_max_wait_seconds=args.speech_boundary_max_wait_seconds,
             initial_prompt=args.initial_prompt,
             hotwords=args.hotwords,
         )
@@ -159,6 +210,7 @@ def main(argv: list[str] | None = None) -> int:
                 api_key=args.server_api_key,
                 ready_timeout=args.server_ready_timeout,
                 chunk_seconds=args.live_chunk_seconds,
+                audio_format=args.audio_format,
                 realtime=args.replay_realtime,
                 profile=profile,
             )
@@ -172,19 +224,23 @@ def main(argv: list[str] | None = None) -> int:
     if args.live:
         transcript_log_path = args.transcript_log or (args.output_dir / "transcript_log.json")
         live_model = args.whisper_model or (
-            (env_model or "large-v3-turbo") if args.asr_backend == "whisperlive" else "small"
+            (env_model or "small") if args.asr_backend == "whisperlive" else "small"
         )
         if args.asr_backend == "whisperlive":
             profile = WhisperLiveProfile(
                 language=args.whisper_language,
                 task=args.whisper_task,
                 model=live_model,
+                use_vad=args.server_vad,
                 vad_threshold=args.vad_threshold,
                 no_speech_thresh=args.whisperlive_no_speech_thresh,
                 local_agreement=args.local_agreement,
                 local_agreement_window_seconds=args.local_agreement_window_seconds,
                 local_agreement_hop_seconds=args.local_agreement_hop_seconds,
                 dynamic_prompt=args.dynamic_prompt,
+                speech_boundary_detection=args.speech_boundary_detection,
+                speech_boundary_silence_seconds=args.speech_boundary_silence_seconds,
+                speech_boundary_max_wait_seconds=args.speech_boundary_max_wait_seconds,
                 initial_prompt=args.initial_prompt,
                 hotwords=args.hotwords,
             )
@@ -195,6 +251,7 @@ def main(argv: list[str] | None = None) -> int:
                 api_key=args.server_api_key,
                 ready_timeout=args.server_ready_timeout,
                 chunk_seconds=args.live_chunk_seconds,
+                audio_format=args.audio_format,
                 source=args.source,
                 sample_rate=args.sample_rate,
                 block_size=args.block_size,
@@ -202,6 +259,7 @@ def main(argv: list[str] | None = None) -> int:
                 final_drain_seconds=args.final_drain_seconds,
                 show_partials=not args.hide_partials,
                 transcript_log_path=transcript_log_path,
+                chunk_archive_dir=args.chunk_archive_dir if args.debug_chunk_archive else None,
                 profile=profile,
             )
             logger.info(
@@ -355,58 +413,6 @@ def main(argv: list[str] | None = None) -> int:
         transcribe_ok = bool(transcript_results)
 
     return 0 if capture_ok and preprocess_ok and transcribe_ok else 2
-
-
-def _load_env_file(path: Path) -> None:
-    """Load simple KEY=VALUE pairs from .env without overriding real env vars."""
-
-    if not path.exists():
-        return
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip().strip('"').strip("'")
-        if key:
-            os.environ.setdefault(key, value)
-
-
-def _env_optional(name: str) -> str | None:
-    value = os.getenv(name)
-    return value if value else None
-
-
-def _env_str(name: str, default: str) -> str:
-    return os.getenv(name) or default
-
-
-def _env_int(name: str, default: int) -> int:
-    value = os.getenv(name)
-    if not value:
-        return default
-    try:
-        return int(value)
-    except ValueError:
-        return default
-
-
-def _env_float(name: str, default: float) -> float:
-    value = os.getenv(name)
-    if not value:
-        return default
-    try:
-        return float(value)
-    except ValueError:
-        return default
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    value = os.getenv(name)
-    if value is None or value == "":
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _print_capture_results(results: list[CaptureResult]) -> None:

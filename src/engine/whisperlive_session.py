@@ -7,11 +7,14 @@ import queue
 import signal
 import threading
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from time import monotonic, perf_counter
 from typing import Callable, Literal
 
+from src.capture.audio_frame import AudioFrame
 from src.capture.errors import CaptureError, CaptureNotSupportedError
+from src.capture.wav_sink import write_frames_to_wav
 from src.capture.mac_sys_audio import MacSystemAudioConfig, MacSystemAudioStream
 from src.capture.mic_stream import MicrophoneConfig, MicrophoneStream
 from src.capture.win_loopback import WindowsLoopbackConfig, WindowsLoopbackStream
@@ -40,15 +43,17 @@ class WhisperLiveSessionConfig:
     use_wss: bool = False
     api_key: str | None = None
     ready_timeout: float = DEFAULT_READY_TIMEOUT_SECONDS
-    chunk_seconds: float = 2.5
+    chunk_seconds: float = 0.5
+    audio_format: Literal["float32", "int16", "uint8"] = "int16"
     source: Literal["mic", "speaker", "both"] = "both"
     sample_rate: int | None = None
     block_size: int = 1_024
     queue_size: int = 128
     max_chunk_queue_size: int = 32
-    final_drain_seconds: float = 8.0
+    final_drain_seconds: float = 10.0
     show_partials: bool = True
     transcript_log_path: Path | None = None
+    chunk_archive_dir: Path | None = None
     profile: WhisperLiveProfile = field(default_factory=WhisperLiveProfile)
 
 
@@ -88,6 +93,7 @@ def run_whisperlive_session(
     transcript_merger = TranscriptMerger()
     transcript_lock = threading.Lock()
     partial_preview = _PartialTranscriptPreview() if cfg.show_partials else None
+    chunk_archive = _ChunkArchive(cfg.chunk_archive_dir) if cfg.chunk_archive_dir is not None else None
 
     def handle_status(source: str, message: dict) -> None:
         status = str(message.get("status") or message.get("message") or "UNKNOWN")
@@ -191,6 +197,7 @@ def run_whisperlive_session(
         use_wss=cfg.use_wss,
         api_key=cfg.api_key,
         ready_timeout=cfg.ready_timeout,
+        audio_format=cfg.audio_format,
         profile=cfg.profile,
     )
 
@@ -259,6 +266,8 @@ def run_whisperlive_session(
                     stats.chunks_dropped += 1
                     continue
                 try:
+                    if chunk_archive is not None:
+                        chunk_archive.save(chunk)
                     client.send_chunk(chunk)
                     stats.chunks_sent += 1
                     _log.debug(
@@ -283,9 +292,11 @@ def run_whisperlive_session(
             if hasattr(signal, "SIGBREAK") and original_sigbreak is not None:
                 signal.signal(signal.SIGBREAK, original_sigbreak)
 
-            drained = _drain_pending_chunks(chunk_queue, clients, stats)
+            drained = _drain_pending_chunks(chunk_queue, clients, stats, chunk_archive)
             if drained:
                 print(f"Finalisasi: mengirim {drained} chunk tersisa...", flush=True)
+            for client in clients.values():
+                client.finish_audio()
             if cfg.final_drain_seconds > 0:
                 print(f"Finalisasi: menunggu hasil server {cfg.final_drain_seconds:g}s...", flush=True)
                 _wait_for_final_results(stats, cfg.final_drain_seconds)
@@ -306,6 +317,8 @@ def run_whisperlive_session(
             )
             if transcript_log is not None:
                 print(f"Transcript log: {cfg.transcript_log_path}")
+            if chunk_archive is not None:
+                print(f"Chunk archive: {chunk_archive.root}")
             print("=" * 60)
     finally:
         for client in clients.values():
@@ -322,9 +335,13 @@ def _build_capture_streams(
 ) -> tuple[list[object], list[threading.Thread]]:
     capture_streams: list[object] = []
     reader_threads: list[threading.Thread] = []
-    mic_preprocess_config = PreprocessConfig(chunk_seconds=cfg.chunk_seconds)
+    mic_preprocess_config = PreprocessConfig(
+        chunk_seconds=cfg.chunk_seconds,
+        min_chunk_seconds=cfg.chunk_seconds,
+    )
     speaker_preprocess_config = PreprocessConfig(
         chunk_seconds=cfg.chunk_seconds,
+        min_chunk_seconds=cfg.chunk_seconds,
         vad_rms_threshold=0.008,
         vad_peak_threshold=0.03,
         vad_speech_fraction=0.20,
@@ -433,6 +450,7 @@ def _drain_pending_chunks(
     chunk_queue: queue.Queue[PreprocessedAudioChunk],
     clients: dict[str, WhisperLiveStreamClient],
     stats: WhisperLiveSessionStats,
+    chunk_archive: "_ChunkArchive | None" = None,
 ) -> int:
     drained = 0
     while True:
@@ -446,6 +464,8 @@ def _drain_pending_chunks(
             stats.chunks_dropped += 1
             continue
         try:
+            if chunk_archive is not None:
+                chunk_archive.save(chunk)
             client.send_chunk(chunk)
             stats.chunks_sent += 1
             drained += 1
@@ -458,6 +478,28 @@ def _drain_pending_chunks(
         except Exception as exc:
             stats.chunks_dropped += 1
             _log.error("failed to send final %s chunk to WhisperLive: %s", chunk.source, exc)
+
+
+class _ChunkArchive:
+    def __init__(self, root_dir: Path) -> None:
+        session_id = datetime.now().strftime("%Y%m%d-%H%M%S")
+        self.root = root_dir / session_id
+        self._counters = {"mic": 0, "speaker": 0}
+        self._lock = threading.Lock()
+
+    def save(self, chunk: PreprocessedAudioChunk) -> Path:
+        with self._lock:
+            index = self._counters.get(chunk.source, 0) + 1
+            self._counters[chunk.source] = index
+        output_path = self.root / chunk.source / f"{index:06d}.wav"
+        frame = AudioFrame(
+            source=chunk.source,  # type: ignore[arg-type]
+            samples=chunk.samples.reshape(-1, 1),
+            sample_rate=chunk.sample_rate,
+            channels=1,
+            timestamp_seconds=chunk.start_seconds,
+        )
+        return write_frames_to_wav(output_path, [frame])
 
 
 def _wait_for_final_results(stats: WhisperLiveSessionStats, timeout_seconds: float) -> None:

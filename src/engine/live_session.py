@@ -67,6 +67,7 @@ class LiveSessionConfig:
     block_size: int = 1_024
     queue_size: int = 128
     max_chunk_queue_size: int = 16
+    max_chunks_processed: int | None = None
     transcript_log_path: Path | None = None
     whisper_config: WhisperConfig | None = None
 
@@ -290,6 +291,9 @@ def run_live_session(
                     result.source,
                     result.warning,
                 )
+
+            if cfg.max_chunks_processed is not None and stats.chunks_processed >= cfg.max_chunks_processed:
+                stop_event.set()
 
     finally:
         # ---------------------------------------------------------------- #

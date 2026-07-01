@@ -57,6 +57,9 @@ class ServeClientBase(object):
         local_agreement_retain_seconds=1.0,
         dynamic_prompt=True,
         dynamic_prompt_max_chars=700,
+        speech_boundary_detection=True,
+        speech_boundary_silence_seconds=0.8,
+        speech_boundary_max_wait_seconds=5.0,
     ):
         self.client_uid = client_uid
         self.websocket = websocket
@@ -85,6 +88,14 @@ class ServeClientBase(object):
         self.local_agreement_retain_seconds = max(0.0, float(local_agreement_retain_seconds))
         self.dynamic_prompt = dynamic_prompt
         self.dynamic_prompt_max_chars = max(0, int(dynamic_prompt_max_chars))
+        self.speech_boundary_detection = bool(speech_boundary_detection)
+        self.speech_boundary_silence_seconds = max(0.1, float(speech_boundary_silence_seconds))
+        self.speech_boundary_max_wait_seconds = max(
+            self.local_agreement_hop_seconds,
+            float(speech_boundary_max_wait_seconds),
+        )
+        self.session_started_at = time.time()
+        self.last_audio_arrived_at = self.session_started_at
         self.last_transcription_at = 0.0
         self.processing_offset = 0.0
         self.local_agreement_stabilizer = (
@@ -136,6 +147,9 @@ class ServeClientBase(object):
             if self.local_agreement:
                 now = time.time()
                 if now - self.last_transcription_at < self.local_agreement_hop_seconds:
+                    time.sleep(0.05)
+                    continue
+                if self.should_wait_for_speech_boundary(now):
                     time.sleep(0.05)
                     continue
                 self.last_transcription_at = now
@@ -237,7 +251,21 @@ class ServeClientBase(object):
             self.frames_np = frame_np.copy()
         else:
             self.frames_np = np.concatenate((self.frames_np, frame_np), axis=0)
+        self.last_audio_arrived_at = time.time()
         self.lock.release()
+
+    def should_wait_for_speech_boundary(self, now=None):
+        """Return True when local agreement should wait for end-of-speech."""
+        if not self.local_agreement or not self.speech_boundary_detection:
+            return False
+        now = time.time() if now is None else now
+        silence_elapsed = now - self.last_audio_arrived_at
+        last_processed_at = self.last_transcription_at or self.session_started_at
+        wait_elapsed = now - last_processed_at
+        return (
+            silence_elapsed < self.speech_boundary_silence_seconds
+            and wait_elapsed < self.speech_boundary_max_wait_seconds
+        )
 
     def clip_audio_if_no_valid_segment(self):
         """

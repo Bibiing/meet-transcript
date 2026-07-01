@@ -66,18 +66,24 @@ def test_whisperlive_client_sends_compatible_initial_options() -> None:
 
     assert options["uid"] == "mic-test"
     assert options["source"] == "mic"
-    assert options["model"] == "large-v3-turbo"
+    assert options["model"] == "small"
     assert options["language"] == "id"
-    assert options["audio_format"] == "float32"
+    assert options["audio_format"] == "int16"
+    assert options["use_vad"] is False
     assert options["vad_parameters"]["threshold"] == 0.55
-    assert options["no_speech_thresh"] == 0.45
-    assert options["no_speech_threshold"] == 0.6
+    assert options["no_speech_thresh"] == 0.75
+    assert options["no_speech_threshold"] == 0.75
+    assert options["log_prob_threshold"] == -1.2
     assert options["local_agreement"] is True
-    assert options["local_agreement_window_seconds"] == 15.0
-    assert options["local_agreement_hop_seconds"] == 2.0
+    assert options["local_agreement_window_seconds"] == 20.0
+    assert options["local_agreement_hop_seconds"] == 3.0
     assert options["dynamic_prompt"] is True
-    assert "EYD/PUEBI" in options["initial_prompt"]
-    assert "jangan menebak kreatif" in options["initial_prompt"].lower()
+    assert options["speech_boundary_detection"] is True
+    assert options["speech_boundary_silence_seconds"] == 0.8
+    assert options["speech_boundary_max_wait_seconds"] == 5.0
+    assert "Indonesian meeting transcript" in options["initial_prompt"]
+    assert "do not translate to English" in options["initial_prompt"]
+    assert "Do not add information" in options["initial_prompt"]
     assert "PLN" in options["hotwords"]
     assert "format" not in options
     assert fake.timeouts == [None]
@@ -89,12 +95,37 @@ def test_whisperlive_client_sends_compatible_initial_options() -> None:
     ]
 
 
-def test_whisperlive_client_sends_float32_pcm_chunk() -> None:
+def test_whisperlive_client_sends_int16_pcm_chunk_by_default() -> None:
     fake = FakeWebSocket()
 
     client = WhisperLiveStreamClient(
         "mic",
         WhisperLiveConnectionConfig(profile=WhisperLiveProfile()),
+        websocket_factory=lambda *args, **kwargs: fake,
+        uid="mic-test",
+    )
+    client.connect()
+    chunk = PreprocessedAudioChunk(
+        source="mic",
+        samples=np.array([0.0, 0.5, -0.5], dtype=np.float32),
+        sample_rate=16_000,
+        start_seconds=0.0,
+        duration_seconds=3 / 16_000,
+        rms_db=-12.0,
+    )
+
+    client.send_chunk(chunk)
+    client.close()
+
+    assert np.frombuffer(fake.sent_binary[0], dtype=np.int16).tolist() == [0, 16384, -16384]
+
+
+def test_whisperlive_client_can_send_float32_pcm_chunk() -> None:
+    fake = FakeWebSocket()
+
+    client = WhisperLiveStreamClient(
+        "mic",
+        WhisperLiveConnectionConfig(profile=WhisperLiveProfile(), audio_format="float32"),
         websocket_factory=lambda *args, **kwargs: fake,
         uid="mic-test",
     )

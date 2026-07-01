@@ -17,6 +17,38 @@ class ServeClientFasterWhisper(ServeClientBase):
     SINGLE_MODEL_LOCK = threading.Lock()
     BATCH_WORKER = None
 
+    @classmethod
+    def preload_shared_model(cls, model, cache_path="~/.cache/whisper-live/"):
+        """Load a stock/shared Faster-Whisper model before the first client connects."""
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        if device == "cuda":
+            major, _ = torch.cuda.get_device_capability(device)
+            compute_type = "float16" if major >= 7 else "float32"
+        else:
+            compute_type = "int8"
+
+        model_key = (model, device, compute_type)
+        with cls.SINGLE_MODEL_LOCK:
+            if cls.SINGLE_MODEL is not None and cls.SINGLE_MODEL_KEY == model_key:
+                logging.info("Shared faster_whisper model already loaded for key=%s", model_key)
+                return
+
+            loader = object.__new__(cls)
+            loader.cache_path = cache_path
+            loader.model_sizes = [
+                "tiny", "tiny.en", "base", "base.en", "small", "small.en",
+                "medium", "medium.en", "large-v2", "large-v3", "distil-small.en",
+                "distil-medium.en", "distil-large-v2", "distil-large-v3",
+                "large-v3-turbo", "turbo",
+            ]
+            loader.model_size_or_path = model
+            loader.compute_type = compute_type
+            logging.info("Preloading shared faster_whisper model for key=%s", model_key)
+            loader.create_model(device)
+            cls.SINGLE_MODEL = loader.transcriber
+            cls.SINGLE_MODEL_KEY = model_key
+
     def __init__(
         self,
         websocket,
@@ -24,7 +56,7 @@ class ServeClientFasterWhisper(ServeClientBase):
         device=None,
         language=None,
         client_uid=None,
-        model="small.en",
+        model="small",
         initial_prompt=None,
         vad_parameters=None,
         use_vad=True,
@@ -54,6 +86,9 @@ class ServeClientFasterWhisper(ServeClientBase):
         local_agreement_retain_seconds=1.0,
         dynamic_prompt=True,
         dynamic_prompt_max_chars=700,
+        speech_boundary_detection=True,
+        speech_boundary_silence_seconds=0.8,
+        speech_boundary_max_wait_seconds=5.0,
     ):
         """
         Initialize a ServeClient instance.
@@ -67,7 +102,7 @@ class ServeClientFasterWhisper(ServeClientBase):
             device (str, optional): The device type for Whisper, "cuda" or "cpu". Defaults to None.
             language (str, optional): The language for transcription. Defaults to None.
             client_uid (str, optional): A unique identifier for the client. Defaults to None.
-            model (str, optional): The whisper model size. Defaults to 'small.en'
+            model (str, optional): The whisper model size. Defaults to 'small'
             initial_prompt (str, optional): Prompt for whisper inference. Defaults to None.
             single_model (bool, optional): Whether to instantiate a new model for each client connection. Defaults to False.
             send_last_n_segments (int, optional): Number of most recent segments to send to the client. Defaults to 10.
@@ -93,6 +128,9 @@ class ServeClientFasterWhisper(ServeClientBase):
             local_agreement_retain_seconds,
             dynamic_prompt,
             dynamic_prompt_max_chars,
+            speech_boundary_detection,
+            speech_boundary_silence_seconds,
+            speech_boundary_max_wait_seconds,
         )
         self.cache_path = cache_path
         self.model_sizes = [
