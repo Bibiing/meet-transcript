@@ -9,7 +9,7 @@ services:
     volumes:
       - whisperlive-cache:/models
     environment:
-      OMP_NUM_THREADS: "${WHISPERLIVE_CPU_OMP_NUM_THREADS:-4}"
+      OMP_NUM_THREADS: "${WHISPERLIVE_OMP_NUM_THREADS:-4}"
       WHISPERLIVE_INITIAL_PROMPT: "${WHISPERLIVE_INITIAL_PROMPT:-}"
       WHISPERLIVE_HOTWORDS: "${WHISPERLIVE_HOTWORDS:-}"
       WHISPERLIVE_FORCE_SERVER_PROMPT: "${WHISPERLIVE_FORCE_SERVER_PROMPT:-true}"
@@ -24,7 +24,7 @@ services:
       - --default_model
       - "${WHISPERLIVE_DEFAULT_MODEL:-small}"
       - --max_clients
-      - "${WHISPERLIVE_CPU_MAX_CLIENTS:-2}"
+      - "${WHISPERLIVE_MAX_CLIENTS:-2}"
       - --max_connection_time
       - "${WHISPERLIVE_MAX_CONNECTION_TIME:-600}"
       - --cache_path
