@@ -1,0 +1,43 @@
+services:
+  whisperlive:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.gpu
+    image: ${WHISPERLIVE_IMAGE:-pln-whisperlive:gpu}
+    ports:
+      - "${WHISPERLIVE_WS_PORT:-9090}:9090"
+      - "${WHISPERLIVE_METRICS_PORT:-9091}:9091"
+    volumes:
+      - whisperlive-cache:/models
+    environment:
+      OMP_NUM_THREADS: "${WHISPERLIVE_OMP_NUM_THREADS:-1}"
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      WHISPERLIVE_INITIAL_PROMPT: "${WHISPERLIVE_INITIAL_PROMPT:-}"
+      WHISPERLIVE_HOTWORDS: "${WHISPERLIVE_HOTWORDS:-}"
+      WHISPERLIVE_FORCE_SERVER_PROMPT: "${WHISPERLIVE_FORCE_SERVER_PROMPT:-true}"
+    gpus: all
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9091/metrics', timeout=3).read(1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    command:
+      - python
+      - run_server.py
+      - --port
+      - "9090"
+      - --backend
+      - faster_whisper
+      - --max_clients
+      - "${WHISPERLIVE_MAX_CLIENTS:-4}"
+      - --max_connection_time
+      - "${WHISPERLIVE_MAX_CONNECTION_TIME:-600}"
+      - --cache_path
+      - /models
+      - --metrics_port
+      - "9091"
+
+volumes:
+  whisperlive-cache:
