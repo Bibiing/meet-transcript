@@ -17,4 +17,3 @@ tmp/
 WhisperLive/docs/
 vendor/whisper.cpp/build/
 vendor/whisper.cpp/models/ggml-*.bin
-run*.py
