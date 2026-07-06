@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from src.capture.recorder import CaptureResult
-from src.engine.preprocess_runtime import Phase3PreprocessResult
+from src.engine.preprocess_runtime import PreprocessResult
 from src.engine.whisper import TranscriptionResult
 from src.main import main
 
@@ -54,7 +54,7 @@ def test_main_preprocess_prints_phase3_results(monkeypatch, capsys) -> None:
         captured_args["input_dir"] = input_dir
         captured_args["output_dir"] = output_dir
         return [
-            Phase3PreprocessResult(
+            PreprocessResult(
                 source="mic",
                 input_path=Path("audio") / "mic.wav",
                 output_path=Path("audio") / "mic.preprocessed.wav",
@@ -77,7 +77,7 @@ def test_main_preprocess_prints_phase3_results(monkeypatch, capsys) -> None:
 def test_main_preprocess_prints_vad_drop_as_skip(monkeypatch, capsys) -> None:
     def fake_preprocess_audio_dir(input_dir, output_dir):
         return [
-            Phase3PreprocessResult(
+            PreprocessResult(
                 source="speaker",
                 input_path=Path("audio") / "speaker.wav",
                 output_path=None,

@@ -19,3 +19,4 @@ vendor/whisper.cpp/build/
 vendor/whisper.cpp/models/ggml-*.bin
 docs/
 config.toml
+draft/
