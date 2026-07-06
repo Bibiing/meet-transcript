@@ -1,4 +1,4 @@
-"""Queue-backed stream helper used by realtime capture callbacks."""
+"""Helper stream berbasis queue untuk callback capture realtime."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ Clock = Callable[[], float]
 
 
 class QueuedAudioStream:
-    """Wrap an audio callback stream and expose non-blocking frame reads."""
+    """Bungkus audio callback stream dan expose pembacaan frame non-blocking."""
 
     def __init__(
         self,
@@ -137,20 +137,7 @@ class QueuedAudioStream:
         self._put_latest(frame)
 
     def _put_latest(self, frame: AudioFrame) -> None:
-        try:
-            self._queue.put_nowait(frame)
-            return
-        except Full:
-            self.frames_dropped += frame.frame_count
-
-        try:
-            self._queue.get_nowait()
-        except Empty:
-            pass
-        try:
-            self._queue.put_nowait(frame)
-        except Full:
-            self.frames_dropped += frame.frame_count
+        self.frames_dropped += put_latest_frame(self._queue, frame)
 
 
 def _timestamp_from_time_info(time_info: Any, clock: Clock) -> float:
@@ -161,3 +148,29 @@ def _timestamp_from_time_info(time_info: Any, clock: Clock) -> float:
         except (TypeError, ValueError):
             pass
     return float(clock())
+
+
+def put_latest_frame(frame_queue: Queue[AudioFrame], frame: AudioFrame) -> int:
+    """Masukkan frame terbaru; jika queue penuh, buang frame terlama.
+
+    Return value adalah jumlah frame audio yang dianggap dropped. Helper ini
+    menjaga policy queue konsisten antara mic, speaker loopback, dan stream lain:
+    sistem lebih memilih audio terbaru daripada menahan data lama.
+    """
+
+    try:
+        frame_queue.put_nowait(frame)
+        return 0
+    except Full:
+        dropped = frame.frame_count
+
+    try:
+        frame_queue.get_nowait()
+    except Empty:
+        pass
+
+    try:
+        frame_queue.put_nowait(frame)
+    except Full:
+        dropped += frame.frame_count
+    return dropped

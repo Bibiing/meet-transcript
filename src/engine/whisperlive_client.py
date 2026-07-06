@@ -1,4 +1,9 @@
-"""WhisperLive WebSocket client primitives."""
+"""Primitive client WebSocket untuk komunikasi dengan server WhisperLive.
+
+Setiap source audio memakai satu koneksi sendiri. Kelas di modul ini mengurus
+handshake, pengiriman opsi model, encoding payload audio, penerimaan SERVER_READY,
+dan parsing segment transcript dari server.
+"""
 
 from __future__ import annotations
 
@@ -20,22 +25,10 @@ _log = logging.getLogger(__name__)
 
 DEFAULT_READY_TIMEOUT_SECONDS = 300.0
 
-DEFAULT_INITIAL_PROMPT = (
-    "Indonesian meeting transcript. Transcribe the audio in Indonesian; do not "
-    "translate to English. Use standard Indonesian spelling only when the words "
-    "are clearly audible. Do not add information, change meaning, or guess when "
-    "the audio is unclear or silent. Preserve technical terms, abbreviations, "
-    "system names, and common loanwords as spoken."
-)
+DEFAULT_INITIAL_PROMPT = ""
 
 
-DEFAULT_HOTWORDS = (
-    "API, database, deployment, endpoint, server, staging, production, "
-    "dashboard, authentication, authorization, billing, invoice, PLN, EYD, "
-    "PUEBI, meteran, token listrik, pelanggan, tagihan, daya, gardu, trafo, "
-    "integrasi, migrasi, aplikasi, layanan, user, admin, login, logout, "
-    "repository, branch, commit, Docker, GPU, CPU"
-)
+DEFAULT_HOTWORDS = ""
 
 
 TranscriptCallback = Callable[[str, list[dict[str, Any]], dict[str, Any]], None]
@@ -45,7 +38,7 @@ WebSocketFactory = Callable[..., Any]
 
 @dataclass(frozen=True, slots=True)
 class WhisperLiveProfile:
-    """ASR profile sent to WhisperLive when a stream connects."""
+    """Profil ASR yang dikirim ke WhisperLive saat stream tersambung."""
 
     language: str = "id"
     task: Literal["transcribe", "translate"] = "transcribe"
@@ -111,7 +104,7 @@ class WhisperLiveConnectionConfig:
 
 
 class WhisperLiveStreamClient:
-    """One WhisperLive WebSocket connection for one audio source."""
+    """Satu koneksi WebSocket WhisperLive untuk satu source audio."""
 
     END_OF_AUDIO = b"END_OF_AUDIO"
 
@@ -148,6 +141,7 @@ class WhisperLiveStreamClient:
         return self._ready_event.is_set()
 
     def connect(self) -> None:
+        """Buka WebSocket, kirim opsi, lalu tunggu SERVER_READY."""
         self._emit_status(
             "CLIENT_CONNECTING",
             url=self.config.url,
@@ -208,6 +202,7 @@ class WhisperLiveStreamClient:
             raise TimeoutError(f"WhisperLive stream '{self.source}' was not ready within {self.config.ready_timeout:g}s")
 
     def send_chunk(self, chunk: PreprocessedAudioChunk) -> None:
+        """Encode satu chunk audio 16 kHz mono dan kirim sebagai binary frame."""
         if self._socket is None or self._closed:
             raise RuntimeError(f"WhisperLive stream '{self.source}' is not connected")
         if chunk.sample_rate != self.config.sample_rate:
@@ -232,6 +227,7 @@ class WhisperLiveStreamClient:
         )
 
     def finish_audio(self) -> None:
+        """Kirim marker END_OF_AUDIO supaya server melakukan flush final."""
         if self._socket is None or self._closed or self._audio_finished:
             return
         try:
@@ -241,13 +237,13 @@ class WhisperLiveStreamClient:
         except Exception:
             pass
 
-    def close(self) -> None:
+    def close(self, *, send_end_of_audio: bool = True) -> None:
         was_closed = self._closed
         self._stop_event.set()
         if not was_closed:
             self._emit_status("CLIENT_CLOSING", **self._diagnostics())
         socket = self._socket
-        if socket is not None:
+        if socket is not None and send_end_of_audio:
             self.finish_audio()
         self._closed = True
         if socket is not None:
@@ -256,13 +252,14 @@ class WhisperLiveStreamClient:
             except Exception:
                 pass
         thread = self._recv_thread
-        if thread is not None and thread.is_alive():
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
             thread.join(timeout=2.0)
         self._socket = None
         if not was_closed:
             self._emit_status("CLIENT_CLOSED", **self._diagnostics())
 
     def _options(self) -> dict[str, Any]:
+        """Susun payload opsi yang menjadi kontrak handshake client-server."""
         profile = self.config.profile
         return {
             "uid": self.uid,
@@ -304,6 +301,7 @@ class WhisperLiveStreamClient:
         }
 
     def _recv_loop(self) -> None:
+        """Baca message server sampai koneksi ditutup atau stop diminta."""
         assert self._socket is not None
         while not self._stop_event.is_set():
             try:
@@ -401,6 +399,7 @@ def _tag_segments(source: str, segments: list[dict[str, Any]]) -> list[dict[str,
 
 
 def _encode_audio_payload(samples: np.ndarray, audio_format: Literal["float32", "int16", "uint8"]) -> bytes:
+    """Konversi float32 internal menjadi format audio yang diminta server."""
     if audio_format == "float32":
         return np.ascontiguousarray(samples, dtype=np.float32).tobytes()
     if audio_format == "int16":

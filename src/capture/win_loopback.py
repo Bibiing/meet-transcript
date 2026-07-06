@@ -1,11 +1,9 @@
-"""Windows system-audio capture via WASAPI loopback recorder."""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
 import platform
-from queue import Empty, Full, Queue
+from queue import Empty, Queue
 from threading import Event, Thread
 from time import perf_counter
 from typing import Any
@@ -16,10 +14,11 @@ import sounddevice as sd
 
 from src.capture.audio_frame import AudioFrame, normalize_samples
 from src.capture.errors import CaptureNotSupportedError
+from src.capture.queued_stream import put_latest_frame
 
 _log = logging.getLogger(__name__)
 
-
+# tipe data untuk device loopback WASAPI dan soundcard
 @dataclass(frozen=True, slots=True)
 class WasapiDevice:
     index: int
@@ -27,7 +26,7 @@ class WasapiDevice:
     sample_rate: int
     channels: int
 
-
+# Konfigurasi capture loopback speaker Windows
 @dataclass(frozen=True, slots=True)
 class WindowsLoopbackConfig:
     sample_rate: int | None = None
@@ -36,7 +35,7 @@ class WindowsLoopbackConfig:
     device: int | str | None = None
     queue_size: int = 64
 
-
+# Konfigurasi capture speaker macOS
 @dataclass(frozen=True, slots=True)
 class SoundcardLoopbackDevice:
     index: int
@@ -46,7 +45,7 @@ class SoundcardLoopbackDevice:
 
 
 class WindowsLoopbackStream:
-    """Capture speaker/system audio from a real WASAPI loopback microphone."""
+    """Capture speaker/system audio dari device loopback WASAPI."""
 
     def __init__(
         self,
@@ -91,21 +90,24 @@ class WindowsLoopbackStream:
         return self._thread is not None and self._thread.is_alive()
 
     def start(self) -> None:
-        system_name = self._system_name or platform.system()
+        system_name = self._system_name or platform.system() 
         if system_name != "Windows":
             raise CaptureNotSupportedError("WASAPI loopback capture is only supported on Windows")
         if self._thread is not None:
             return
 
         try:
+            # menggunakan soundcard untuk membuat recorder loopback WASAPI
             self._recorder = self.device.raw_device.recorder(
                 samplerate=self.sample_rate,
                 channels=self.channels,
                 blocksize=self.block_size,
             )
-            self._stop_event.clear()
-            self._thread = Thread(target=self._record_loop, name="windows-loopback-capture", daemon=True)
-            self._thread.start()
+
+            self._stop_event.clear() # stop event untuk menghentikan thread rekaman
+            self._thread = Thread(target=self._record_loop, name="windows-loopback-capture", daemon=True) # thread untuk merekam audio loopback
+            self._thread.start() # mulai thread rekaman
+
         except Exception as exc:
             self._thread = None
             self._recorder = None
@@ -115,16 +117,16 @@ class WindowsLoopbackStream:
             ) from exc
 
     def stop(self) -> None:
-        self._stop_event.set()
-        thread = self._thread
-        self._thread = None
-        if thread is not None:
+        self._stop_event.set()  # hentikan thread rekaman
+        thread = self._thread   # simpan referensi thread sebelum dihapus 
+        self._thread = None     # hapus referensi thread untuk menandai bahwa stream sudah berhenti
+        if thread is not None:  # tunggu thread rekaman berhenti dengan timeout 2 detik
             thread.join(timeout=2.0)
         self._recorder = None
 
     def read_frame(self, timeout: float | None = None) -> AudioFrame | None:
         try:
-            return self._queue.get(timeout=timeout)
+            return self._queue.get(timeout=timeout) # ambil frame audio dari queue dengan timeout
         except Empty:
             return None
 
@@ -165,6 +167,7 @@ class WindowsLoopbackStream:
             )
 
     def _push_samples(self, samples: Any) -> None:
+        """Normalisasi hasil recorder menjadi AudioFrame dan simpan ke queue."""
         audio = normalize_samples(samples, self.channels)
         if audio.shape[0] == 0:
             return
@@ -191,20 +194,7 @@ class WindowsLoopbackStream:
         self._put_latest(frame)
 
     def _put_latest(self, frame: AudioFrame) -> None:
-        try:
-            self._queue.put_nowait(frame)
-            return
-        except Full:
-            self.frames_dropped += frame.frame_count
-
-        try:
-            self._queue.get_nowait()
-        except Empty:
-            pass
-        try:
-            self._queue.put_nowait(frame)
-        except Full:
-            self.frames_dropped += frame.frame_count
+        self.frames_dropped += put_latest_frame(self._queue, frame)
 
 
 def select_soundcard_loopback_device(
@@ -212,16 +202,16 @@ def select_soundcard_loopback_device(
     *,
     soundcard_module: Any = sc,
 ) -> SoundcardLoopbackDevice:
-    """Select a soundcard loopback microphone for Windows speaker capture."""
-
-    microphones = list(soundcard_module.all_microphones(include_loopback=True))
+    microphones = list(soundcard_module.all_microphones(include_loopback=True)) # ambil semua device microphone termasuk loopback
+    
+    # filter device loopback dari daftar microphone
     loopbacks = [
         (index, device)
         for index, device in enumerate(microphones)
         if bool(getattr(device, "isloopback", False))
     ]
 
-    # RC#5: Log all available loopback devices for diagnostics
+    # Log semua device loopback yang tersedia
     _log.info("available loopback devices (%d found):", len(loopbacks))
     for idx, dev in loopbacks:
         _log.info("  [%d] %s (channels=%s)", idx, getattr(dev, "name", "?"), getattr(dev, "channels", "?"))
@@ -249,6 +239,17 @@ def select_soundcard_loopback_device(
 
     index, device = loopbacks[0]
     return _to_soundcard_loopback_device(index, device)
+
+
+def list_soundcard_loopback_devices(soundcard_module: Any = sc) -> list[SoundcardLoopbackDevice]:
+    """Daftar device loopback yang bisa dipilih user di UI."""
+
+    microphones = list(soundcard_module.all_microphones(include_loopback=True))
+    return [
+        _to_soundcard_loopback_device(index, device)
+        for index, device in enumerate(microphones)
+        if bool(getattr(device, "isloopback", False))
+    ]
 
 
 def _to_soundcard_loopback_device(index: int, device: Any) -> SoundcardLoopbackDevice:

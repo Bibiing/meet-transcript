@@ -8,12 +8,14 @@ services:
       - "${WHISPERLIVE_WS_PORT:-9090}:9090"
     volumes:
       - whisperlive-cache:/models
+      - ../logs/whisperlive:/app/logs
     environment:
       OMP_NUM_THREADS: "${WHISPERLIVE_OMP_NUM_THREADS:-4}"
       WHISPERLIVE_INITIAL_PROMPT: "${WHISPERLIVE_INITIAL_PROMPT:-}"
       WHISPERLIVE_HOTWORDS: "${WHISPERLIVE_HOTWORDS:-}"
       WHISPERLIVE_FORCE_SERVER_PROMPT: "${WHISPERLIVE_FORCE_SERVER_PROMPT:-true}"
       WHISPERLIVE_DEFAULT_MODEL: "${WHISPERLIVE_DEFAULT_MODEL:-small}"
+      WHISPERLIVE_PROCESS_LOG: "${WHISPERLIVE_PROCESS_LOG:-/app/logs/process.log}"
     command:
       - python
       - run_server.py

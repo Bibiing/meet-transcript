@@ -1,3 +1,10 @@
+"""Server WhisperLive yang menerima stream audio dan mengirim transcript.
+
+File ini adalah sisi server ASR. Tanggung jawab utamanya: menerima handshake
+WebSocket client, memilih backend model, membaca audio binary, menjalankan ASR,
+melakukan post-processing/local agreement, dan mengirim segment ke client.
+"""
+
 import os
 import time
 import threading
@@ -28,6 +35,7 @@ from websockets.http11 import Response
 from whisper_live.vad import VoiceActivityDetector
 from whisper_live.backend.base import ServeClientBase
 from whisper_live.defaults import DEFAULT_HOTWORDS, DEFAULT_INITIAL_PROMPT
+from whisper_live.process_logging import log_process_event
 
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("faster_whisper").setLevel(logging.WARNING)
@@ -35,6 +43,8 @@ logging.getLogger("websockets.server").setLevel(logging.WARNING)
 
 
 class _InvalidHandshakeNoiseFilter(logging.Filter):
+    """Filter noise health-check TCP yang bukan handshake WebSocket valid."""
+
     def filter(self, record):
         if record.name != "websockets.server" or record.getMessage() != "opening handshake failed":
             return True
@@ -47,6 +57,8 @@ class _InvalidHandshakeNoiseFilter(logging.Filter):
 logging.getLogger("websockets.server").addFilter(_InvalidHandshakeNoiseFilter())
 
 class ClientManager:
+    """Registry koneksi aktif beserta batas jumlah client dan durasi koneksi."""
+
     def __init__(self, max_clients=4, max_connection_time=600):
         """
         Initializes the ClientManager with specified limits on client connections and connection durations.
@@ -186,6 +198,8 @@ class BackendType(Enum):
 
 
 class TranscriptionServer:
+    """Koordinator server WebSocket/REST dan lifecycle client ASR."""
+
     RATE = 16000
 
     def __init__(self):
@@ -206,6 +220,7 @@ class TranscriptionServer:
         self, websocket, options, faster_whisper_custom_model_path,
         whisper_tensorrt_path, trt_multilingual, trt_py_session=False,
     ):
+        """Buat client backend ASR berdasarkan opsi handshake dari WebSocket."""
         client: Optional[ServeClientBase] = None
 
         # Check if client wants translation
@@ -296,6 +311,8 @@ class TranscriptionServer:
         try:
             if self.backend.is_faster_whisper():
                 from whisper_live.backend.faster_whisper_backend import ServeClientFasterWhisper
+                # Prompt/hotwords dikontrol server agar client tidak menyuntikkan
+                # prompt yang dapat bocor menjadi transcript.
                 # model is of the form namespace/repo_name and not a filesystem path
                 if faster_whisper_custom_model_path is not None:
                     logging.info(f"Using custom model {faster_whisper_custom_model_path}")
@@ -365,7 +382,10 @@ class TranscriptionServer:
         # Attach segment post-processor if configured
         if self.segment_post_processor is not None:
             if hasattr(self.segment_post_processor, "new_session"):
-                client.segment_post_processor = self.segment_post_processor.new_session()
+                try:
+                    client.segment_post_processor = self.segment_post_processor.new_session(client_uid=options["uid"])
+                except TypeError:
+                    client.segment_post_processor = self.segment_post_processor.new_session()
             else:
                 client.segment_post_processor = self.segment_post_processor
 
@@ -395,23 +415,25 @@ class TranscriptionServer:
             return None
 
     def _option_with_server_default(self, options, key, default_value):
+        """Ambil prompt/hotwords dari server kecuali policy mengizinkan client."""
         if self.force_server_prompt:
             return default_value
         value = options.get(key)
         return value if value else default_value
 
     def get_audio_from_websocket(self, websocket):
-        """
-        Receives audio buffer from websocket and creates a numpy array out of it.
+        """Terima audio binary dari WebSocket dan ubah menjadi float32 numpy.
 
-        Args:
-            websocket: The websocket to receive audio from.
-
-        Returns:
-            A numpy array containing the audio.
+        Marker END_OF_AUDIO mengembalikan False agar backend melakukan
+        drain/finalisasi, bukan langsung putus sebelum transcript final keluar.
         """
         frame_data = websocket.recv()
         if frame_data == b"END_OF_AUDIO":
+            client = self.client_manager.get_client(websocket) if self.client_manager is not None else None
+            log_process_event(
+                "server.end_of_audio_received",
+                uid=getattr(client, "client_uid", None),
+            )
             return False
         audio_format = self.audio_formats.get(websocket)
         if audio_format == "uint8":
@@ -424,8 +446,10 @@ class TranscriptionServer:
 
     def handle_new_connection(self, websocket, faster_whisper_custom_model_path,
                               whisper_tensorrt_path, trt_multilingual, trt_py_session=False):
+        """Handle handshake client baru, validasi opsi, lalu mulai session ASR."""
         try:
             logging.info("New client connected")
+            log_process_event("server.client_connected")
             options = websocket.recv()
             options = json.loads(options)
             options["model"] = options.get("model") or self.default_model
@@ -439,6 +463,20 @@ class TranscriptionServer:
             if audio_format not in {"float32", "int16", "uint8"}:
                 raise ValueError(f"Unsupported audio_format: {audio_format}")
             self.audio_formats[websocket] = audio_format
+            log_process_event(
+                "server.options_received",
+                uid=options.get("uid"),
+                model=options.get("model"),
+                language=options.get("language"),
+                task=options.get("task"),
+                audio_format=audio_format,
+                use_vad=self.use_vad,
+                local_agreement=options.get("local_agreement", False),
+                local_agreement_window_seconds=options.get("local_agreement_window_seconds", 15.0),
+                local_agreement_hop_seconds=options.get("local_agreement_hop_seconds", 2.0),
+                speech_boundary_detection=options.get("speech_boundary_detection", True),
+                source=options.get("source"),
+            )
 
             if self.backend.is_tensorrt():
                 self.vad_detector = VoiceActivityDetector(frame_rate=self.RATE)
@@ -464,9 +502,32 @@ class TranscriptionServer:
                 client.set_eos(True)
             elif client is not None:
                 drain_seconds = max(2.0, float(getattr(client, "local_agreement_hop_seconds", 2.0)) + 1.5)
-                logging.info("End of audio received for %s; draining for %.1fs", client.client_uid, drain_seconds)
-                time.sleep(drain_seconds)
+                logging.info("End of audio received for %s; final flush timeout %.1fs", client.client_uid, drain_seconds)
+                log_process_event(
+                    "server.end_of_audio_flush_start",
+                    uid=client.client_uid,
+                    timeout_seconds=round(drain_seconds, 3),
+                )
+                if hasattr(client, "request_final_flush"):
+                    client.request_final_flush()
+                    completed = client.final_flush_completed.wait(timeout=drain_seconds)
+                else:
+                    time.sleep(drain_seconds)
+                    completed = False
+                log_process_event(
+                    "server.end_of_audio_flush_complete",
+                    uid=client.client_uid,
+                    completed=completed,
+                    timeout_seconds=round(drain_seconds, 3),
+                )
             return False
+        log_process_event(
+            "server.audio_received",
+            uid=getattr(client, "client_uid", None),
+            samples=int(frame_np.shape[0]),
+            duration_seconds=round(frame_np.shape[0] / self.RATE, 3),
+            audio_format=self.audio_formats.get(websocket),
+        )
 
         if self.backend.is_tensorrt():
             voice_active = self.voice_activity(websocket, frame_np)
@@ -486,30 +547,7 @@ class TranscriptionServer:
                    whisper_tensorrt_path=None,
                    trt_multilingual=False,
                    trt_py_session=False):
-        """
-        Receive audio chunks from a client in an infinite loop.
-
-        Continuously receives audio frames from a connected client
-        over a WebSocket connection. It processes the audio frames using a
-        voice activity detection (VAD) model to determine if they contain speech
-        or not. If the audio frame contains speech, it is added to the client's
-        audio data for ASR.
-        If the maximum number of clients is reached, the method sends a
-        "WAIT" status to the client, indicating that they should wait
-        until a slot is available.
-        If a client's connection exceeds the maximum allowed time, it will
-        be disconnected, and the client's resources will be cleaned up.
-
-        Args:
-            websocket (WebSocket): The WebSocket connection for the client.
-            backend (str): The backend to run the server with.
-            faster_whisper_custom_model_path (str): path to custom faster whisper model.
-            whisper_tensorrt_path (str): Required for tensorrt backend.
-            trt_multilingual(bool): Only used for tensorrt, True if multilingual model.
-
-        Raises:
-            Exception: If there is an error during the audio frame processing.
-        """
+        """Loop utama WebSocket: handshake, terima audio, dan cleanup koneksi."""
         self.backend = backend
         if not self.handle_new_connection(websocket, faster_whisper_custom_model_path,
                                           whisper_tensorrt_path, trt_multilingual, trt_py_session=trt_py_session):
@@ -667,26 +705,11 @@ class TranscriptionServer:
             default_hotwords: Optional[str] = None,
             default_model: str = "small",
             force_server_prompt: bool = True):
-        """
-        Run the transcription server.
+        """Jalankan server transcription.
 
-        Args:
-            host (str): The host address to bind the server.
-            port (int): The port number to bind the server.
-            batch_enabled (bool): Enable cross-client GPU batch inference for
-                the faster_whisper backend. When enabled, ``single_model`` is
-                forced to True and a ``BatchInferenceWorker`` is started after
-                the first client connects. Defaults to False.
-            batch_max_size (int): Maximum number of requests per GPU batch.
-                Defaults to 8.
-            batch_window_ms (int): Maximum time in milliseconds to wait for
-                the batch to fill after the first request arrives. Defaults
-                to 50.
-            segment_post_processor (callable, optional): A callable that receives
-                a transcription segment dict and returns a modified segment dict.
-                Applied to every segment before sending to the client. Useful for
-                plugging in custom post-processing (e.g. formatting, redaction).
-                Defaults to None.
+        Jalur production project ini adalah WebSocket port 9090. REST API tetap
+        opsional. Jika single_model aktif, model default di-preload saat server
+        start agar client tidak menunggu load model ketika meeting mulai.
         """
         self.cache_path = cache_path
         self.raw_pcm_input = raw_pcm_input
@@ -740,6 +763,8 @@ class TranscriptionServer:
                 logging.info("Single model mode currently only works with custom models.")
 
         if self.single_model and BackendType(backend).is_faster_whisper() and faster_whisper_custom_model_path is None:
+            # Preload model kecil/default saat inisiasi server untuk mengurangi
+            # latency first-client.
             from whisper_live.backend.faster_whisper_backend import ServeClientFasterWhisper
             ServeClientFasterWhisper.preload_shared_model(self.default_model, cache_path=self.cache_path)
 
@@ -928,6 +953,8 @@ class TranscriptionServer:
         extra_ws_kwargs = {}
 
         def _process_request(connection, request):
+            # Health endpoint dibuat di port WebSocket agar Docker/VM probe tidak
+            # menimbulkan log "opening handshake failed".
             path = request.path
             request_headers = request.headers
             if path in {"/health", "/healthz"}:

@@ -9,6 +9,7 @@ import pytest
 from src.capture.errors import CaptureNotSupportedError
 from src.capture.mac_sys_audio import MacSystemAudioConfig, MacSystemAudioStream
 from src.capture.mic_stream import MicrophoneConfig, MicrophoneStream
+from src.capture.recorder import CaptureOptions, CaptureResult, run_capture
 from src.capture.wav_sink import write_frames_to_wav
 from src.capture.win_loopback import (
     list_wasapi_output_devices,
@@ -17,6 +18,7 @@ from src.capture.win_loopback import (
     WindowsLoopbackConfig,
     WindowsLoopbackStream,
 )
+from src.utils.os_detector import AudioBackend
 
 
 class FakeStream:
@@ -287,3 +289,24 @@ def test_write_frames_to_wav() -> None:
         assert wav_file.getnchannels() == 1
         assert wav_file.getframerate() == 8_000
         assert wav_file.getnframes() == 3
+
+
+def test_run_capture_passes_detected_backend_to_speaker_recorder(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured = {}
+
+    def fake_backend():
+        return AudioBackend.WASAPI_LOOPBACK
+
+    def fake_record_speaker(options, audio_backend):
+        captured["options"] = options
+        captured["audio_backend"] = audio_backend
+        return CaptureResult(source="speaker", warning="skipped")
+
+    monkeypatch.setattr("src.capture.recorder.get_audio_backend", fake_backend)
+    monkeypatch.setattr("src.capture.recorder._record_speaker", fake_record_speaker)
+
+    result = run_capture(CaptureOptions(source="speaker", seconds=0.1))
+
+    assert len(result) == 1
+    assert captured["audio_backend"] is AudioBackend.WASAPI_LOOPBACK
+    assert captured["options"].source == "speaker"

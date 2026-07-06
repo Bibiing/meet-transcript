@@ -1,4 +1,9 @@
-"""Small local web UI for controlling the live transcriber client."""
+"""Server web UI lokal untuk mengontrol client live transcriber.
+
+Server ini bukan server ASR. Ia hanya menyajikan HTML/JS lokal, endpoint status,
+daftar device audio, transcript log, dan menjalankan `python -m src.main --live`
+sebagai subprocess.
+"""
 
 from __future__ import annotations
 
@@ -20,6 +25,10 @@ import threading
 import time
 from typing import Any
 
+from src.capture.mic_stream import list_input_devices
+from src.capture.win_loopback import list_soundcard_loopback_devices
+from src.utils.logging import load_transcript_entries
+
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -29,16 +38,26 @@ DEFAULT_LOG_FILE = ROOT_DIR / "logs" / "transcriber.log"
 
 @dataclass(slots=True)
 class UiOptions:
+    """Opsi start live session yang diterima dari form web UI."""
+
     host: str = "localhost"
     port: int = 9090
     source: str = "both"
     model: str = "small"
     language: str = "id"
     chunk_seconds: float = 0.5
+    mic_device: int | str | None = None
+    speaker_device: int | str | None = None
+    mic_client_vad: bool = True
+    speaker_client_vad: bool = False
     vad_threshold: float = 0.55
     no_speech_thresh: float = 0.75
     ready_timeout: float = 300.0
     final_drain_seconds: float = 10.0
+    auto_reconnect: bool = True
+    reconnect_initial_backoff_seconds: float = 1.0
+    reconnect_max_backoff_seconds: float = 30.0
+    reconnect_buffer_seconds: float = 30.0
     local_agreement: bool = True
     local_agreement_window_seconds: float = 20.0
     local_agreement_hop_seconds: float = 3.0
@@ -55,6 +74,8 @@ class UiOptions:
 
 @dataclass
 class LiveProcessState:
+    """State proses client live yang sedang dijalankan oleh web UI."""
+
     process: subprocess.Popen[str] | None = None
     started_at: float | None = None
     command: list[str] = field(default_factory=list)
@@ -100,7 +121,7 @@ STATE = LiveProcessState()
 
 
 def build_live_command(options: UiOptions) -> list[str]:
-    """Build the argv used by the UI to start the CLI client."""
+    """Bangun argv yang dipakai UI untuk menjalankan CLI client."""
 
     command = [
         sys.executable,
@@ -121,12 +142,21 @@ def build_live_command(options: UiOptions) -> list[str]:
         options.language,
         "--live-chunk-seconds",
         _num(options.chunk_seconds),
+        "--mic-client-vad" if options.mic_client_vad else "--no-mic-client-vad",
+        "--speaker-client-vad" if options.speaker_client_vad else "--no-speaker-client-vad",
         "--vad-threshold",
         _num(options.vad_threshold),
         "--whisperlive-no-speech-thresh",
         _num(options.no_speech_thresh),
         "--final-drain-seconds",
         _num(options.final_drain_seconds),
+        "--auto-reconnect" if options.auto_reconnect else "--no-auto-reconnect",
+        "--reconnect-initial-backoff-seconds",
+        _num(options.reconnect_initial_backoff_seconds),
+        "--reconnect-max-backoff-seconds",
+        _num(options.reconnect_max_backoff_seconds),
+        "--reconnect-buffer-seconds",
+        _num(options.reconnect_buffer_seconds),
         "--local-agreement-window-seconds",
         _num(options.local_agreement_window_seconds),
         "--local-agreement-hop-seconds",
@@ -142,6 +172,10 @@ def build_live_command(options: UiOptions) -> list[str]:
         "--log-file",
         str(DEFAULT_LOG_FILE),
     ]
+    if options.mic_device is not None:
+        command.extend(["--mic-device", str(options.mic_device)])
+    if options.speaker_device is not None:
+        command.extend(["--speaker-device", str(options.speaker_device)])
     if options.hide_partials:
         command.append("--hide-partials")
     command.append("--local-agreement" if options.local_agreement else "--no-local-agreement")
@@ -153,6 +187,7 @@ def build_live_command(options: UiOptions) -> list[str]:
 
 
 def start_live(options: UiOptions) -> dict[str, Any]:
+    """Start subprocess client live dan mulai thread monitor stdout."""
     with STATE.lock:
         if STATE.process is not None and STATE.process.poll() is None:
             raise RuntimeError("live session is already running")
@@ -198,6 +233,7 @@ def start_live(options: UiOptions) -> dict[str, Any]:
 
 
 def stop_live(*, force: bool = False) -> dict[str, Any]:
+    """Stop client live secara graceful, atau terminate jika force=True."""
     with STATE.lock:
         process = STATE.process
         if process is None or process.poll() is not None:
@@ -238,11 +274,7 @@ def transcript_payload(path: Path = DEFAULT_TRANSCRIPT_LOG) -> dict[str, Any]:
     error = None
     if path.exists():
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(payload, list):
-                entries = [entry for entry in payload if isinstance(entry, dict)]
-            else:
-                error = "transcript file is not a JSON list"
+            entries = [entry for entry in load_transcript_entries(path) if isinstance(entry, dict)]
         except Exception as exc:
             error = str(exc)
 
@@ -271,7 +303,47 @@ def server_health(host: str = "localhost", port: int = 9090) -> dict[str, Any]:
         return {"healthy": False, "url": address, "status": None, "error": str(exc)}
 
 
+def audio_devices_payload() -> dict[str, Any]:
+    """Payload daftar mic/speaker untuk dropdown UI."""
+    result: dict[str, Any] = {"mic": [], "speaker": [], "errors": {}, "diagnostics": {}}
+    try:
+        raw_mic_devices = list_input_devices(include_system_aliases=True)
+        mic_devices = list_input_devices(concise=True)
+        result["diagnostics"]["raw_mic_count"] = len(raw_mic_devices)
+        result["diagnostics"]["mic_count"] = len(mic_devices)
+        result["mic"] = [
+            {
+                "id": str(device.get("index")),
+                "index": device.get("index"),
+                "name": str(device.get("name", f"device-{device.get('index')}")),
+                "label": str(device.get("label") or device.get("name", f"device-{device.get('index')}")),
+                "hostapi": str(device.get("hostapi_name", "")),
+                "is_default": bool(device.get("is_default", False)),
+                "channels": int(device.get("max_input_channels", 0)),
+                "sample_rate": int(float(device.get("default_samplerate", 0) or 0)),
+            }
+            for device in mic_devices
+        ]
+    except Exception as exc:
+        result["errors"]["mic"] = str(exc)
+    try:
+        result["speaker"] = [
+            {
+                "id": str(device.index),
+                "index": device.index,
+                "name": device.name,
+                "channels": device.channels,
+            }
+            for device in list_soundcard_loopback_devices()
+        ]
+    except Exception as exc:
+        result["errors"]["speaker"] = str(exc)
+    return result
+
+
 class UiRequestHandler(SimpleHTTPRequestHandler):
+    """HTTP handler kecil untuk static UI dan API kontrol client."""
+
     server_version = "PLNTranscriberUI/1.0"
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -293,6 +365,9 @@ class UiRequestHandler(SimpleHTTPRequestHandler):
             return
         if self.path == "/api/logs":
             self._json({"lines": STATE.logs(500)})
+            return
+        if self.path == "/api/audio-devices":
+            self._json(audio_devices_payload())
             return
         super().do_GET()
 
@@ -346,10 +421,18 @@ def _parse_options(payload: dict[str, Any]) -> UiOptions:
         model=str(payload.get("model") or "small"),
         language=str(payload.get("language") or "id"),
         chunk_seconds=_float(payload.get("chunkSeconds"), 0.5),
+        mic_device=_device_value(payload.get("micDevice")),
+        speaker_device=_device_value(payload.get("speakerDevice")),
+        mic_client_vad=bool(payload.get("micClientVad", True)),
+        speaker_client_vad=bool(payload.get("speakerClientVad", False)),
         vad_threshold=_float(payload.get("vadThreshold"), 0.55),
         no_speech_thresh=_float(payload.get("noSpeechThresh"), 0.75),
         ready_timeout=_float(payload.get("readyTimeout"), 300.0),
         final_drain_seconds=_float(payload.get("finalDrainSeconds"), 10.0),
+        auto_reconnect=bool(payload.get("autoReconnect", True)),
+        reconnect_initial_backoff_seconds=_float(payload.get("reconnectInitialBackoffSeconds"), 1.0),
+        reconnect_max_backoff_seconds=_float(payload.get("reconnectMaxBackoffSeconds"), 30.0),
+        reconnect_buffer_seconds=_float(payload.get("reconnectBufferSeconds"), 30.0),
         local_agreement=bool(payload.get("localAgreement", True)),
         local_agreement_window_seconds=_float(payload.get("localAgreementWindowSeconds"), 20.0),
         local_agreement_hop_seconds=_float(payload.get("localAgreementHopSeconds"), 3.0),
@@ -400,6 +483,18 @@ def _int(value: object, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _device_value(value: object) -> int | str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return text
 
 
 def _num(value: float) -> str:

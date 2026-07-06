@@ -12,6 +12,7 @@ from src.engine.whisperlive_client import (
     WhisperLiveStreamClient,
 )
 from src.engine.whisperlive_session import _events_from_segments, _results_from_segments
+from src.engine.whisperlive_session import _BufferedReconnectClient, ReconnectPolicy
 
 
 class FakeWebSocket:
@@ -37,6 +38,39 @@ class FakeWebSocket:
 
     def settimeout(self, timeout: float | None) -> None:
         self.timeouts.append(timeout)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class StableFakeWebSocket:
+    def __init__(self, *, fail_binary_once: bool = False) -> None:
+        self.fail_binary_once = fail_binary_once
+        self.sent_text: list[str] = []
+        self.sent_binary: list[bytes] = []
+        self.closed = False
+        self._ready_sent = False
+
+    def send(self, message: str) -> None:
+        self.sent_text.append(message)
+
+    def send_binary(self, message: bytes) -> None:
+        if self.fail_binary_once:
+            self.fail_binary_once = False
+            raise RuntimeError("simulated send failure")
+        self.sent_binary.append(message)
+
+    def recv(self) -> str:
+        if not self._ready_sent:
+            self._ready_sent = True
+            uid = json.loads(self.sent_text[0])["uid"]
+            return json.dumps({"uid": uid, "message": "SERVER_READY", "backend": "faster_whisper"})
+        while not self.closed:
+            time.sleep(0.01)
+        return ""
+
+    def settimeout(self, timeout: float | None) -> None:
+        return None
 
     def close(self) -> None:
         self.closed = True
@@ -81,10 +115,8 @@ def test_whisperlive_client_sends_compatible_initial_options() -> None:
     assert options["speech_boundary_detection"] is True
     assert options["speech_boundary_silence_seconds"] == 0.8
     assert options["speech_boundary_max_wait_seconds"] == 5.0
-    assert "Indonesian meeting transcript" in options["initial_prompt"]
-    assert "do not translate to English" in options["initial_prompt"]
-    assert "Do not add information" in options["initial_prompt"]
-    assert "PLN" in options["hotwords"]
+    assert options["initial_prompt"] == ""
+    assert options["hotwords"] == ""
     assert "format" not in options
     assert fake.timeouts == [None]
     assert [message["status"] for _, message in statuses[:4]] == [
@@ -196,3 +228,73 @@ def test_events_from_segments_preserves_completed_flag() -> None:
     assert len(events) == 1
     assert events[0].result.source == "mic"
     assert events[0].completed is False
+
+
+def test_buffered_reconnect_replays_local_audio_after_send_failure() -> None:
+    sockets = [
+        StableFakeWebSocket(fail_binary_once=True),
+        StableFakeWebSocket(),
+    ]
+    created: list[StableFakeWebSocket] = []
+
+    def factory(url, timeout, header):
+        socket = sockets.pop(0)
+        created.append(socket)
+        return socket
+
+    connection = WhisperLiveConnectionConfig(
+        profile=WhisperLiveProfile(),
+        ready_timeout=1.0,
+    )
+    wrapper = _BufferedReconnectClient(
+        "mic",
+        connection,
+        policy=ReconnectPolicy(enabled=True, initial_backoff_seconds=0.1, max_backoff_seconds=0.1, buffer_seconds=5.0),
+        on_transcript=lambda source, segments, message: None,
+        on_status=lambda source, message: None,
+    )
+    # Inject factory through the connection client constructor by patching module default in this narrow test.
+    import src.engine.whisperlive_session as session_module
+
+    original_client = session_module.WhisperLiveStreamClient
+
+    class FactoryClient(original_client):
+        def __init__(self, *args, **kwargs):
+            kwargs["websocket_factory"] = factory
+            super().__init__(*args, **kwargs)
+
+    session_module.WhisperLiveStreamClient = FactoryClient
+    try:
+        wrapper.connect_initial()
+        chunk1 = PreprocessedAudioChunk(
+            source="mic",
+            samples=np.array([0.1, 0.2], dtype=np.float32),
+            sample_rate=16_000,
+            start_seconds=0.0,
+            duration_seconds=0.5,
+            rms_db=-20.0,
+        )
+        chunk2 = PreprocessedAudioChunk(
+            source="mic",
+            samples=np.array([0.3, 0.4], dtype=np.float32),
+            sample_rate=16_000,
+            start_seconds=0.5,
+            duration_seconds=0.5,
+            rms_db=-20.0,
+        )
+
+        first = wrapper.send(chunk1)
+        assert first.buffered == 1
+        assert wrapper.buffered_count == 1
+
+        time.sleep(0.12)
+        second = wrapper.send(chunk2)
+
+        assert second.sent == 2
+        assert second.reconnect_successes == 1
+        assert wrapper.buffered_count == 0
+        assert len(created) == 2
+        assert len(created[1].sent_binary) == 2
+    finally:
+        wrapper.close(send_end_of_audio=False)
+        session_module.WhisperLiveStreamClient = original_client

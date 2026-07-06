@@ -270,7 +270,7 @@ Cek container CPU:
 
 ```bash
 docker compose -f WhisperLive/docker-compose.cpu.yml ps
-docker logs --tail 120 whisperlive-whisperlive-1
+docker logs --tail 120 whisperlive-whisperlive-1  
 ```
 
 Log normal CPU:
@@ -300,6 +300,69 @@ Loading model: small
 
 First preload bisa beberapa menit. Server benar-benar siap jika client sudah
 mendapat `SERVER_READY`.
+
+### Observability Process Log
+
+Client menulis process log terstruktur ke:
+
+```text
+logs/process.log
+```
+
+Server Docker menulis process log terstruktur ke volume host:
+
+```text
+logs/whisperlive/process.log
+```
+
+Gunakan file ini untuk investigasi kasus transcript loncat atau hasil tidak
+muncul. Event penting yang dicatat meliputi capture start, VAD pass/drop,
+chunk queued/sent, WebSocket ready, audio received, buffer size, boundary
+wait/process, ASR start/end, local agreement, TVE score/pending/drop/emit,
+dan send ke client.
+
+Live transcript JSON menyimpan dua tingkat hasil:
+
+- `stability=candidate`, `completed=false`: hipotesis live/review dari server.
+  Ini sengaja disimpan agar ucapan tidak hilang dan bisa dipakai final
+  post-processing/offline refinement.
+- `stability=stable`, `completed=true`: segment yang sudah completed melalui
+  Local Agreement atau final flush.
+
+Untuk speaker/system audio, default produksi adalah `--no-speaker-client-vad`
+karena volume loopback aplikasi sering rendah. Mic tetap memakai client VAD.
+
+Reconnect client aktif secara default untuk mode live. Jika WebSocket putus,
+client tidak langsung menghentikan capture; chunk audio per source ditahan di
+ring buffer RAM sampai `--reconnect-buffer-seconds` lalu client mencoba reconnect
+dengan exponential backoff (`--reconnect-initial-backoff-seconds` sampai
+`--reconnect-max-backoff-seconds`). Setelah tersambung lagi, buffer dikirim ulang
+secara FIFO sebelum chunk baru dilanjutkan. Event yang perlu dipantau:
+`client.chunk_buffered`, `client.reconnect_status`, dan
+`client.reconnect_buffer_flushed`.
+
+```bash
+tail -f logs/whisperlive/process.log
+```
+
+Untuk device headset/laptop, client mendukung pemilihan input dan output:
+
+```bash
+uv run python -m src.main --live --mic-device "Headset" --speaker-device "Headset"
+```
+
+`--mic-device` memilih input microphone, sedangkan `--speaker-device` memilih
+speaker/output loopback yang sedang dipakai meeting. Web UI dan desktop UI
+menampilkan daftar mic yang sudah difilter dari alias Windows seperti Sound
+Mapper, Primary Sound Capture Driver, Stereo Mix, PC Speaker, dan duplikasi host
+API. Endpoint speaker tetap berada di dropdown loopback tersendiri.
+
+Jika log menunjukkan `client.vad_drop` berulang pada mic, jalankan diagnosis
+dengan:
+
+```bash
+uv run python -m src.main --live --no-mic-client-vad
+```
 
 ### Firewall VM
 

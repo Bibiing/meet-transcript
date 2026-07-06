@@ -1,4 +1,9 @@
-"""Segment post-processing for live ASR hardening."""
+"""Post-processing segment untuk memperkuat kualitas live ASR.
+
+Layer ini memperlakukan output Whisper sebagai hipotesis, bukan kebenaran final.
+Setiap segment dinormalisasi, dicek halusinasi/repetisi, diberi reliability
+score, lalu diputuskan: emit, review, pending, atau drop.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +11,8 @@ import re
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
+
+from whisper_live.process_logging import log_process_event, preview_text
 
 
 _WORD_RE = re.compile(r"\b[\w']+\b", re.UNICODE)
@@ -29,9 +36,20 @@ MEDIA_HALLUCINATION_PHRASES = {
     "pertahankan istilah teknis",
     "transkrip meeting bahasa indonesia",
     "technical terms api database deployment",
+    "jangan menambah informasi",
+    "jangan mengganti makna",
+    "jangan menebak kreatif",
+    "audio tidak jelas",
+    "pertahankan istilah teknis",
+    "preserve technical terms",
+    "do not add information",
+    "do not change meaning",
+    "do not guess",
 }
 
 SHORT_SILENCE_PHRASES = {
+    "terima",
+    "kasih",
     "thank you",
     "thanks",
     "terima kasih",
@@ -40,7 +58,7 @@ SHORT_SILENCE_PHRASES = {
 
 @dataclass(frozen=True, slots=True)
 class SegmentFilterConfig:
-    """Tunable server-side anti-hallucination policy."""
+    """Konfigurasi kebijakan anti-halusinasi di sisi server."""
 
     max_consecutive_word_repeats: int = 2
     repeated_text_window: int = 8
@@ -54,24 +72,32 @@ class SegmentFilterConfig:
     pending_window: int = 12
     pending_repeat_boost: float = 0.18
     max_pending_age: int = 4
+    short_phrase_min_duration_seconds: float = 2.0
+    short_phrase_max_no_speech_prob: float = 0.35
+    short_phrase_min_avg_logprob: float = -0.80
 
 
 @dataclass
 class SegmentPostProcessorFactory:
-    """Factory that gives every client session its own filter state."""
+    """Factory agar setiap sesi client punya state filter sendiri."""
 
     config: SegmentFilterConfig = field(default_factory=SegmentFilterConfig)
 
-    def new_session(self) -> "SegmentStabilizer":
-        return SegmentStabilizer(self.config)
+    def new_session(self, client_uid: str | None = None) -> "SegmentStabilizer":
+        return SegmentStabilizer(self.config, client_uid=client_uid)
 
 
 class SegmentStabilizer:
-    """Validate, score, hold, and normalize WhisperLive segment hypotheses."""
+    """Validasi, scoring, pending, dan normalisasi hipotesis segment."""
 
-    def __init__(self, config: SegmentFilterConfig | None = None) -> None:
+    def __init__(self, config: SegmentFilterConfig | None = None, *, client_uid: str | None = None) -> None:
         self.config = config or SegmentFilterConfig()
-        self._recent_texts: deque[str] = deque(maxlen=self.config.repeated_text_window)
+        self.client_uid = client_uid
+        self._recent_segment_keys: deque[str] = deque(maxlen=self.config.repeated_text_window)
+        # Segment yang sudah pernah lolos review dicatat sebagai konteks. Jika
+        # muncul lagi pada window berikutnya, stability/context score dapat naik
+        # menjadi emit.
+        self._reviewed_texts: deque[str] = deque(maxlen=self.config.pending_window)
         self._pending: deque[dict[str, Any]] = deque(maxlen=self.config.pending_window)
         self.filtered_count = 0
         self.pending_count = 0
@@ -79,40 +105,54 @@ class SegmentStabilizer:
         self._turn = 0
 
     def __call__(self, segment: dict[str, Any]) -> dict[str, Any] | None:
+        """Proses satu segment; return None berarti segment ditahan/dibuang."""
         self._turn += 1
         self._expire_pending()
 
         text = normalize_text(str(segment.get("text", "")))
         if not text:
             self.filtered_count += 1
+            self._log_drop(segment, "empty_text")
             return None
 
         lowered = text.lower()
+        phrase_key = short_phrase_key(lowered)
         completed = bool(segment.get("completed", False))
 
         if is_media_hallucination(lowered):
             self.filtered_count += 1
+            self._log_drop(segment, "media_hallucination", text)
             return None
 
-        if self._should_drop_repeated_short_phrase(lowered, completed):
+        if self._should_drop_repeated_short_phrase(phrase_key, completed):
             self.filtered_count += 1
+            self._log_drop(segment, "repeated_short_phrase", text)
             return None
 
         collapsed = collapse_repeated_words(text, self.config.max_consecutive_word_repeats)
         collapsed = collapse_repeated_sentences(collapsed)
         if is_degenerate_repetition(collapsed, self.config):
             self.filtered_count += 1
+            self._log_drop(segment, "degenerate_repetition", collapsed)
             return None
 
         normalized_collapsed = collapsed.lower()
-        if completed and self._recent_texts.count(normalized_collapsed) >= self.config.max_repeated_text_count:
+        segment_key = self._segment_key(normalized_collapsed, segment)
+        if completed and self._recent_segment_keys.count(segment_key) >= self.config.max_repeated_text_count:
             self.filtered_count += 1
+            self._log_drop(segment, "recent_duplicate", collapsed)
             return None
+
+        if completed and short_phrase_key(normalized_collapsed) in SHORT_SILENCE_PHRASES:
+            if not has_strong_short_phrase_evidence(segment, self.config):
+                self.filtered_count += 1
+                self._log_drop(segment, "short_phrase_low_evidence", collapsed)
+                return None
 
         evaluation = evaluate_segment(
             segment,
             collapsed,
-            seen_before=self._pending_count(normalized_collapsed) > 0,
+            seen_before=self._seen_before(normalized_collapsed),
             emit_threshold=self.config.emit_threshold,
             review_threshold=self.config.review_threshold,
         )
@@ -121,23 +161,69 @@ class SegmentStabilizer:
         processed["reliability_score"] = round(evaluation.score, 3)
         processed["reliability_action"] = evaluation.action
         processed["reliability_factors"] = evaluation.factors
+        log_process_event(
+            "server.tve_score",
+            uid=self.client_uid,
+            completed=completed,
+            score=processed["reliability_score"],
+            action=evaluation.action,
+            factors=evaluation.factors,
+            text=preview_text(collapsed),
+            start=processed.get("start"),
+            end=processed.get("end"),
+        )
 
-        if completed and evaluation.score < self.config.emit_threshold:
-            self._hold_pending(processed, normalized_collapsed)
+        if evaluation.score < self.config.review_threshold:
+            if completed:
+                self._hold_pending(processed, normalized_collapsed)
+            else:
+                self.pending_count += 1
+            log_process_event(
+                "server.tve_pending",
+                uid=self.client_uid,
+                completed=completed,
+                score=processed["reliability_score"],
+                action=evaluation.action,
+                text=preview_text(collapsed),
+                pending_count=self.pending_count,
+            )
             return None
 
         if completed:
-            self._recent_texts.append(normalized_collapsed)
+            self._recent_segment_keys.append(segment_key)
             self._remove_pending(normalized_collapsed)
+            if evaluation.action == "review":
+                self._reviewed_texts.append(normalized_collapsed)
         self.emitted_count += 1
+        log_process_event(
+            "server.tve_emit",
+            uid=self.client_uid,
+            completed=completed,
+            score=processed["reliability_score"],
+            action=evaluation.action,
+            text=preview_text(collapsed),
+            emitted_count=self.emitted_count,
+        )
         return processed
 
-    def _should_drop_repeated_short_phrase(self, lowered: str, completed: bool) -> bool:
-        if lowered not in SHORT_SILENCE_PHRASES:
+    def _log_drop(self, segment: dict[str, Any], reason: str, text: str | None = None) -> None:
+        log_process_event(
+            "server.tve_drop",
+            uid=self.client_uid,
+            reason=reason,
+            completed=bool(segment.get("completed", False)),
+            text=preview_text(text if text is not None else segment.get("text")),
+            filtered_count=self.filtered_count,
+            start=segment.get("start"),
+            end=segment.get("end"),
+        )
+
+    def _should_drop_repeated_short_phrase(self, phrase_key: str, completed: bool) -> bool:
+        if phrase_key not in SHORT_SILENCE_PHRASES:
             return False
         if not self.config.drop_short_silence_phrases_after_repeat:
             return False
-        return not completed or lowered in self._recent_texts
+        return not completed
 
     def _hold_pending(self, segment: dict[str, Any], normalized_text: str) -> None:
         self.pending_count += 1
@@ -149,6 +235,9 @@ class SegmentStabilizer:
 
     def _pending_count(self, normalized_text: str) -> int:
         return sum(1 for item in self._pending if item.get("_normalized_text") == normalized_text)
+
+    def _seen_before(self, normalized_text: str) -> bool:
+        return self._pending_count(normalized_text) > 0 or normalized_text in self._reviewed_texts
 
     def _remove_pending(self, normalized_text: str) -> None:
         self._pending = deque(
@@ -166,6 +255,14 @@ class SegmentStabilizer:
             maxlen=self.config.pending_window,
         )
 
+    @staticmethod
+    def _segment_key(normalized_text: str, segment: dict[str, Any]) -> str:
+        return (
+            f"{normalized_text}|"
+            f"{_rounded_time(segment.get('start'))}|"
+            f"{_rounded_time(segment.get('end'))}"
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class SegmentEvaluation:
@@ -178,6 +275,13 @@ def normalize_text(text: str) -> str:
     return _SPACE_RE.sub(" ", text).strip()
 
 
+def _rounded_time(value: Any) -> str:
+    try:
+        return f"{float(value):.1f}"
+    except (TypeError, ValueError):
+        return "?"
+
+
 def evaluate_segment(
     segment: dict[str, Any],
     text: str,
@@ -186,6 +290,7 @@ def evaluate_segment(
     emit_threshold: float = 0.80,
     review_threshold: float = 0.70,
 ) -> SegmentEvaluation:
+    """Hitung reliability score dari beberapa indikator kualitas segment."""
     factors = {
         "asr_confidence": score_asr_confidence(segment),
         "language": score_language_shape(text),
@@ -211,6 +316,7 @@ def evaluate_segment(
 
 
 def score_asr_confidence(segment: dict[str, Any]) -> float:
+    """Skor confidence dari no_speech_prob, avg_logprob, compression, dan words."""
     score = 0.86
 
     no_speech_prob = _optional_float(segment.get("no_speech_prob"))
@@ -298,6 +404,33 @@ def has_sentence_boundary(text: str) -> bool:
 def is_media_hallucination(lowered_text: str) -> bool:
     normalized = normalize_text(lowered_text)
     return any(phrase in normalized for phrase in MEDIA_HALLUCINATION_PHRASES)
+
+
+def short_phrase_key(text: str) -> str:
+    return " ".join(token.lower() for token in _tokens(text))
+
+
+def has_strong_short_phrase_evidence(segment: dict[str, Any], config: SegmentFilterConfig) -> bool:
+    """Validasi phrase pendek seperti 'terima kasih' agar tidak mudah halu."""
+    duration = _optional_float(segment.get("end"))
+    start = _optional_float(segment.get("start"))
+    if duration is not None and start is not None:
+        if duration - start < config.short_phrase_min_duration_seconds:
+            return False
+
+    no_speech_prob = _optional_float(segment.get("no_speech_prob"))
+    if no_speech_prob is None or no_speech_prob > config.short_phrase_max_no_speech_prob:
+        return False
+
+    avg_logprob = _optional_float(segment.get("avg_logprob"))
+    if avg_logprob is None or avg_logprob < config.short_phrase_min_avg_logprob:
+        return False
+
+    compression_ratio = _optional_float(segment.get("compression_ratio"))
+    if compression_ratio is not None and compression_ratio > 2.2:
+        return False
+
+    return True
 
 
 def collapse_repeated_words(text: str, max_repeats: int = 2) -> str:

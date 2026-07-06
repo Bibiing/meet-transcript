@@ -1,11 +1,8 @@
-"""Transcript formatting helpers for the CLI view."""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
 
 from src.engine.whisper import TranscriptionResult
-
 
 SOURCE_LABELS = {
     "mic": "MIC",
@@ -21,9 +18,8 @@ class TranscriptLine:
     end_seconds: float
     text: str
 
-
+# convert hasil transkripsi menjadi baris yang siap ditampilkan
 def result_to_line(result: TranscriptionResult) -> TranscriptLine:
-    """Convert one transcription result into a display-ready line."""
 
     return TranscriptLine(
         source=result.source,
@@ -33,24 +29,20 @@ def result_to_line(result: TranscriptionResult) -> TranscriptLine:
         text=result.text.strip(),
     )
 
-
+# format hasil transkripsi chat style
 def format_transcript_line(line: TranscriptLine) -> str:
-    """Format one line as a compact chat-style transcript entry."""
-
     start = _format_timestamp(line.start_seconds)
     end = _format_timestamp(line.end_seconds)
     text = line.text if line.text else "<empty>"
     return f"[{start} - {end}] [{line.label}] {text}"
 
-
+# format hasil transkripsi menjadi list string
 def format_transcript_results(results: list[TranscriptionResult]) -> list[str]:
-    """Format transcription results sorted by timestamp then source."""
-
     lines = [result_to_line(result) for result in results if result.text.strip()]
     lines.sort(key=lambda item: (item.start_seconds, item.source))
     return [format_transcript_line(line) for line in lines]
 
-
+# format timestamp menjadi string
 def _format_timestamp(seconds: float) -> str:
     total = max(0, int(round(seconds)))
     minutes, sec = divmod(total, 60)

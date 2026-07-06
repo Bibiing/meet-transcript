@@ -49,24 +49,62 @@ def test_segment_filter_drops_prompt_echo():
     assert result is None
 
 
-def test_segment_filter_keeps_first_completed_short_thanks_but_drops_repeat():
+def test_segment_filter_keeps_completed_short_thanks_at_different_times():
     processor = SegmentStabilizer()
 
     first = processor({
         "start": "0.000",
-        "end": "1.000",
+        "end": "2.500",
         "text": "terima kasih",
         "completed": True,
+        "no_speech_prob": 0.1,
+        "avg_logprob": -0.4,
+        "compression_ratio": 1.2,
     })
     second = processor({
-        "start": "1.000",
-        "end": "2.000",
+        "start": "3.000",
+        "end": "5.500",
         "text": "terima kasih",
         "completed": True,
+        "no_speech_prob": 0.1,
+        "avg_logprob": -0.4,
+        "compression_ratio": 1.2,
     })
 
     assert first is not None
+    assert second is not None
+
+
+def test_segment_filter_drops_exact_completed_duplicate():
+    processor = SegmentStabilizer()
+    segment = {
+        "start": "0.000",
+        "end": "2.500",
+        "text": "terima kasih",
+        "completed": True,
+        "no_speech_prob": 0.1,
+        "avg_logprob": -0.4,
+        "compression_ratio": 1.2,
+    }
+
+    first = processor(segment)
+    second = processor(segment)
+
+    assert first is not None
     assert second is None
+
+
+def test_segment_filter_drops_short_thanks_without_asr_evidence():
+    processor = SegmentStabilizer()
+
+    result = processor({
+        "start": "0.000",
+        "end": "1.000",
+        "text": "Terima kasih.",
+        "completed": True,
+    })
+
+    assert result is None
 
 
 def test_segment_filter_collapses_repeated_words():
@@ -98,8 +136,17 @@ def test_post_processor_factory_returns_isolated_session_state():
     first_session = factory.new_session()
     second_session = factory.new_session()
 
-    first_session({"start": "0", "end": "1", "text": "terima kasih", "completed": True})
-    second_result = second_session({"start": "0", "end": "1", "text": "terima kasih", "completed": True})
+    segment = {
+        "start": "0",
+        "end": "2.5",
+        "text": "terima kasih",
+        "completed": True,
+        "no_speech_prob": 0.1,
+        "avg_logprob": -0.4,
+        "compression_ratio": 1.2,
+    }
+    first_session(segment)
+    second_result = second_session(segment)
 
     assert second_result is not None
 
@@ -172,7 +219,8 @@ def test_pending_segment_emits_after_repeated_stable_context():
     first = processor(segment)
     second = processor({**segment, "start": "0.500", "end": "2.500"})
 
-    assert first is None
+    assert first is not None
+    assert first["reliability_action"] == "review"
     assert second is not None
     assert second["reliability_action"] == "emit"
     assert second["reliability_score"] >= 0.8

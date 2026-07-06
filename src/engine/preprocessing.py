@@ -1,10 +1,15 @@
-"""Phase 3 realtime audio preprocessing pipeline."""
+"""Pipeline preprocessing audio realtime sebelum dikirim ke ASR.
+
+Tanggung jawab modul ini: ubah audio capture menjadi mono 16 kHz, high-pass
+filter, normalisasi RMS terbatas, potong menjadi chunk, lalu gate dengan VAD
+energi sederhana. Keputusan VAD dicatat di `last_decisions` untuk observability.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from math import gcd
-from typing import Iterable
+from typing import Any, Iterable
 
 import numpy as np
 from scipy import signal
@@ -15,6 +20,8 @@ from src.engine.vad_filter import EnergyVad, VoiceActivityDetector
 
 @dataclass(frozen=True, slots=True)
 class PreprocessConfig:
+    """Parameter preprocessing yang memengaruhi kualitas dan jumlah chunk."""
+
     target_sample_rate: int = 16_000
     chunk_seconds: float = 2.5
     highpass_cutoff_hz: float = 80.0
@@ -31,6 +38,8 @@ class PreprocessConfig:
 
 @dataclass(frozen=True, slots=True)
 class PreprocessedAudioChunk:
+    """Chunk audio siap kirim ke WhisperLive beserta metadata diagnostik."""
+
     source: str
     samples: np.ndarray
     sample_rate: int
@@ -60,8 +69,10 @@ class AudioPreprocessor:
             peak_threshold=self.config.vad_peak_threshold,
             speech_fraction=self.config.vad_speech_fraction,
         )
+        self.last_decisions: list[dict[str, Any]] = []
 
     def preprocess_frames(self, frames: Iterable[AudioFrame]) -> list[PreprocessedAudioChunk]:
+        """Gabungkan frame capture yang sama source/rate/channel lalu proses."""
         frame_list = [frame for frame in frames if frame.frame_count > 0]
         if not frame_list:
             return []
@@ -100,6 +111,7 @@ class AudioPreprocessor:
     ) -> list[PreprocessedAudioChunk]:
         """Run cast, mono, resample, high-pass, normalization, clip, and VAD."""
 
+        self.last_decisions = []
         audio = _as_float32_matrix(samples, channels)
         mono = _stereo_to_mono(audio)
         resampled = _resample(mono, sample_rate, self.config.target_sample_rate)
@@ -113,16 +125,42 @@ class AudioPreprocessor:
         chunks: list[PreprocessedAudioChunk] = []
         chunk_size = int(round(self.config.chunk_seconds * self.config.target_sample_rate))
         for index, start in enumerate(range(0, filtered.shape[0], chunk_size)):
+            # Setiap chunk dievaluasi sendiri. Chunk pendek, silence, atau RMS
+            # terlalu rendah tidak dikirim agar Whisper tidak halusinasi.
             chunk = filtered[start : start + chunk_size]
             if chunk.size == 0:
                 continue
             duration_seconds = chunk.shape[0] / self.config.target_sample_rate
+            chunk_start = start_seconds + (index * self.config.chunk_seconds)
             if duration_seconds < self.config.min_chunk_seconds:
+                self._record_decision(
+                    source=source,
+                    start_seconds=chunk_start,
+                    duration_seconds=duration_seconds,
+                    passed=False,
+                    reason="too_short",
+                )
                 continue
             if not self.vad.is_speech(chunk, self.config.target_sample_rate):
+                self._record_decision(
+                    source=source,
+                    start_seconds=chunk_start,
+                    duration_seconds=duration_seconds,
+                    passed=False,
+                    reason="vad_silence",
+                    input_rms_db=_rms_db(chunk),
+                )
                 continue
             input_rms_db = _rms_db(chunk)
             if input_rms_db < self.config.min_input_rms_db:
+                self._record_decision(
+                    source=source,
+                    start_seconds=chunk_start,
+                    duration_seconds=duration_seconds,
+                    passed=False,
+                    reason="below_min_rms",
+                    input_rms_db=input_rms_db,
+                )
                 continue
 
             normalized = _normalize_rms(
@@ -132,7 +170,15 @@ class AudioPreprocessor:
             )
             clipped = np.clip(normalized, -self.config.clip_limit, self.config.clip_limit).astype(np.float32)
             rms_db = _rms_db(clipped)
-            chunk_start = start_seconds + (index * self.config.chunk_seconds)
+            self._record_decision(
+                source=source,
+                start_seconds=chunk_start,
+                duration_seconds=duration_seconds,
+                passed=True,
+                reason="accepted",
+                input_rms_db=input_rms_db,
+                output_rms_db=rms_db,
+            )
             chunks.append(
                 PreprocessedAudioChunk(
                     source=source,
@@ -146,6 +192,30 @@ class AudioPreprocessor:
             )
 
         return chunks
+
+    def _record_decision(
+        self,
+        *,
+        source: str,
+        start_seconds: float,
+        duration_seconds: float,
+        passed: bool,
+        reason: str,
+        input_rms_db: float | None = None,
+        output_rms_db: float | None = None,
+    ) -> None:
+        decision: dict[str, Any] = {
+            "source": source,
+            "start_seconds": round(start_seconds, 3),
+            "duration_seconds": round(duration_seconds, 3),
+            "passed": passed,
+            "reason": reason,
+        }
+        if input_rms_db is not None:
+            decision["input_rms_db"] = round(input_rms_db, 2)
+        if output_rms_db is not None:
+            decision["output_rms_db"] = round(output_rms_db, 2)
+        self.last_decisions.append(decision)
 
     def _validate_config(self) -> None:
         if self.config.target_sample_rate <= 0:

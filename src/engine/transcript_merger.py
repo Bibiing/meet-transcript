@@ -52,6 +52,10 @@ class TranscriptMerger:
         self._max_seen_start = max(self._max_seen_start, result.start_seconds)
         return self.pop_ready()
 
+    @property
+    def pending_count(self) -> int:
+        return len(self._pending)
+
     def pop_ready(self) -> list[MergedTranscriptEntry]:
         watermark = self._max_seen_start - self.reorder_delay_seconds
         ready = [result for result in self._pending if result.start_seconds <= watermark]

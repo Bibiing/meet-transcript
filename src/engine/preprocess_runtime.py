@@ -14,7 +14,7 @@ from src.engine.preprocessing import AudioPreprocessor, PreprocessConfig, Prepro
 
 
 @dataclass(frozen=True, slots=True)
-class Phase3PreprocessResult:
+class PreprocessResult:
     source: str
     input_path: Path
     output_path: Path | None
@@ -23,15 +23,19 @@ class Phase3PreprocessResult:
     warning: str = ""
 
 
+# Alias kompatibilitas untuk test/dokumen lama yang masih memakai nama phase.
+Phase3PreprocessResult = PreprocessResult
+
+
 def preprocess_wav_file(
     input_path: Path,
     output_path: Path,
     *,
     source: str,
     preprocessor: AudioPreprocessor | None = None,
-) -> Phase3PreprocessResult:
+) -> PreprocessResult:
     if not input_path.exists():
-        return Phase3PreprocessResult(
+        return PreprocessResult(
             source=source,
             input_path=input_path,
             output_path=None,
@@ -44,7 +48,7 @@ def preprocess_wav_file(
     processor = preprocessor or AudioPreprocessor(PreprocessConfig())
     chunks = processor.preprocess_frames([frame])
     if not chunks:
-        return Phase3PreprocessResult(
+        return PreprocessResult(
             source=source,
             input_path=input_path,
             output_path=None,
@@ -55,7 +59,7 @@ def preprocess_wav_file(
 
     output = _write_chunks(output_path, chunks)
     duration = sum(chunk.duration_seconds for chunk in chunks)
-    return Phase3PreprocessResult(
+    return PreprocessResult(
         source=source,
         input_path=input_path,
         output_path=output,
@@ -69,7 +73,7 @@ def preprocess_audio_dir(
     output_dir: Path = Path("audio"),
     *,
     preprocessor: AudioPreprocessor | None = None,
-) -> list[Phase3PreprocessResult]:
+) -> list[PreprocessResult]:
     output_dir.mkdir(parents=True, exist_ok=True)
     processor = preprocessor or AudioPreprocessor(PreprocessConfig())
     return [
