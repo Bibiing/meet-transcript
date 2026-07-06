@@ -33,15 +33,17 @@ from src.utils.os_detector import AudioBackend, get_audio_backend
 _log = logging.getLogger(__name__)
 
 
+# konfigurasi default untuk sesi live WhisperLive
 @dataclass(frozen=True, slots=True)
 class WhisperLiveSessionConfig:
-    """Konfigurasi runtime untuk sesi live berbasis WhisperLive."""
-
+    # server dan koneksi
     server_host: str = "localhost"
     server_port: int = 9090
     use_wss: bool = False
     api_key: str | None = None
     ready_timeout: float = DEFAULT_READY_TIMEOUT_SECONDS
+    
+    # audio capture dan preprocessing
     chunk_seconds: float = 0.5
     audio_format: Literal["float32", "int16", "uint8"] = "int16"
     source: Literal["mic", "speaker", "both"] = "both"
@@ -50,20 +52,27 @@ class WhisperLiveSessionConfig:
     queue_size: int = 128
     mic_device: int | str | None = None
     speaker_device: int | str | None = None
+    
+    # vad (voice activity detection)
     mic_client_vad: bool = True
     speaker_client_vad: bool = False
     max_chunk_queue_size: int = 32
+    
+    # koneksi dan reconnect
     auto_reconnect: bool = True
     reconnect_initial_backoff_seconds: float = 1.0
     reconnect_max_backoff_seconds: float = 30.0
     reconnect_buffer_seconds: float = 30.0
     final_drain_seconds: float = 10.0
+    
+    # output dan logging
     show_partials: bool = True
     log_transcript: Path | None = None
     chunk_archive_dir: Path | None = None
+    
     profile: WhisperLiveProfile = field(default_factory=WhisperLiveProfile)
 
-
+# stats untuk sesi live WhisperLive
 @dataclass
 class WhisperLiveSessionStats:
     chunks_sent: int = 0
@@ -74,41 +83,36 @@ class WhisperLiveSessionStats:
     results_received: int = 0
     start_time: float = field(default_factory=perf_counter)
 
+    # waktu yang telah berlalu sejak sesi dimulai
     @property
     def elapsed_seconds(self) -> float:
         return perf_counter() - self.start_time
 
-
+# callback type untuk menerima hasil transcript, log, dan entry merger
 TranscriptCallback = Callable[[TranscriptionResult], None]
 LogCallback = Callable[[str], None]
 MergedEntryCallback = Callable[[MergedTranscriptEntry], None]
 
-
+# reconnect policy untuk client WhisperLive
 @dataclass(frozen=True, slots=True)
 class ReconnectPolicy:
     enabled: bool = True
-    initial_backoff_seconds: float = 1.0
-    max_backoff_seconds: float = 30.0
-    buffer_seconds: float = 30.0
+    initial_backoff_seconds: float = 1.0    # waktu tunggu awal sebelum mencoba reconnect
+    max_backoff_seconds: float = 30.0       # batas waktu tunggu maksimal sebelum mencoba reconnect
+    buffer_seconds: float = 30.0            # batas buffer audio lokal untuk reconnect, dalam detik
 
-
+# hasil pengiriman chunk audio ke server WhisperLive
 @dataclass(frozen=True, slots=True)
 class SendOutcome:
-    sent: int = 0
-    buffered: int = 0
-    dropped: int = 0
-    reconnect_attempts: int = 0
-    reconnect_successes: int = 0
+    sent: int = 0                   # jumlah chunk yang berhasil dikirim ke server
+    buffered: int = 0               # jumlah chunk yang berhasil disimpan di buffer lokal untuk reconnect
+    dropped: int = 0                # jumlah chunk yang diabaikan
+    reconnect_attempts: int = 0     # jumlah upaya reconnect
+    reconnect_successes: int = 0    # jumlah reconnect yang berhasil
 
-
+# client wrapper dengan local audio buffer dan reconnect
+# capture thread tidak boleh berhenti hanya karena WebSocket terputus. Wrapper ini menahan chunk per source dalam bounded ring buffer, mencoba reconnect memakai exponential backoff, lalu mengirim ulang buffer secara FIFO.
 class _BufferedReconnectClient:
-    """WhisperLive client wrapper dengan local audio buffer dan reconnect.
-
-    Capture thread tidak boleh berhenti hanya karena WebSocket terputus. Wrapper
-    ini menahan chunk per source dalam bounded ring buffer, mencoba reconnect
-    memakai exponential backoff, lalu mengirim ulang buffer secara FIFO.
-    """
-
     def __init__(
         self,
         source: Literal["mic", "speaker"],
@@ -131,46 +135,62 @@ class _BufferedReconnectClient:
         self._buffered_seconds = 0.0
         self._lock = threading.RLock()
 
+    # thread-safe property untuk memeriksa apakah client terhubung dan siap mengirim chunk
     @property
     def connected(self) -> bool:
         with self._lock:
             return self._connected and self._client is not None and self._client.is_ready
-
+        
+    # memeriksa jumlah chunk yang tersimpan di buffer lokal
     @property
     def buffered_count(self) -> int:
         with self._lock:
             return len(self._buffer)
 
+    # memeriksa total durasi audio yang tersimpan di buffer lokal
     @property
     def buffered_seconds(self) -> float:
         with self._lock:
             return self._buffered_seconds
 
+    # memaksa koneksi awal ke server WhisperLive, mengabaikan kebijakan reconnect
     def connect_initial(self) -> SendOutcome:
         return self._connect(force=True)
 
+    # mengirim chunk audio ke server WhisperLive, atau menyimpannya di buffer lokal jika tidak terhubung. Jika reconnect diaktifkan, mencoba reconnect dan mengirim ulang buffer.
     def send(self, chunk: PreprocessedAudioChunk) -> SendOutcome:
         with self._lock:
-            outcome = self._flush_locked()
+            outcome = self._flush_locked() # flush buffer sebelum mengirim chunk baru
+
             if self.connected:
                 try:
-                    self._client.send_chunk(chunk)  # type: ignore[union-attr]
+                    self._client.send_chunk(chunk)  # mengirim chunk ke server
+
+                    # outcome dengan sent=1 chunk berhasil dikirim
                     return _combine_outcome(outcome, SendOutcome(sent=1))
+                
+                # jika gagal mengirim chunk karena koneksi terputus, tandai sebagai disconnected
                 except Exception as exc:
                     self._mark_disconnected_locked(f"send failed: {exc}")
-
+                
+            # jika tidak terhubung, simpan chunk di buffer lokal
             buffered = self._buffer_chunk_locked(chunk)
-            outcome = _combine_outcome(outcome, buffered)
+            outcome = _combine_outcome(outcome, buffered) 
+
+            # jika reconnect diaktifkan, coba reconnect dan flush buffer
             if self.policy.enabled:
                 outcome = _combine_outcome(outcome, self._connect(force=False))
                 outcome = _combine_outcome(outcome, self._flush_locked())
             return outcome
 
+    # memaksa flush buffer lokal ke server WhisperLive, jika terhubung. Jika tidak terhubung, mencoba reconnect jika diaktifkan.
     def flush_buffer(self) -> SendOutcome:
         with self._lock:
-            outcome = SendOutcome()
+            outcome = SendOutcome() # 
+            
             if not self.connected and self.policy.enabled:
-                outcome = _combine_outcome(outcome, self._connect(force=False))
+                outcome = _combine_outcome(outcome, self._connect(force=False)) 
+
             return _combine_outcome(outcome, self._flush_locked())
 
     def finish_audio(self) -> None:

@@ -1,10 +1,3 @@
-"""Pipeline preprocessing audio realtime sebelum dikirim ke ASR.
-
-Tanggung jawab modul ini: ubah audio capture menjadi mono 16 kHz, high-pass
-filter, normalisasi RMS terbatas, potong menjadi chunk, lalu gate dengan VAD
-energi sederhana. Keputusan VAD dicatat di `last_decisions` untuk observability.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -17,44 +10,44 @@ from scipy import signal
 from src.capture.audio_frame import AudioFrame
 from src.engine.vad_filter import EnergyVad, VoiceActivityDetector
 
+# yang perlu diketahui:
+# RMS merupakan ukuran energi rata-rata dari sinyal audio. RMS yang lebih tinggi berarti audio lebih keras, sedangkan RMS yang lebih rendah berarti audio lebih lembut.
+# ASR (Automatic Speech Recognition) adalah proses mengubah sinyal audio menjadi teks. Untuk ASR, kualitas audio sangat penting agar model dapat mengenali ucapan dengan akurat. (Whisper)
 
+# konfigurasi default untuk preprocessing audio.
 @dataclass(frozen=True, slots=True)
 class PreprocessConfig:
-    """Parameter preprocessing yang memengaruhi kualitas dan jumlah chunk."""
-
-    target_sample_rate: int = 16_000
-    chunk_seconds: float = 2.5
-    highpass_cutoff_hz: float = 80.0
-    highpass_order: int = 2
-    target_rms_db: float = -20.0
-    clip_limit: float = 0.95
-    vad_rms_threshold: float = 0.015    # raised from 0.008 -- RC#1 fix
-    vad_peak_threshold: float = 0.05    # raised from 0.03  -- RC#1 fix
-    vad_speech_fraction: float = 0.30   # NEW: min active sub-frame fraction
-    min_input_rms_db: float = -42.0     # slightly relaxed from -45 to catch more speech
-    min_chunk_seconds: float = 1.0
-    max_normalization_gain_db: float = 24.0
+    target_sample_rate: int = 16_000            # 16000 Hz untuk Whisper
+    chunk_seconds: float = 2.5                  # durasi chunk audio untuk dikirim ke WhisperLive
+    highpass_cutoff_hz: float = 80.0            # frekuensi potong high-pass filter, > mengurangi noise low-frequency, < mengurangi kualitas suara. 
+    highpass_order: int = 2                     # order filter untuk high-pass filter. 2 karena order 2 memberikan roll-off yang cukup untuk mengurangi noise low-frequency, tapi tidak terlalu tinggi sehingga tidak merusak kualitas suara.             
+    target_rms_db: float = -20.0                # target RMS level untuk normalisasi audio. -20 dBFS adalah level yang baik untuk audio manusia, karena memberikan headroom yang cukup untuk puncak suara tanpa distorsi.
+    clip_limit: float = 0.95                    # batas clipping untuk normalisasi audio. 0.95 berarti bahwa amplitudo audio akan dibatasi pada 95% dari nilai maksimum, untuk menghindari distorsi.
+    vad_rms_threshold: float = 0.015            # threshold RMS untuk VAD. 0.015 adalah nilai yang baik untuk mendeteksi suara manusia, karena lebih sensitif terhadap suara yang lebih lembut.
+    vad_peak_threshold: float = 0.05            # threshold puncak untuk VAD. 0.05 adalah nilai yang baik untuk mendeteksi suara manusia, karena lebih sensitif terhadap puncak suara yang lebih tinggi.
+    vad_speech_fraction: float = 0.30           # fraksi minimum frame yang harus terdeteksi sebagai suara untuk dianggap sebagai chunk suara. 0.30 berarti bahwa setidaknya 30% dari frame dalam chunk harus terdeteksi sebagai suara agar chunk tersebut dianggap sebagai chunk suara. 
+    min_input_rms_db: float = -42.0             # minimum RMS level untuk input audio agar diterima. -42 dBFS adalah level yang baik untuk audio manusia, karena lebih sensitif terhadap suara yang lebih lembut.
+    min_chunk_seconds: float = 1.0              # durasi minimum chunk audio agar diterima. 1.0 detik adalah durasi yang baik untuk audio manusia, karena memberikan cukup waktu untuk mendeteksi suara manusia.
+    max_normalization_gain_db: float = 24.0     # gain maksimum untuk normalisasi audio. 24 dB adalah gain yang baik untuk audio manusia, karena memberikan headroom yang cukup untuk puncak suara tanpa distorsi.
 
 
+# menyimpan chunk audio yang telah diproses beserta metadata diagnostik.
 @dataclass(frozen=True, slots=True)
 class PreprocessedAudioChunk:
-    """Chunk audio siap kirim ke WhisperLive beserta metadata diagnostik."""
-
-    source: str
-    samples: np.ndarray
-    sample_rate: int
-    start_seconds: float
-    duration_seconds: float
-    rms_db: float
-    input_rms_db: float = 0.0
+    source: str                 # sumber audio
+    samples: np.ndarray         # array 1D float32 audio mono
+    sample_rate: int            # sample rate audio
+    start_seconds: float        # waktu mulai chunk audio relatif terhadap awal sumber
+    duration_seconds: float     # durasi chunk audio 
+    rms_db: float               # RMS level dari chunk audio setelah normalisasi
+    input_rms_db: float = 0.0   # RMS level dari chunk audio sebelum normalisasi
 
     @property
     def frame_count(self) -> int:
         return int(self.samples.shape[0])
 
-
+# mengubah audio yang ditangkap menjadi chunk mono 16 kHz untuk ASR.
 class AudioPreprocessor:
-    """Convert captured audio into mono 16 kHz speech chunks for ASR."""
 
     def __init__(
         self,
@@ -71,14 +64,15 @@ class AudioPreprocessor:
         )
         self.last_decisions: list[dict[str, Any]] = []
 
+    # menggabungkan frame audio
+    # jadi intinya fungsi ini menggabungkan frame audio yang ditangkap menjadi satu chunk audio untuk diproses lebih lanjut, agar chunk audio yang dikirim ke ars tidak terlalu pendek, sehingga bisa diproses dengan baik oleh ars. 
     def preprocess_frames(self, frames: Iterable[AudioFrame]) -> list[PreprocessedAudioChunk]:
-        """Gabungkan frame capture yang sama source/rate/channel lalu proses."""
-        frame_list = [frame for frame in frames if frame.frame_count > 0]
+        frame_list = [frame for frame in frames if frame.frame_count > 0] 
         if not frame_list:
             return []
 
-        first = frame_list[0]
-        sample_rate = first.sample_rate
+        first = frame_list[0] 
+        sample_rate = first.sample_rate 
         channels = first.channels
         source = first.source
         start_seconds = first.timestamp_seconds
@@ -91,7 +85,9 @@ class AudioPreprocessor:
             if frame.source != source:
                 raise ValueError("all frames for one preprocessing pass must share source")
 
-        samples = np.concatenate([frame.samples for frame in frame_list], axis=0)
+        samples = np.concatenate([frame.samples for frame in frame_list], axis=0) # menggabungkan semua frame menjadi satu array samples
+        # mengembalikan hasil preprocessing audio yang telah digabungkan menjadi chunk mono 16 kHz untuk ASR.
+    
         return self.preprocess_samples(
             samples,
             sample_rate=sample_rate,
