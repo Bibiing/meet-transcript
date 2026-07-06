@@ -94,11 +94,6 @@ def run_capture(options: CaptureOptions) -> list[CaptureResult]:
     sleep(0.05)
     return results
 
-
-Phase2CaptureOptions = CaptureOptions
-run_phase2_capture = run_capture
-
-
 def _record_microphone(options: CaptureOptions) -> CaptureResult:
     try:
         stream = MicrophoneStream(
@@ -195,7 +190,7 @@ def _write_result(source: str, output_path: Path, frames: list[AudioFrame]) -> C
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Record phase 2 mic/speaker WAV files.")
+    parser = argparse.ArgumentParser(description="Record mic/speaker WAV files.")
     parser.add_argument("--seconds", type=float, default=3.0)
     parser.add_argument("--output-dir", type=Path, default=Path("audio"))
     parser.add_argument("--source", choices=("mic", "speaker", "both"), default="both")

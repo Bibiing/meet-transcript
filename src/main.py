@@ -234,13 +234,13 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         case "live":
-            #capture audio, preprocessing, kirim chunk ke WhisperLive, lalu simpan transcript realtime/candidate/final.
             log_transcript = args.transcript_log or (args.output_dir / "transcript_log.json")
 
             live_model = args.whisper_model or (
                 (env_model or "small") if args.asr_backend == "whisperlive" else "small"
             )
 
+            # ASR whisper server live
             if args.asr_backend == "whisperlive":
                 profile = WhisperLiveProfile(
                     language=args.whisper_language,
@@ -259,7 +259,8 @@ def main(argv: list[str] | None = None) -> int:
                     initial_prompt=args.initial_prompt,
                     hotwords=args.hotwords,
                 )
-
+                
+                # Konfigurasi sesi live WhisperLive
                 live_cfg = WhisperLiveSessionConfig(
                     server_host=args.server_host,
                     server_port=args.server_port,
@@ -296,9 +297,11 @@ def main(argv: list[str] | None = None) -> int:
                     args.server_port,
                 )
 
+                # jalankan sesi live WhisperLive
                 run_whisperlive_session(live_cfg)
                 return 0
 
+            # ASR whisper lokal
             whisper_cfg = WhisperConfig(
                 model_name=live_model,
                 language=args.whisper_language,
@@ -313,6 +316,7 @@ def main(argv: list[str] | None = None) -> int:
                 compression_ratio_threshold=args.whisper_max_compression,
             )
 
+            # Konfigurasi sesi live lokal
             live_cfg = LiveSessionConfig(
                 chunk_seconds=args.live_chunk_seconds,
                 source=args.source,
@@ -331,7 +335,8 @@ def main(argv: list[str] | None = None) -> int:
                 args.live_chunk_seconds,
                 live_model,
             )
-
+            
+            # jalankan sesi live lokal
             run_live_session(live_cfg)
             return 0
         

@@ -21,35 +21,29 @@ from src.utils.formatter import format_transcript_line, result_to_line
 from src.utils.logging import TranscriptLog, log_process_event
 from src.utils.os_detector import AudioBackend, get_audio_backend
 
+# def detect_os() -> object:
+#     """Compatibility shim untuk test lama; runtime memakai get_audio_backend()."""
 
-def detect_os() -> object:
-    """Compatibility shim untuk test lama; runtime memakai get_audio_backend()."""
-
-    return get_audio_backend()
+#     return get_audio_backend()
 
 _log = logging.getLogger(__name__)
 
+# konfigurasi sesi live transcription
+# chunk_seconds: 
+#   - berapa detik audio yang dikumpulkan sebelum dikirim ke Whisper.
+#   - lebih rendah = latensi lebih rendah, risiko kata terpotong lebih tinggi.
+#   - lebih tinggi = latensi lebih tinggi, konteks lebih baik untuk Whisper.
+#   - rekomendasi  = 4.0 untuk CPU, 2.0 untuk GPU.
 
+# source:
+#  - sumber audio yang akan ditangkap: "mic", "speaker", atau "both".
+#  - untuk rapat online, "both" menangkap suara Anda (mic) dan remote participants (speaker).
+
+# max_chunk_queue_size:
+#  - berapa banyak chunk yang belum diproses yang akan di-buffer.
+#  - ketika penuh, chunk tertua akan dihapus untuk memberi preferensi pada audio terbaru.
 @dataclass(frozen=True, slots=True)
 class LiveSessionConfig:
-    """Runtime configuration for a live transcription session.
-
-    chunk_seconds
-        How many seconds of audio to accumulate before sending to Whisper.
-        Lower = less latency, more risk of cut-off words.
-        Higher = more latency, better context for Whisper.
-        Recommended: 4.0 for CPU, 2.0 for GPU.
-
-    source
-        Which audio sources to capture: "mic", "speaker", or "both".
-        For online meetings, "both" captures your voice (mic) and
-        remote participants (speaker / WASAPI loopback).
-
-    max_chunk_queue_size
-        How many unprocessed chunks to buffer.  When full, the oldest
-        chunk is dropped to prefer fresh audio.
-    """
-
     chunk_seconds: float = 4.0
     source: Literal["mic", "speaker", "both"] = "both"
     sample_rate: int | None = None
@@ -63,70 +57,60 @@ class LiveSessionConfig:
     whisper_config: WhisperConfig | None = None
 
 
+# menyimpan statistik runtime selama sesi live transcription
 @dataclass
 class LiveSessionStats:
-    """Runtime statistics collected during a live session."""
-
     chunks_processed: int = 0
     chunks_dropped: int = 0
     results_accepted: int = 0
     results_rejected: int = 0
     start_time: float = field(default_factory=perf_counter)
 
+    # waktu yang telah berlalu sejak sesi dimulai
     @property
     def elapsed_seconds(self) -> float:
         return perf_counter() - self.start_time
 
 
+# config:
+# - konfigurasi sesi live transcription. Jika None, akan menggunakan default.
+# on_result:
+# - callback opsional yang dipanggil untuk setiap hasil transkripsi yang diterima. Berguna untuk integrasi (misalnya, menulis ke file, mengirim ke UI).
+
+# return:
+# - LiveSessionStats: statistik runtime untuk sesi yang telah selesai.  
 def run_live_session(
     config: LiveSessionConfig | None = None,
     *,
     on_result: Callable[[TranscriptionResult], None] | None = None,
 ) -> LiveSessionStats:
-    """Run a real-time transcription session until Ctrl+C or KeyboardInterrupt.
 
-    Parameters
-    ----------
-    config:
-        Session configuration.  Uses safe defaults when omitted.
-    on_result:
-        Optional callback called for every accepted transcription result.
-        Useful for integrations (e.g., write to file, send to UI).
-
-    Returns
-    -------
-    LiveSessionStats
-        Runtime statistics for the completed session.
-    """
-    cfg = config or LiveSessionConfig()
-    whisper_cfg = cfg.whisper_config or WhisperConfig()
+    if config is None: cfg = LiveSessionConfig() 
+    if cfg.whisper_config is None: whisper_cfg = WhisperConfig()
     stats = LiveSessionStats()
 
-    # ------------------------------------------------------------------ #
-    # Transcript log (crash-resistant real-time backup)                   #
-    # ------------------------------------------------------------------ #
+    # Transcrip log ini akan menyimpan hasil transkripsi secara real-time ke file, sehingga jika terjadi crash atau penutupan mendadak, hasil transkripsi tetap tersimpan.
     transcript_log: TranscriptLog | None = None
     if cfg.transcript_log_path:
         transcript_log = TranscriptLog(cfg.transcript_log_path)
         transcript_log.save()
 
-    # ------------------------------------------------------------------ #
-    # Shared state                                                        #
-    # ------------------------------------------------------------------ #
+    # Shared state
+    # untuk menghentikan sesi live transcription, kita menggunakan stop_event. Ketika stop_event diset, semua thread akan berhenti.
     stop_event = threading.Event()
     chunk_queue: queue.Queue[PreprocessedAudioChunk] = queue.Queue(
         maxsize=cfg.max_chunk_queue_size
     )
 
-    # ------------------------------------------------------------------ #
     # Capture streams & reader threads                                    #
-    # ------------------------------------------------------------------ #
     capture_streams: list = []
     reader_threads: list[threading.Thread] = []
     preprocess_config = PreprocessConfig(chunk_seconds=cfg.chunk_seconds)
 
+    # (mic, both) berarti jika cfg.source adalah mic atau both, maka akan membuat stream mikrofon. 
     if cfg.source in ("mic", "both"):
         try:
+            # Membuat stream mikrofon
             mic_stream = MicrophoneStream(
                 MicrophoneConfig(
                     sample_rate=cfg.sample_rate,
@@ -135,6 +119,8 @@ def run_live_session(
                     queue_size=cfg.queue_size,
                 )
             )
+
+            # Menambahkan stream mikrofon ke daftar capture_streams dan membuat thread pembaca untuk memproses frame audio dari mikrofon.
             capture_streams.append(mic_stream)
             reader_threads.append(
                 threading.Thread(
@@ -151,10 +137,12 @@ def run_live_session(
                     daemon=True,
                 )
             )
+
             _log.info("live session: mic stream created")
         except Exception as exc:  # pragma: no cover
             _log.warning("live session: mic stream unavailable — %s", exc)
 
+    # (speaker, both) berarti jika cfg.source adalah speaker atau both, maka akan mencoba membuat stream loopback speaker.
     if cfg.source in ("speaker", "both"):
         audio_backend = get_audio_backend()
         if audio_backend is AudioBackend.WASAPI_LOOPBACK:
@@ -191,6 +179,7 @@ def run_live_session(
                     exc,
                 )
         else:
+            # Jika backend audio tidak mendukung loopback speaker, maka akan menampilkan peringatan bahwa hanya mikrofon yang didukung.
             _log.warning(
                 "live session: speaker capture not supported on %s — mic only",
                 audio_backend.value,
@@ -201,9 +190,7 @@ def run_live_session(
         print("[ERROR] Tidak ada audio stream yang tersedia. Periksa perangkat audio Anda.")
         return stats
 
-    # ------------------------------------------------------------------ #
-    # Graceful Ctrl+C handler                                             #
-    # ------------------------------------------------------------------ #
+    # handel ketika Ctrl+C maka akan menghentikan sesi live transcription
     original_sigint = signal.getsignal(signal.SIGINT)
     original_sigbreak = signal.getsignal(signal.SIGBREAK) if hasattr(signal, "SIGBREAK") else None
 
@@ -215,9 +202,7 @@ def run_live_session(
     if hasattr(signal, "SIGBREAK"):
         signal.signal(signal.SIGBREAK, _sigint_handler)
 
-    # ------------------------------------------------------------------ #
     # Start streams and reader threads                                    #
-    # ------------------------------------------------------------------ #
     active_streams: list = []
     for stream in capture_streams:
         try:
@@ -232,16 +217,15 @@ def run_live_session(
         signal.signal(signal.SIGINT, original_sigint)
         return stats
 
+    # setiap thread pembaca mereka mulai membaca frame audio dari stream masing-masing dan memprosesnya menjadi chunk audio.
     for thread in reader_threads:
         thread.start()
 
-    # ------------------------------------------------------------------ #
-    # Transcription loop (main thread — serialised, thread-safe)         #
-    # ------------------------------------------------------------------ #
+    # Transcription loop (main thread — serialised, thread-safe) 
     transcriber = OpenAIWhisperTranscriber(whisper_cfg)
 
     source_labels = {"mic": "MIC", "speaker": "SPEAKER"}
-    session_start_wall = monotonic()
+    session_start_wall = monotonic() # waktu mulai sesi live transcription untuk menghitung durasi sesi.
 
     print("=" * 60)
     print("Live transcription aktif. Tekan Ctrl+C untuk berhenti.")
@@ -255,7 +239,7 @@ def run_live_session(
     try:
         while not stop_event.is_set():
             try:
-                chunk = chunk_queue.get(timeout=0.5)
+                chunk = chunk_queue.get(timeout=0.5) # mengambil chunk dalam antrian dengan timeout agar thread tidak terblokir selamanya jika tidak ada chunk yang tersedia.
             except queue.Empty:
                 continue
 
@@ -265,15 +249,19 @@ def run_live_session(
                 chunk.duration_seconds,
             )
 
-            result = transcriber.transcribe_chunk(chunk)
-            stats.chunks_processed += 1
+            result = transcriber.transcribe_chunk(chunk)    # memproses chunk audio dengan Whisper.
+            stats.chunks_processed += 1                     # increment jumlah chunk yang telah diproses
 
             if result.text:
-                stats.results_accepted += 1
-                line = format_transcript_line(result_to_line(result))
-                print(line, flush=True)
-                if transcript_log is not None:
+                stats.results_accepted += 1                                 # increment jumlah hasil transkripsi yang diterima
+                line = format_transcript_line(result_to_line(result))       # format hasil transkripsi
+                print(line, flush=True)                                     # menampilkan hasil transkripsi ke terminal
+                
+                # transcript log aktif
+                if transcript_log is not None:                             
                     transcript_log.append_result(result)
+
+                # 
                 if on_result is not None:
                     on_result(result)
                 _log.info("live session: accepted source=%s text=%r", result.source, result.text[:80])
@@ -285,26 +273,32 @@ def run_live_session(
                     result.warning,
                 )
 
+            # jika sudah melebihi batas maksimal chunk yang diproses, maka akan menghentikan sesi live transcription.
             if cfg.max_chunks_processed is not None and stats.chunks_processed >= cfg.max_chunks_processed:
                 stop_event.set()
 
+    # mengakhiri sesi live transcription ketika Ctrl+C ditekan atau terjadi KeyboardInterrupt.
     finally:
-        # ---------------------------------------------------------------- #
-        # Shutdown — stop streams, join threads, restore signal handler    #
-        # ---------------------------------------------------------------- #
-        stop_event.set()
+        stop_event.set()                # diset untuk menghentikan semua thread pembaca dan stream audio.
+        
+        #  stream audio yang aktif
         for stream in active_streams:
             try:
-                stream.stop()
-            except Exception as exc:  # pragma: no cover
+                stream.stop() # hentikan stream audio
+            except Exception as exc: 
                 _log.debug("live session: error stopping stream: %s", exc)
+
+        # thread pembaca yang aktif  
         for thread in reader_threads:
-            thread.join(timeout=3.0)
+            thread.join(timeout=5.0) # menunggu thread pembaca selesai dengan timeout 5 detik. Jika thread tidak selesai dalam waktu tersebut, maka akan dilanjutkan tanpa menunggu lebih lama.
+        
+        # mengembalikan handler sinyal Ctrl+C ke handler asli agar tidak mengganggu program lain.
         signal.signal(signal.SIGINT, original_sigint)
         if hasattr(signal, "SIGBREAK") and original_sigbreak is not None:
             signal.signal(signal.SIGBREAK, original_sigbreak)
 
-        elapsed = monotonic() - session_start_wall
+        elapsed = monotonic() - session_start_wall # menghitung durasi sesi live transcription
+
         print("\n" + "=" * 60)
         print(f"Sesi selesai. Durasi: {elapsed:.0f}s")
         print(
@@ -320,9 +314,11 @@ def run_live_session(
     return stats
 
 
-# --------------------------------------------------------------------------- #
-# Internal helpers                                                             #
-# --------------------------------------------------------------------------- #
+# akumulasi frame dari *stream*, preprocess, push ke *chunk_queue*.
+# fungsi ini berjalan di thread daemon sendiri. Tidak sengaja merujuk model Whisper — hanya penangkapan audio dan preprocessing yang terjadi di sini.  Thread-safety dipertahankan dengan:
+#   - Hanya menulis ke *chunk_queue* (Queue thread-safe).
+#   - Hanya membaca *stop_event.is_set()* (bool-like atomik).
+#   - *preprocessor* TIDAK dibagikan antar thread.
 
 def _reader_thread(
     stream: object,
@@ -332,15 +328,6 @@ def _reader_thread(
     stop_event: threading.Event,
     stats: LiveSessionStats,
 ) -> None:
-    """Accumulate frames from *stream*, preprocess, push to *chunk_queue*.
-
-    This function runs in its own daemon thread.  It intentionally does not
-    reference the Whisper model — only audio capture and preprocessing happen
-    here.  Thread-safety is maintained by:
-      - Only writing to *chunk_queue* (thread-safe Queue).
-      - Only reading *stop_event.is_set()* (atomic bool-like).
-      - *preprocessor* is NOT shared between threads.
-    """
     buffer: list[AudioFrame] = []
     source_name = "unknown"
     frames_seen = 0
@@ -348,13 +335,16 @@ def _reader_thread(
     first_frame_logged = False
     dropped_by_preprocess = 0
 
+    # loop pembaca frame audio dari stream. 
     while not stop_event.is_set():
-        frame = stream.read_frame(timeout=0.1)  # type: ignore[attr-defined]
+        frame = stream.read_frame(timeout=0.1)  # membaca frame audio dari stream dengan timeout 0.1 detik. jika terlalu cepat membebani cpu
         if frame is None:
             continue
 
-        source_name = frame.source
-        frames_seen += 1
+        source_name = frame.source  # sumber audio dari frame
+        frames_seen += 1 # increment jumlah frame yang telah dibaca dari stream    
+        
+        # frame pertama belum dicatat, maka akan mencatat event "client.capture_start" ke log proses dan menampilkan informasi frame pertama ke log. Hal ini untuk debugging dan monitoring performa sesi live transcription.
         if not first_frame_logged:
             log_process_event(
                 "client.capture_start",
@@ -377,13 +367,14 @@ def _reader_thread(
             first_frame_logged = True
         buffer.append(frame)
 
-        # Check accumulated duration
+        # Check durasi total buffer. Jika durasi total buffer lebih kecil dari chunk_seconds, maka akan melanjutkan membaca frame audio dari stream. Jika durasi total buffer lebih besar atau sama dengan chunk_seconds, maka akan memproses buffer menjadi chunk audio dan mengirimkannya ke chunk_queue.
         total_duration = sum(f.duration_seconds for f in buffer)
         if total_duration < chunk_seconds:
             continue
 
-        input_rms = _buffer_rms(buffer)
-        input_frames = sum(frame.frame_count for frame in buffer)
+        input_rms = _buffer_rms(buffer)                             # menghitung rms unuk mengetahui kekuatan audio
+        input_frames = sum(frame.frame_count for frame in buffer)   # menghitung jumlah frame audio yang ada di buffer
+        
         log_process_event(
             "client.chunk_created",
             source=source_name,
@@ -392,12 +383,14 @@ def _reader_thread(
             input_rms=round(input_rms, 6),
             queue_size=chunk_queue.qsize(),
         )
-        # Preprocess the accumulated buffer
-        chunks = preprocessor.preprocess_frames(buffer)
-        buffer = []
+        
+        chunks = preprocessor.preprocess_frames(buffer) # meggabungkan frame audio di buffer menjadi chunk audio yang siap diproses lebih lanjut.
+        buffer = [] # mengosongkan buffer setelah frame audio diubah menjadi chunk audio. 
+
         for decision in preprocessor.last_decisions:
             event = "client.vad_pass" if decision.get("passed") else "client.vad_drop"
             log_process_event(event, **decision, queue_size=chunk_queue.qsize())
+        
         if not chunks:
             dropped_by_preprocess += 1
             _log.info(
@@ -412,8 +405,9 @@ def _reader_thread(
 
         for chunk in chunks:
             try:
-                chunk_queue.put_nowait(chunk)
-                chunks_enqueued += 1
+                chunk_queue.put_nowait(chunk) # menambahkan chunk audio ke chunk_queue tanpa menunggu jika antrian penuh.
+                chunks_enqueued += 1 # increment jumlah chunk yang telah dimasukkan ke chunk_queue
+
                 log_process_event(
                     "client.chunk_queued",
                     source=chunk.source,
@@ -433,16 +427,18 @@ def _reader_thread(
                     chunk.rms_db,
                     chunks_enqueued,
                 )
+            
+            # jika antrian penuh, maka akan menghapus chunk tertua dari antrian dan menambahkan chunk baru ke antrian.
             except queue.Full:
-                # Drop the oldest item and insert the new one (prefer fresh audio)
                 try:
-                    chunk_queue.get_nowait()
+                    chunk_queue.get_nowait() # mengambil data dari antrean secara langsung tanpa menunggu (queue FIFO) jadi yang didapatkan adalah chunk tertua. 
                 except queue.Empty:
                     pass
                 try:
-                    chunk_queue.put_nowait(chunk)
+                    chunk_queue.put_nowait(chunk) # menambahkan chunk baru ke antrian tanpa menunggu jika antrian penuh.
                     chunks_enqueued += 1
                     stats.chunks_dropped += 1
+
                     log_process_event(
                         "client.chunk_queue_drop",
                         source=source_name,
@@ -453,13 +449,16 @@ def _reader_thread(
                     _log.warning(
                         "live session: chunk queue full — dropped oldest %s chunk", source_name
                     )
+                
                 except queue.Full:
                     pass
-
+    
+    # ketika buffer tidak kosong, maka akan memproses buffer menjadi chunk audio terakhir sebelum thread pembaca keluar. Hal ini untuk memastikan bahwa semua frame audio yang telah dibaca dari stream diproses menjadi chunk audio dan dikirim ke chunk_queue.
     if buffer:
-        partial_duration = sum(f.duration_seconds for f in buffer)
-        partial_frames = sum(frame.frame_count for frame in buffer)
-        partial_rms = _buffer_rms(buffer)
+        partial_duration = sum(f.duration_seconds for f in buffer) # durasi total buffer terakhir
+        partial_frames = sum(frame.frame_count for frame in buffer) # jumlah frame audio terakhir
+        partial_rms = _buffer_rms(buffer) # menghitung rms untuk mengetahui kekuatan audio terakhir
+
         _log.info(
             "live session: reader exiting with partial buffer source=%s duration=%.3f frames=%s rms=%.6f",
             source_name,
@@ -467,14 +466,19 @@ def _reader_thread(
             partial_frames,
             partial_rms,
         )
+        
+        # ika durasi buffer terakhir cukup panjang, maka diproses menjadi chunk audio terakhir. Jika durasi buffer terakhir terlalu pendek, maka akan diabaikan.
         if partial_duration >= preprocessor.config.min_chunk_seconds:
+
+            # untuk setiap chunk audio yang dihasilkan dari buffer terakhir
             for chunk in preprocessor.preprocess_frames(buffer):
                 for decision in preprocessor.last_decisions:
                     event = "client.vad_pass" if decision.get("passed") else "client.vad_drop"
                     log_process_event(event, final_partial=True, **decision, queue_size=chunk_queue.qsize())
                 try:
-                    chunk_queue.put_nowait(chunk)
-                    chunks_enqueued += 1
+                    chunk_queue.put_nowait(chunk) # menambahkan chunk audio terakhir ke antrian.
+                    chunks_enqueued += 1 # increment jumlah chunk yang telah dimasukkan ke chunk_queue
+
                     log_process_event(
                         "client.chunk_queued",
                         source=chunk.source,
@@ -494,6 +498,7 @@ def _reader_thread(
                         chunk.input_rms_db,
                         chunk.rms_db,
                     )
+                
                 except queue.Full:
                     stats.chunks_dropped += 1
                     log_process_event(
