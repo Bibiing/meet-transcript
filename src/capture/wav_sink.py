@@ -1,5 +1,3 @@
-"""WAV writer utilities for captured and processed audio."""
-
 from __future__ import annotations
 
 from pathlib import Path
@@ -9,9 +7,8 @@ import numpy as np
 
 from src.capture.audio_frame import AudioFrame
 
-
+# menulis daftar AudioFrame ke file WAV, mengembalikan path file output
 def write_frames_to_wav(path: str | Path, frames: list[AudioFrame]) -> Path:
-    """Write captured float32 frames to 16-bit PCM WAV."""
 
     if not frames:
         raise ValueError("cannot write an empty WAV file")
@@ -26,7 +23,9 @@ def write_frames_to_wav(path: str | Path, frames: list[AudioFrame]) -> Path:
         if frame.channels != first.channels:
             raise ValueError("all frames must use the same channel count")
 
-    audio = np.concatenate([frame.samples for frame in frames], axis=0)
+    audio = np.concatenate([frame.samples for frame in frames], axis=0) # menggabungkan semua sampel audio dari setiap AudioFrame menjadi satu array 2D dengan shape (total_frame_count, channels)
+    
+    # normalisasi sampel audio dari float32 dalam rentang [-1.0, 1.0] menjadi 16-bit PCM, dengan clipping agar tidak melebihi batas [-1.0, 1.0]
     pcm = np.clip(audio, -1.0, 1.0)
     pcm = (pcm * np.iinfo(np.int16).max).astype(np.int16)
 

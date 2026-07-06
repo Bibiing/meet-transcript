@@ -4,31 +4,37 @@ import logging
 import queue
 import signal
 import threading
-from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
 from time import monotonic, perf_counter
-from typing import Callable, Literal
+from typing import Literal
 
-from src.capture.audio_frame import AudioFrame
-from src.capture.errors import CaptureError, CaptureNotSupportedError
-from src.capture.wav_sink import write_frames_to_wav
-from src.capture.mac_sys_audio import MacSystemAudioConfig, MacSystemAudioStream
-from src.capture.mic_stream import MicrophoneConfig, MicrophoneStream
-from src.capture.win_loopback import WindowsLoopbackConfig, WindowsLoopbackStream
-from src.engine.live_session import _reader_thread
-from src.engine.preprocessing import AudioPreprocessor, PreprocessConfig, PreprocessedAudioChunk
-from src.engine.transcript_merger import MEETING_SOURCE_LABELS, MergedTranscriptEntry, TranscriptMerger
-from src.engine.whisper import TranscriptionResult, TranscriptionSegment
+from src.engine.preprocessing import PreprocessedAudioChunk
+from src.engine.transcript_merger import MEETING_SOURCE_LABELS, TranscriptMerger
 from src.engine.whisperlive_client import (
     DEFAULT_READY_TIMEOUT_SECONDS,
     WhisperLiveConnectionConfig,
     WhisperLiveProfile,
-    WhisperLiveStreamClient,
 )
 from src.utils.logging import TranscriptLog, log_process_event
-from src.utils.os_detector import AudioBackend, get_audio_backend
+
+from src.engine.whisperlive_client_reconnect import (
+    ReconnectPolicy,
+    _BufferedReconnectClient,
+)
+from src.engine.whisperlive_capture import _build_capture_streams
+from src.engine.whisperlive_session_utils import (
+    TranscriptCallback,
+    LogCallback,
+    MergedEntryCallback,
+    _ChunkArchive,
+    _PartialTranscriptPreview,
+    _wait_for_final_results,
+    _requested_sources,
+    _events_from_segments,
+    _emit_merged_entry,
+    _format_timestamp,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -88,275 +94,16 @@ class WhisperLiveSessionStats:
     def elapsed_seconds(self) -> float:
         return perf_counter() - self.start_time
 
-# callback type untuk menerima hasil transcript, log, dan entry merger
-TranscriptCallback = Callable[[TranscriptionResult], None]
-LogCallback = Callable[[str], None]
-MergedEntryCallback = Callable[[MergedTranscriptEntry], None]
-
-# reconnect policy untuk client WhisperLive
-@dataclass(frozen=True, slots=True)
-class ReconnectPolicy:
-    enabled: bool = True
-    initial_backoff_seconds: float = 1.0    # waktu tunggu awal sebelum mencoba reconnect
-    max_backoff_seconds: float = 30.0       # batas waktu tunggu maksimal sebelum mencoba reconnect
-    buffer_seconds: float = 30.0            # batas buffer audio lokal untuk reconnect, dalam detik
-
-# hasil pengiriman chunk audio ke server WhisperLive
-@dataclass(frozen=True, slots=True)
-class SendOutcome:
-    sent: int = 0                   # jumlah chunk yang berhasil dikirim ke server
-    buffered: int = 0               # jumlah chunk yang berhasil disimpan di buffer lokal untuk reconnect
-    dropped: int = 0                # jumlah chunk yang diabaikan
-    reconnect_attempts: int = 0     # jumlah upaya reconnect
-    reconnect_successes: int = 0    # jumlah reconnect yang berhasil
-
-# client wrapper dengan local audio buffer dan reconnect
-# capture thread tidak boleh berhenti hanya karena WebSocket terputus. Wrapper ini menahan chunk per source dalam bounded ring buffer, mencoba reconnect memakai exponential backoff, lalu mengirim ulang buffer secara FIFO.
-class _BufferedReconnectClient:
-    def __init__(
-        self,
-        source: Literal["mic", "speaker"],
-        connection_config: WhisperLiveConnectionConfig,
-        *,
-        policy: ReconnectPolicy,
-        on_transcript: Callable[[str, list[dict], dict], None],
-        on_status: Callable[[str, dict], None],
-    ) -> None:
-        self.source = source
-        self.connection_config = connection_config
-        self.policy = policy
-        self._on_transcript = on_transcript
-        self._upstream_status = on_status
-        self._client: WhisperLiveStreamClient | None = None
-        self._connected = False
-        self._attempt = 0
-        self._next_reconnect_at = 0.0
-        self._buffer: deque[PreprocessedAudioChunk] = deque()
-        self._buffered_seconds = 0.0
-        self._lock = threading.RLock()
-
-    # thread-safe property untuk memeriksa apakah client terhubung dan siap mengirim chunk
-    @property
-    def connected(self) -> bool:
-        with self._lock:
-            return self._connected and self._client is not None and self._client.is_ready
-        
-    # memeriksa jumlah chunk yang tersimpan di buffer lokal
-    @property
-    def buffered_count(self) -> int:
-        with self._lock:
-            return len(self._buffer)
-
-    # memeriksa total durasi audio yang tersimpan di buffer lokal
-    @property
-    def buffered_seconds(self) -> float:
-        with self._lock:
-            return self._buffered_seconds
-
-    # memaksa koneksi awal ke server WhisperLive, mengabaikan kebijakan reconnect
-    def connect_initial(self) -> SendOutcome:
-        return self._connect(force=True)
-
-    # mengirim chunk audio ke server WhisperLive, atau menyimpannya di buffer lokal jika tidak terhubung. Jika reconnect diaktifkan, mencoba reconnect dan mengirim ulang buffer.
-    def send(self, chunk: PreprocessedAudioChunk) -> SendOutcome:
-        with self._lock:
-            outcome = self._flush_locked() # flush buffer sebelum mengirim chunk baru
-
-            if self.connected:
-                try:
-                    self._client.send_chunk(chunk)  # mengirim chunk ke server
-
-                    # outcome dengan sent=1 chunk berhasil dikirim
-                    return _combine_outcome(outcome, SendOutcome(sent=1))
-                
-                # jika gagal mengirim chunk karena koneksi terputus, tandai sebagai disconnected
-                except Exception as exc:
-                    self._mark_disconnected_locked(f"send failed: {exc}")
-                
-            # jika tidak terhubung, simpan chunk di buffer lokal
-            buffered = self._buffer_chunk_locked(chunk)
-            outcome = _combine_outcome(outcome, buffered) 
-
-            # jika reconnect diaktifkan, coba reconnect dan flush buffer
-            if self.policy.enabled:
-                outcome = _combine_outcome(outcome, self._connect(force=False))
-                outcome = _combine_outcome(outcome, self._flush_locked())
-            return outcome
-
-    # memaksa flush buffer lokal ke server WhisperLive, jika terhubung. Jika tidak terhubung, mencoba reconnect jika diaktifkan.
-    def flush_buffer(self) -> SendOutcome:
-        with self._lock:
-            outcome = SendOutcome() # 
-            
-            if not self.connected and self.policy.enabled:
-                outcome = _combine_outcome(outcome, self._connect(force=False)) 
-
-            return _combine_outcome(outcome, self._flush_locked())
-
-    def finish_audio(self) -> None:
-        with self._lock:
-            if self._client is not None and self.connected:
-                self._client.finish_audio()
-
-    def close(self, *, send_end_of_audio: bool = True) -> None:
-        with self._lock:
-            client = self._client
-            self._client = None
-            self._connected = False
-        if client is not None:
-            client.close(send_end_of_audio=send_end_of_audio)
-
-    def _connect(self, *, force: bool) -> SendOutcome:
-        if not self.policy.enabled and not force:
-            return SendOutcome()
-        now = perf_counter()
-        if not force and now < self._next_reconnect_at:
-            return SendOutcome()
-
-        self._attempt += 1
-        attempt = self._attempt
-        self._emit_status(
-            "CLIENT_RECONNECTING" if attempt > 1 else "CLIENT_CONNECTING_RETRY",
-            attempt=attempt,
-            buffered_chunks=len(self._buffer),
-            buffered_seconds=round(self._buffered_seconds, 3),
-        )
-        self.close(send_end_of_audio=False)
-
-        client = WhisperLiveStreamClient(
-            self.source,
-            self.connection_config,
-            on_transcript=self._on_transcript,
-            on_status=self._handle_status,
-        )
-        try:
-            client.connect()
-        except Exception as exc:
-            if not self.policy.enabled:
-                raise
-            delay = self._schedule_next_reconnect_locked()
-            self._client = None
-            self._connected = False
-            self._emit_status(
-                "CLIENT_RECONNECT_FAILED",
-                attempt=attempt,
-                next_retry_seconds=round(delay, 3),
-                error=str(exc),
-                buffered_chunks=len(self._buffer),
-                buffered_seconds=round(self._buffered_seconds, 3),
-            )
-            return SendOutcome(reconnect_attempts=1)
-
-        self._client = client
-        self._connected = True
-        self._attempt = 0
-        self._next_reconnect_at = 0.0
-        self._emit_status(
-            "CLIENT_RECONNECTED" if attempt > 1 else "CLIENT_CONNECTED_READY",
-            attempt=attempt,
-            buffered_chunks=len(self._buffer),
-            buffered_seconds=round(self._buffered_seconds, 3),
-        )
-        return SendOutcome(reconnect_attempts=1, reconnect_successes=1)
-
-    def _handle_status(self, source: str, message: dict) -> None:
-        status = str(message.get("status") or "")
-        if status == "SERVER_READY":
-            with self._lock:
-                self._connected = True
-        elif status in {"CLIENT_RECV_ERROR", "CLIENT_REMOTE_CLOSED", "DISCONNECT", "CLIENT_READY_TIMEOUT"}:
-            with self._lock:
-                self._mark_disconnected_locked(status)
-        self._upstream_status(source, message)
-
-    def _mark_disconnected_locked(self, reason: str) -> None:
-        self._connected = False
-        self._schedule_next_reconnect_locked()
-        log_process_event(
-            "client.reconnect_scheduled",
-            source=self.source,
-            reason=reason,
-            attempt=self._attempt,
-            next_reconnect_at=round(self._next_reconnect_at, 3),
-            buffered_chunks=len(self._buffer),
-            buffered_seconds=round(self._buffered_seconds, 3),
-        )
-
-    def _schedule_next_reconnect_locked(self) -> float:
-        exponent = max(0, self._attempt - 1)
-        delay = min(
-            max(0.1, self.policy.max_backoff_seconds),
-            max(0.1, self.policy.initial_backoff_seconds) * (2**exponent),
-        )
-        self._next_reconnect_at = perf_counter() + delay
-        return delay
-
-    def _buffer_chunk_locked(self, chunk: PreprocessedAudioChunk) -> SendOutcome:
-        if self.policy.buffer_seconds <= 0:
-            return SendOutcome(dropped=1)
-
-        dropped = 0
-        while self._buffer and self._buffered_seconds + chunk.duration_seconds > self.policy.buffer_seconds:
-            old = self._buffer.popleft()
-            self._buffered_seconds = max(0.0, self._buffered_seconds - old.duration_seconds)
-            dropped += 1
-
-        if chunk.duration_seconds > self.policy.buffer_seconds:
-            return SendOutcome(dropped=dropped + 1)
-
-        self._buffer.append(chunk)
-        self._buffered_seconds += chunk.duration_seconds
-        log_process_event(
-            "client.chunk_buffered",
-            source=self.source,
-            buffered_chunks=len(self._buffer),
-            buffered_seconds=round(self._buffered_seconds, 3),
-            dropped_oldest=dropped,
-        )
-        return SendOutcome(buffered=1, dropped=dropped)
-
-    def _flush_locked(self) -> SendOutcome:
-        if not self.connected or not self._buffer:
-            return SendOutcome()
-
-        sent = 0
-        while self._buffer and self.connected:
-            chunk = self._buffer.popleft()
-            self._buffered_seconds = max(0.0, self._buffered_seconds - chunk.duration_seconds)
-            try:
-                self._client.send_chunk(chunk)  # type: ignore[union-attr]
-                sent += 1
-            except Exception as exc:
-                self._buffer.appendleft(chunk)
-                self._buffered_seconds += chunk.duration_seconds
-                self._mark_disconnected_locked(f"buffer flush failed: {exc}")
-                break
-
-        if sent:
-            log_process_event(
-                "client.reconnect_buffer_flushed",
-                source=self.source,
-                sent=sent,
-                remaining_chunks=len(self._buffer),
-                remaining_seconds=round(self._buffered_seconds, 3),
-            )
-        return SendOutcome(sent=sent)
-
-    def _emit_status(self, status: str, **fields: object) -> None:
-        message = {"uid": f"{self.source}-reconnect", "status": status, **fields}
-        log_process_event("client.reconnect_status", source=self.source, details=message)
-        self._upstream_status(self.source, message)
-
-
-def _combine_outcome(left: SendOutcome, right: SendOutcome) -> SendOutcome:
-    return SendOutcome(
-        sent=left.sent + right.sent,
-        buffered=left.buffered + right.buffered,
-        dropped=left.dropped + right.dropped,
-        reconnect_attempts=left.reconnect_attempts + right.reconnect_attempts,
-        reconnect_successes=left.reconnect_successes + right.reconnect_successes,
-    )
-
+# capture mic/speaker audio dan stream setiap source ke WhisperLive
+# Args:
+#     config: konfigurasi sesi.
+#     on_result: callback setiap ada hasil transcript yang sudah di-emit.
+#     stop_event: event eksternal untuk menghentikan sesi.
+#     on_log: callback log/status untuk UI; None berarti print ke stdout.
+#     on_merged_entry: callback entry hasil merge untuk GUI.
+#     install_signal_handlers: False saat berjalan di thread GUI/QThread.
+# Returns:
+#     WhisperLiveSessionStats: statistik runtime untuk sesi yang telah selesai. 
 
 def run_whisperlive_session(
     config: WhisperLiveSessionConfig | None = None,
@@ -367,17 +114,6 @@ def run_whisperlive_session(
     on_merged_entry: MergedEntryCallback | None = None,
     install_signal_handlers: bool = True,
 ) -> WhisperLiveSessionStats:
-    """Capture mic/speaker audio dan stream setiap source ke WhisperLive.
-
-    Args:
-        config: Konfigurasi sesi.
-        on_result: Callback setiap ada hasil transcript yang sudah di-emit.
-        stop_event: Event eksternal untuk menghentikan sesi.
-        on_log: Callback log/status untuk UI; None berarti print ke stdout.
-        on_merged_entry: Callback entry hasil merge untuk GUI.
-        install_signal_handlers: False saat berjalan di thread GUI/QThread.
-    """
-
     cfg = config or WhisperLiveSessionConfig()
     stats = WhisperLiveSessionStats()
     _stop = stop_event or threading.Event()
@@ -603,6 +339,7 @@ def run_whisperlive_session(
                 _emit_merged_entry(entry, transcript_log, on_result, on_log=on_log, on_merged_entry=on_merged_entry)
                 stats.results_received += 1
 
+    # client reconnect buffer dan koneksi ke server WhisperLive
     connection_config = WhisperLiveConnectionConfig(
         host=cfg.server_host,
         port=cfg.server_port,
@@ -613,13 +350,17 @@ def run_whisperlive_session(
         profile=cfg.profile,
     )
 
-    active_sources = _requested_sources(cfg.source)
+    active_sources = _requested_sources(cfg.source) # mengambil source yang aktif (mic, speaker, atau keduanya)
+
+    # policy reconnect untuk setiap source, agar jika koneksi terputus, client akan mencoba reconnect sesuai policy yang ditentukan
     reconnect_policy = ReconnectPolicy(
         enabled=cfg.auto_reconnect,
         initial_backoff_seconds=cfg.reconnect_initial_backoff_seconds,
         max_backoff_seconds=cfg.reconnect_max_backoff_seconds,
         buffer_seconds=cfg.reconnect_buffer_seconds,
     )
+
+    # client setiap source (mic/speaker) yang akan mengirim audio ke server WhisperLive atau koneksi terputus, client akan mencoba reconnect sesuai policy yang ditentukan.
     clients = {
         source: _BufferedReconnectClient(
             source,
@@ -632,9 +373,11 @@ def run_whisperlive_session(
     }
 
     try:
-        _connect_clients_parallel(clients, allow_initial_failure=cfg.auto_reconnect)
+        _connect_clients_parallel(clients, allow_initial_failure=cfg.auto_reconnect) # menghubungkan semua client ke server WhisperLive secara paralel, jika gagal, akan mencoba reconnect sesuai policy yang ditentukan
 
-        capture_streams, reader_threads = _build_capture_streams(cfg, chunk_queue, _stop, stats)
+        capture_streams, reader_threads = _build_capture_streams(cfg, chunk_queue, _stop, stats) # stream audio untuk setiap source (mic/speaker) dan thread untuk membaca audio dari stream dan memasukkannya ke dalam queue chunk audio
+        
+        # tidak ada stream audio yang tersedia, maka akan menampilkan error dan mengembalikan stats
         if not capture_streams:
             _print("[ERROR] Tidak ada audio stream yang tersedia. Periksa perangkat audio Anda.")
             return stats
@@ -642,9 +385,9 @@ def run_whisperlive_session(
         active_streams: list[object] = []
         for stream in capture_streams:
             try:
-                stream.start()  # type: ignore[attr-defined]
-                active_streams.append(stream)
-            except CaptureError as exc:
+                stream.start()                  # mulai menangkap audio dari perangkat
+                active_streams.append(stream)   # menambahkan stream yang aktif ke daftar active_streams
+            except Exception as exc:
                 _log.warning("whisperlive session: failed to start stream: %s", exc)
 
         if not active_streams:
@@ -667,7 +410,9 @@ def run_whisperlive_session(
         for thread in reader_threads:
             thread.start()
 
-        session_start = monotonic()
+        session_start = monotonic() # mencatat waktu mulai sesi untuk menghitung durasi sesi
+
+        # menampilkan informasi sesi live WhisperLive ke stdout atau callback log
         _print("=" * 60)
         _print("Live transcription aktif via WhisperLive. Tekan Ctrl+C untuk berhenti.")
         _print(
@@ -679,8 +424,7 @@ def run_whisperlive_session(
 
         try:
             while not _stop.is_set():
-                # Loop utama hanya mengambil chunk yang sudah lolos preprocessing
-                # dan mengirimnya ke koneksi WebSocket sesuai source.
+                # Loop utama hanya mengambil chunk yang sudah lolos preprocessing dan mengirimnya ke koneksi WebSocket sesuai source.
                 try:
                     chunk = chunk_queue.get(timeout=0.5)
                 except queue.Empty:
@@ -809,145 +553,6 @@ def run_whisperlive_session(
             client.close(send_end_of_audio=False)
 
     return stats
-
-
-def _build_capture_streams(
-    cfg: WhisperLiveSessionConfig,
-    chunk_queue: queue.Queue[PreprocessedAudioChunk],
-    stop_event: threading.Event,
-    stats: WhisperLiveSessionStats,
-) -> tuple[list[object], list[threading.Thread]]:
-    """Bangun stream capture mic/speaker beserta reader thread-nya."""
-    capture_streams: list[object] = []
-    reader_threads: list[threading.Thread] = []
-    mic_preprocess_config = PreprocessConfig(
-        chunk_seconds=cfg.chunk_seconds,
-        min_chunk_seconds=cfg.chunk_seconds,
-    )
-    if not cfg.mic_client_vad:
-        mic_preprocess_config = _without_client_vad(mic_preprocess_config)
-    speaker_preprocess_config = PreprocessConfig(
-        chunk_seconds=cfg.chunk_seconds,
-        min_chunk_seconds=cfg.chunk_seconds,
-        vad_rms_threshold=0.008,
-        vad_peak_threshold=0.03,
-        vad_speech_fraction=0.20,
-        min_input_rms_db=-48.0,
-    )
-    if not cfg.speaker_client_vad:
-        # Speaker loopback biasanya sudah bersih, jadi VAD client boleh dimatikan
-        # agar audio pelan dari meeting tidak ikut terbuang.
-        speaker_preprocess_config = _without_client_vad(speaker_preprocess_config)
-
-    if cfg.source in ("mic", "both"):
-        try:
-            mic_stream = MicrophoneStream(
-                MicrophoneConfig(
-                    sample_rate=cfg.sample_rate,
-                    block_size=cfg.block_size,
-                    device=cfg.mic_device,
-                    queue_size=cfg.queue_size,
-                )
-            )
-            capture_streams.append(mic_stream)
-            log_process_event(
-                "client.capture_backend",
-                source="mic",
-                backend="microphone",
-                sample_rate=cfg.sample_rate,
-                block_size=cfg.block_size,
-                queue_size=cfg.queue_size,
-                device=cfg.mic_device,
-                client_vad=cfg.mic_client_vad,
-            )
-            reader_threads.append(_reader("mic", mic_stream, mic_preprocess_config, chunk_queue, stop_event, stats))
-        except Exception as exc:  # pragma: no cover
-            log_process_event("client.capture_backend_error", source="mic", backend="microphone", error=str(exc))
-            _log.warning("whisperlive session: mic unavailable: %s", exc)
-
-    if cfg.source in ("speaker", "both"):
-        backend_audio = get_audio_backend()
-        try:
-            if backend_audio is AudioBackend.WASAPI_LOOPBACK:
-                speaker_stream = WindowsLoopbackStream(
-                    WindowsLoopbackConfig(
-                        sample_rate=cfg.sample_rate,
-                        block_size=cfg.block_size,
-                        device=cfg.speaker_device,
-                        queue_size=cfg.queue_size,
-                    )
-                )
-                backend = "wasapi_loopback"
-            elif backend_audio is AudioBackend.SCREENCAPTUREKIT:
-                speaker_stream = MacSystemAudioStream(
-                    MacSystemAudioConfig(
-                        sample_rate=cfg.sample_rate or 48_000,
-                        block_size=cfg.block_size,
-                        queue_size=cfg.queue_size,
-                    )
-                )
-                backend = "mac_system_audio"
-            else:
-                raise CaptureNotSupportedError(f"speaker capture is unsupported on {backend_audio.value}")
-            capture_streams.append(speaker_stream)
-            log_process_event(
-                "client.capture_backend",
-                source="speaker",
-                backend=backend,
-                backenn_audio=backend_audio.value,
-                sample_rate=cfg.sample_rate,
-                block_size=cfg.block_size,
-                queue_size=cfg.queue_size,
-                device=cfg.speaker_device,
-                client_vad=cfg.speaker_client_vad,
-            )
-            reader_threads.append(_reader("speaker", speaker_stream, speaker_preprocess_config, chunk_queue, stop_event, stats))
-        except CaptureNotSupportedError as exc:
-            log_process_event("client.capture_backend_error", source="speaker", backenn_audio=backend_audio.value, error=str(exc))
-            _log.warning("whisperlive session: speaker unavailable: %s", exc)
-
-    return capture_streams, reader_threads
-
-
-def _without_client_vad(config: PreprocessConfig) -> PreprocessConfig:
-    """Kembalikan konfigurasi preprocessing tanpa gate VAD client."""
-    return PreprocessConfig(
-        target_sample_rate=config.target_sample_rate,
-        chunk_seconds=config.chunk_seconds,
-        highpass_cutoff_hz=config.highpass_cutoff_hz,
-        highpass_order=config.highpass_order,
-        target_rms_db=config.target_rms_db,
-        clip_limit=config.clip_limit,
-        vad_rms_threshold=0.0,
-        vad_peak_threshold=0.0,
-        vad_speech_fraction=0.0,
-        min_input_rms_db=float("-inf"),
-        min_chunk_seconds=config.min_chunk_seconds,
-        max_normalization_gain_db=config.max_normalization_gain_db,
-    )
-
-
-def _reader(
-    source: str,
-    stream: object,
-    preprocess_config: PreprocessConfig,
-    chunk_queue: queue.Queue[PreprocessedAudioChunk],
-    stop_event: threading.Event,
-    stats: WhisperLiveSessionStats,
-) -> threading.Thread:
-    return threading.Thread(
-        target=_reader_thread,
-        args=(
-            stream,
-            AudioPreprocessor(preprocess_config),
-            chunk_queue,
-            preprocess_config.chunk_seconds,
-            stop_event,
-            stats,
-        ),
-        name=f"whisperlive-{source}-reader",
-        daemon=True,
-    )
 
 
 def _connect_clients_parallel(
@@ -1104,180 +709,3 @@ def _flush_reconnect_buffers(
         stats.chunks_dropped += remaining
         log_process_event("client.reconnect_buffer_flush_timeout", remaining_chunks=remaining)
     return total_sent
-
-
-class _ChunkArchive:
-    def __init__(self, root_dir: Path) -> None:
-        session_id = datetime.now().strftime("%Y%m%d-%H%M%S")
-        self.root = root_dir / session_id
-        self._counters = {"mic": 0, "speaker": 0}
-        self._lock = threading.Lock()
-
-    def save(self, chunk: PreprocessedAudioChunk) -> Path:
-        with self._lock:
-            index = self._counters.get(chunk.source, 0) + 1
-            self._counters[chunk.source] = index
-        output_path = self.root / chunk.source / f"{index:06d}.wav"
-        frame = AudioFrame(
-            source=chunk.source,  # type: ignore[arg-type]
-            samples=chunk.samples.reshape(-1, 1),
-            sample_rate=chunk.sample_rate,
-            channels=1,
-            timestamp_seconds=chunk.start_seconds,
-        )
-        return write_frames_to_wav(output_path, [frame])
-
-
-def _wait_for_final_results(stats: WhisperLiveSessionStats, timeout_seconds: float) -> None:
-    deadline = perf_counter() + timeout_seconds
-    min_wait_deadline = perf_counter() + min(timeout_seconds, 5.0)
-    last_results = stats.results_received
-    quiet_since = perf_counter()
-    while perf_counter() < deadline:
-        threading.Event().wait(0.25)
-        if stats.results_received != last_results:
-            last_results = stats.results_received
-            quiet_since = perf_counter()
-        if perf_counter() >= min_wait_deadline and perf_counter() - quiet_since >= 1.5:
-            return
-
-
-class _PartialTranscriptPreview:
-    def __init__(self, *, min_interval_seconds: float = 0.75) -> None:
-        self._last_text_by_source: dict[str, str] = {}
-        self._last_print_by_source: dict[str, float] = {}
-        self._min_interval_seconds = min_interval_seconds
-
-    def show(self, source: str, segments: list[dict]) -> None:
-        partials = [segment for segment in segments if not segment.get("completed", True)]
-        if not partials:
-            return
-
-        segment = partials[-1]
-        text = str(segment.get("text", "")).strip()
-        if len(text) < 3:
-            return
-
-        normalized = " ".join(text.split())
-        if normalized == self._last_text_by_source.get(source):
-            return
-
-        now = perf_counter()
-        last_print = self._last_print_by_source.get(source, 0.0)
-        if now - last_print < self._min_interval_seconds:
-            return
-
-        self._last_text_by_source[source] = normalized
-        self._last_print_by_source[source] = now
-        label = MEETING_SOURCE_LABELS.get(source, source.upper())
-        start = _float_or_zero(segment.get("start"))
-        end = _float_or_zero(segment.get("end"))
-        print(f"[live {_format_timestamp(start)} - {_format_timestamp(end)}] [{label}] {normalized}", flush=True)
-
-
-def _requested_sources(source: Literal["mic", "speaker", "both"]) -> list[Literal["mic", "speaker"]]:
-    return ["mic", "speaker"] if source == "both" else [source]
-
-
-def _results_from_segments(
-    source: str,
-    model_name: str,
-    language: str | None,
-    segments: list[dict],
-) -> list[TranscriptionResult]:
-    return [event.result for event in _events_from_segments(source, model_name, language, segments)]
-
-
-@dataclass(frozen=True, slots=True)
-class WhisperLiveTranscriptEvent:
-    result: TranscriptionResult
-    completed: bool
-    reliability_score: float | None = None
-    reliability_action: str | None = None
-
-
-def _events_from_segments(
-    source: str,
-    model_name: str,
-    language: str | None,
-    segments: list[dict],
-) -> list[WhisperLiveTranscriptEvent]:
-    events: list[WhisperLiveTranscriptEvent] = []
-    for segment in segments:
-        text = str(segment.get("text", "")).strip()
-        if not text:
-            continue
-        start = _float_or_zero(segment.get("start"))
-        end = _float_or_zero(segment.get("end"))
-        duration = max(0.0, end - start)
-        result = (
-            TranscriptionResult(
-                source=source,
-                text=text,
-                model_name=model_name,
-                language=language,
-                start_seconds=start,
-                duration_seconds=duration,
-                segments=[
-                    TranscriptionSegment(
-                        start=start,
-                        end=end,
-                        text=text,
-                    )
-                ],
-            )
-        )
-        events.append(
-            WhisperLiveTranscriptEvent(
-                result=result,
-                completed=bool(segment.get("completed", True)),
-                reliability_score=_optional_float(segment.get("reliability_score")),
-                reliability_action=str(segment.get("reliability_action") or "") or None,
-            )
-        )
-    return events
-
-
-def _optional_float(value: object) -> float | None:
-    try:
-        if value is None:
-            return None
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _emit_merged_entry(
-    entry,
-    transcript_log: TranscriptLog | None,
-    on_result: TranscriptCallback | None,
-    *,
-    on_log: LogCallback | None = None,
-    on_merged_entry: MergedEntryCallback | None = None,
-) -> None:
-    if on_log is not None:
-        on_log(entry.display)
-    else:
-        print(entry.display, flush=True)
-    if transcript_log is not None:
-        transcript_log.append_result(entry.result, label=entry.label, display=entry.display)
-    if on_result is not None:
-        on_result(entry.result)
-    if on_merged_entry is not None:
-        on_merged_entry(entry)
-
-
-def _float_or_zero(value: object) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def _format_timestamp(seconds: float) -> str:
-    total = max(0, int(round(seconds)))
-    minutes, sec = divmod(total, 60)
-    hours, minutes = divmod(minutes, 60)
-    if hours:
-        return f"{hours:02d}:{minutes:02d}:{sec:02d}"
-    return f"{minutes:02d}:{sec:02d}"

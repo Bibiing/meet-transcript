@@ -1,5 +1,3 @@
-"""Entry point untuk menjalankan aplikasi"""
-
 from __future__ import annotations
 import argparse
 from pathlib import Path
@@ -241,104 +239,104 @@ def main(argv: list[str] | None = None) -> int:
             )
 
             # ASR whisper server live
-            if args.asr_backend == "whisperlive":
-                profile = WhisperLiveProfile(
-                    language=args.whisper_language,
-                    task=args.whisper_task,
-                    model=live_model,
-                    use_vad=args.server_vad,
-                    vad_threshold=args.vad_threshold,
-                    no_speech_thresh=args.whisperlive_no_speech_thresh,
-                    local_agreement=args.local_agreement,
-                    local_agreement_window_seconds=args.local_agreement_window_seconds,
-                    local_agreement_hop_seconds=args.local_agreement_hop_seconds,
-                    dynamic_prompt=args.dynamic_prompt,
-                    speech_boundary_detection=args.speech_boundary_detection,
-                    speech_boundary_silence_seconds=args.speech_boundary_silence_seconds,
-                    speech_boundary_max_wait_seconds=args.speech_boundary_max_wait_seconds,
-                    initial_prompt=args.initial_prompt,
-                    hotwords=args.hotwords,
-                )
-                
-                # Konfigurasi sesi live WhisperLive
-                live_cfg = WhisperLiveSessionConfig(
-                    server_host=args.server_host,
-                    server_port=args.server_port,
-                    use_wss=args.server_wss,
-                    api_key=args.server_api_key,
-                    ready_timeout=args.server_ready_timeout,
-                    chunk_seconds=args.live_chunk_seconds,
-                    audio_format=args.audio_format,
-                    source=args.source,
-                    sample_rate=args.sample_rate,
-                    block_size=args.block_size,
-                    queue_size=args.queue_size,
-                    mic_device=_device_arg(args.mic_device),
-                    speaker_device=_device_arg(args.speaker_device),
-                    mic_client_vad=args.mic_client_vad,
-                    speaker_client_vad=args.speaker_client_vad,
-                    auto_reconnect=args.auto_reconnect,
-                    reconnect_initial_backoff_seconds=args.reconnect_initial_backoff_seconds,
-                    reconnect_max_backoff_seconds=args.reconnect_max_backoff_seconds,
-                    reconnect_buffer_seconds=args.reconnect_buffer_seconds,
-                    final_drain_seconds=args.final_drain_seconds,
-                    show_partials=not args.hide_partials,
-                    log_transcript=log_transcript,
-                    chunk_archive_dir=args.chunk_archive_dir if args.debug_chunk_archive else None,
-                    profile=profile,
-                )
-
-                logger.info(
-                    "whisperlive session start source=%s chunk_seconds=%s model=%s server=%s:%s",
-                    args.source,
-                    args.live_chunk_seconds,
-                    live_model,
-                    args.server_host,
-                    args.server_port,
-                )
-
-                # jalankan sesi live WhisperLive
-                run_whisperlive_session(live_cfg)
-                return 0
-
-            # ASR whisper lokal
-            whisper_cfg = WhisperConfig(
-                model_name=live_model,
+            profile = WhisperLiveProfile(
                 language=args.whisper_language,
                 task=args.whisper_task,
-                device=args.whisper_device,
-                fp16=args.whisper_fp16,
-                min_segment_avg_logprob=args.whisper_min_logprob,
-                logprob_threshold=args.whisper_min_logprob,
-                max_segment_no_speech_prob=args.whisper_max_no_speech,
-                no_speech_threshold=args.whisper_max_no_speech,
-                max_segment_compression_ratio=args.whisper_max_compression,
-                compression_ratio_threshold=args.whisper_max_compression,
+                model=live_model,
+                use_vad=args.server_vad,
+                vad_threshold=args.vad_threshold,
+                no_speech_thresh=args.whisperlive_no_speech_thresh,
+                local_agreement=args.local_agreement,
+                local_agreement_window_seconds=args.local_agreement_window_seconds,
+                local_agreement_hop_seconds=args.local_agreement_hop_seconds,
+                dynamic_prompt=args.dynamic_prompt,
+                speech_boundary_detection=args.speech_boundary_detection,
+                speech_boundary_silence_seconds=args.speech_boundary_silence_seconds,
+                speech_boundary_max_wait_seconds=args.speech_boundary_max_wait_seconds,
+                initial_prompt=args.initial_prompt,
+                hotwords=args.hotwords,
             )
-
-            # Konfigurasi sesi live lokal
-            live_cfg = LiveSessionConfig(
+            
+            # Konfigurasi sesi live WhisperLive
+            live_cfg = WhisperLiveSessionConfig(
+                server_host=args.server_host,
+                server_port=args.server_port,
+                use_wss=args.server_wss,
+                api_key=args.server_api_key,
+                ready_timeout=args.server_ready_timeout,
                 chunk_seconds=args.live_chunk_seconds,
+                audio_format=args.audio_format,
                 source=args.source,
                 sample_rate=args.sample_rate,
                 block_size=args.block_size,
                 queue_size=args.queue_size,
                 mic_device=_device_arg(args.mic_device),
                 speaker_device=_device_arg(args.speaker_device),
-                transcript_log_path=log_transcript,
-                whisper_config=whisper_cfg,
+                mic_client_vad=args.mic_client_vad,
+                speaker_client_vad=args.speaker_client_vad,
+                auto_reconnect=args.auto_reconnect,
+                reconnect_initial_backoff_seconds=args.reconnect_initial_backoff_seconds,
+                reconnect_max_backoff_seconds=args.reconnect_max_backoff_seconds,
+                reconnect_buffer_seconds=args.reconnect_buffer_seconds,
+                final_drain_seconds=args.final_drain_seconds,
+                show_partials=not args.hide_partials,
+                log_transcript=log_transcript,
+                chunk_archive_dir=args.chunk_archive_dir if args.debug_chunk_archive else None,
+                profile=profile,
             )
 
             logger.info(
-                "live session start source=%s chunk_seconds=%s model=%s",
+                "whisperlive session start source=%s chunk_seconds=%s model=%s server=%s:%s",
                 args.source,
                 args.live_chunk_seconds,
                 live_model,
+                args.server_host,
+                args.server_port,
             )
-            
-            # jalankan sesi live lokal
-            run_live_session(live_cfg)
+
+            # jalankan sesi live WhisperLive
+            run_whisperlive_session(live_cfg)
             return 0
+
+            # DRAFT: Local Whisper implementation (Client-Server only)
+            # # ASR whisper lokal
+            # whisper_cfg = WhisperConfig(
+            #     model_name=live_model,
+            #     language=args.whisper_language,
+            #     task=args.whisper_task,
+            #     device=args.whisper_device,
+            #     fp16=args.whisper_fp16,
+            #     min_segment_avg_logprob=args.whisper_min_logprob,
+            #     logprob_threshold=args.whisper_min_logprob,
+            #     max_segment_no_speech_prob=args.whisper_max_no_speech,
+            #     no_speech_threshold=args.whisper_max_no_speech,
+            #     max_segment_compression_ratio=args.whisper_max_compression,
+            #     compression_ratio_threshold=args.whisper_max_compression,
+            # )
+            # 
+            # # Konfigurasi sesi live lokal
+            # live_cfg = LiveSessionConfig(
+            #     chunk_seconds=args.live_chunk_seconds,
+            #     source=args.source,
+            #     sample_rate=args.sample_rate,
+            #     block_size=args.block_size,
+            #     queue_size=args.queue_size,
+            #     mic_device=_device_arg(args.mic_device),
+            #     speaker_device=_device_arg(args.speaker_device),
+            #     transcript_log_path=log_transcript,
+            #     whisper_config=whisper_cfg,
+            # )
+            # 
+            # logger.info(
+            #     "live session start source=%s chunk_seconds=%s model=%s",
+            #     args.source,
+            #     args.live_chunk_seconds,
+            #     live_model,
+            # )
+            # 
+            # # jalankan sesi live lokal
+            # run_live_session(live_cfg)
+            # return 0
         
         case "replay-file":
             # Replay untuk test whisper langsung dari file.
