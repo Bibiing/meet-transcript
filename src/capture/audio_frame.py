@@ -4,12 +4,11 @@ from typing import Literal
 
 import numpy as np
 
-
 AudioSource = Literal["mic", "speaker"]
 
+# frame audio yang ditangkap dari sumber audio
 @dataclass(frozen=True, slots=True)
 class AudioFrame:
-    """Block raw audio captured dari satu sumber."""
     source: AudioSource
     samples: np.ndarray         # data audio dalam bentuk np
     sample_rate: int            # kecepatan hz per detik
@@ -17,20 +16,21 @@ class AudioFrame:
     timestamp_seconds: float    # waktu dalam detik saat frame audio
     status: str = ""            # status tambahan untuk frame audio 
 
+    # jumlah frame audio dalam frame
     @property
     def frame_count(self) -> int:
         return int(self.samples.shape[0])
 
+    # durasi frame audio dalam detik
+    # durasi = jumlah frame / kecepatan titik data audio per detik 
     @property
     def duration_seconds(self) -> float:
         if self.sample_rate <= 0:
             return 0.0
-        return self.frame_count / self.sample_rate
+        return self.frame_count / self.sample_rate 
 
-
+# normalisasi sampel audio ke float32 dan bentuk (frame, saluran). saluran: (1 untuk mono, 2 untuk stereo)
 def normalize_samples(samples: np.ndarray, channels: int) -> np.ndarray:
-    """Mengembalikan sampel audio sebagai array float32 yang disalin dengan bentuk (frame, saluran)."""
-
     audio = np.asarray(samples, dtype=np.float32) # convert ke float32
     if audio.ndim == 1: 
         audio = audio.reshape(-1, 1)

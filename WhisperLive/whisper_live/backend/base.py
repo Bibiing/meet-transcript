@@ -7,6 +7,7 @@ import numpy as np
 
 from whisper_live import metrics as wl_metrics
 from whisper_live.local_agreement import LocalAgreementStabilizer
+from whisper_live.process_logging import log_process_event, preview_text
 
 
 class ServeClientBase(object):
@@ -14,29 +15,19 @@ class ServeClientBase(object):
     SERVER_READY = "SERVER_READY"
     DISCONNECT = "DISCONNECT"
 
-    MAX_BUFFER_DURATION_S = 45
-    """Maximum audio buffer duration in seconds before trimming."""
-    BUFFER_TRIM_DURATION_S = 30
-    """Duration in seconds to trim from the buffer when it exceeds MAX_BUFFER_DURATION_S."""
-    CLIP_THRESHOLD_DURATION_S = 25
-    """Duration threshold in seconds for clipping audio with no valid segments."""
-    CLIP_TAIL_DURATION_S = 5
-    """Duration in seconds of audio to keep after clipping."""
+    MAX_BUFFER_DURATION_S = 45  # Durasi maksimal audio buffer sebelum dilakukan trimming
+    BUFFER_TRIM_DURATION_S = 30  # Durasi trimming ketika buffer melebihi batas maksimal
+    CLIP_THRESHOLD_DURATION_S = 25  # treshold durasi untuk clipping audio tanpa segmen valid
+    CLIP_TAIL_DURATION_S = 5  # Durasi audio yang tetap disimpan setelah proses clipping
+    client_uid: str  # Identitas unik untuk setiap klien
 
-    client_uid: str
-    """A unique identifier for the client."""
-    websocket: object
-    """The WebSocket connection for the client."""
-    send_last_n_segments: int
-    """Number of most recent segments to send to the client."""
-    no_speech_thresh: float
-    """Segments with no speech probability above this threshold will be discarded."""
-    clip_audio: bool
-    """Whether to clip audio with no valid segments."""
-    same_output_threshold: int
-    """Number of repeated outputs before considering it as a valid segment."""
+    websocket: object  # Objek koneksi WebSocket untuk klien
+    send_last_n_segments: int  # Jumlah segmen terbaru yang dikirim ke klien
+    no_speech_thresh: float  # tresh probabilitas tanpa suara; segmen di atas nilai ini dibuang
+    clip_audio: bool  # Menentukan apakah audio tanpa segmen valid akan di-clipping
+    same_output_threshold: int  # Jumlah keluaran berulang sebelum dianggap sebagai segmen valid
 
-    MAX_TRANSCRIPT_LENGTH = 500
+    MAX_TRANSCRIPT_LENGTH = 500 
     MAX_TRANSLATION_QUEUE_SIZE = 100
 
     def __init__(
@@ -98,11 +89,15 @@ class ServeClientBase(object):
         self.last_audio_arrived_at = self.session_started_at
         self.last_transcription_at = 0.0
         self.processing_offset = 0.0
+        self.final_flush_requested = False
+        self.final_flush_completed = threading.Event()
+        self.force_flush_current = False
         self.local_agreement_stabilizer = (
             LocalAgreementStabilizer(trailing_guard_seconds=local_agreement_trailing_guard_seconds)
             if local_agreement
             else None
         )
+        self.last_boundary_wait_log_at = 0.0
 
         # Optional post-processing callable for segments.
         # If set, called with a segment dict and must return a segment dict.
@@ -134,48 +129,133 @@ class ServeClientBase(object):
                 logging.info("Exiting speech to text thread")
                 break
 
+            force_flush = self.final_flush_requested
             if self.frames_np is None:
+                if force_flush:
+                    log_process_event("server.final_flush_no_audio", uid=self.client_uid)
+                    self.final_flush_requested = False
+                    self.final_flush_completed.set()
+                    self.exit = True
+                    logging.info("Exiting speech to text thread")
+                    break
+                time.sleep(0.05)
                 continue
 
             if self.clip_audio:
                 self.clip_audio_if_no_valid_segment()
 
             input_bytes, duration = self.get_audio_chunk_for_processing()
-            if duration < 1.0:
+            force_flush = self.final_flush_requested
+            min_duration = 0.2 if force_flush else 1.0
+            if duration < min_duration:
+                if force_flush:
+                    log_process_event(
+                        "server.final_flush_short_audio",
+                        uid=self.client_uid,
+                        duration_seconds=round(duration, 3),
+                    )
+                    self.final_flush_requested = False
+                    self.final_flush_completed.set()
+                    self.exit = True
+                    logging.info("Exiting speech to text thread")
+                    break
                 time.sleep(0.1)     # wait for audio chunks to arrive
                 continue
-            if self.local_agreement:
+            if self.local_agreement and not force_flush:
                 now = time.time()
                 if now - self.last_transcription_at < self.local_agreement_hop_seconds:
                     time.sleep(0.05)
                     continue
                 if self.should_wait_for_speech_boundary(now):
+                    if now - self.last_boundary_wait_log_at >= 1.0:
+                        last_processed_at = self.last_transcription_at or self.session_started_at
+                        log_process_event(
+                            "server.boundary_wait",
+                            uid=self.client_uid,
+                            silence_elapsed_seconds=round(now - self.last_audio_arrived_at, 3),
+                            wait_elapsed_seconds=round(now - last_processed_at, 3),
+                            buffer_duration_seconds=round(duration, 3),
+                            speech_boundary_silence_seconds=self.speech_boundary_silence_seconds,
+                            speech_boundary_max_wait_seconds=self.speech_boundary_max_wait_seconds,
+                        )
+                        self.last_boundary_wait_log_at = now
                     time.sleep(0.05)
                     continue
                 self.last_transcription_at = now
             try:
                 input_sample = input_bytes.copy()
+                self.force_flush_current = force_flush
                 t0 = time.time()
+                log_process_event(
+                    "server.boundary_process",
+                    uid=self.client_uid,
+                    duration_seconds=round(duration, 3),
+                    processing_offset_seconds=round(self.processing_offset, 3),
+                    local_agreement=self.local_agreement,
+                    force_flush=force_flush,
+                )
+                log_process_event(
+                    "server.asr_start",
+                    uid=self.client_uid,
+                    duration_seconds=round(duration, 3),
+                    samples=int(input_sample.shape[0]),
+                    language=getattr(self, "language", None),
+                )
                 result = self.transcribe_audio(input_sample)
+                elapsed = time.time() - t0
+                log_process_event(
+                    "server.asr_end",
+                    uid=self.client_uid,
+                    duration_seconds=round(duration, 3),
+                    latency_seconds=round(elapsed, 3),
+                    result_count=len(result) if result is not None else 0,
+                    language=getattr(self, "language", None),
+                    empty=result is None,
+                )
 
                 if result is None or self.language is None:
                     self.timestamp_offset += duration
+                    if force_flush:
+                        self.final_flush_requested = False
+                        self.final_flush_completed.set()
+                        self.exit = True
+                        logging.info("Exiting speech to text thread")
+                        break
                     time.sleep(0.25)    # wait for voice activity, result is None when no voice activity
                     continue
                 wl_metrics.track_transcription_latency(time.time() - t0)
                 wl_metrics.track_audio_processed(duration)
                 self.handle_transcription_output(result, duration)
+                if force_flush:
+                    self.final_flush_requested = False
+                    self.final_flush_completed.set()
+                    self.exit = True
+                    logging.info("Exiting speech to text thread")
+                    break
 
             except Exception as e:
                 logging.error(f"[ERROR]: Failed to transcribe audio chunk: {e}")
                 wl_metrics.track_error("transcription")
+                if force_flush:
+                    self.final_flush_requested = False
+                    self.final_flush_completed.set()
+                    self.exit = True
+                    logging.info("Exiting speech to text thread")
+                    break
                 time.sleep(0.01)
+            finally:
+                self.force_flush_current = False
 
     def transcribe_audio(self):
         raise NotImplementedError
 
     def handle_transcription_output(self, result, duration):
         raise NotImplementedError
+
+    def request_final_flush(self):
+        """Ask the ASR loop to process remaining buffered audio promptly."""
+        self.final_flush_completed.clear()
+        self.final_flush_requested = True
     
     def format_segment(
         self,
@@ -252,6 +332,17 @@ class ServeClientBase(object):
         else:
             self.frames_np = np.concatenate((self.frames_np, frame_np), axis=0)
         self.last_audio_arrived_at = time.time()
+        buffer_samples = int(self.frames_np.shape[0])
+        log_process_event(
+            "server.audio_buffer_update",
+            uid=self.client_uid,
+            received_samples=int(frame_np.shape[0]),
+            received_duration_seconds=round(frame_np.shape[0] / self.RATE, 3),
+            buffer_samples=buffer_samples,
+            buffer_duration_seconds=round(buffer_samples / self.RATE, 3),
+            frames_offset_seconds=round(self.frames_offset, 3),
+            timestamp_offset_seconds=round(self.timestamp_offset, 3),
+        )
         self.lock.release()
 
     def should_wait_for_speech_boundary(self, now=None):
@@ -368,6 +459,7 @@ class ServeClientBase(object):
             segments = processed
 
         if not segments:
+            log_process_event("server.send_to_client", uid=self.client_uid, segment_count=0, skipped=True)
             return segments
 
         try:
@@ -376,6 +468,23 @@ class ServeClientBase(object):
                     "uid": self.client_uid,
                     "segments": segments,
                 })
+            )
+            log_process_event(
+                "server.send_to_client",
+                uid=self.client_uid,
+                segment_count=len(segments),
+                completed_count=sum(1 for seg in segments if seg.get("completed", False)),
+                segments=[
+                    {
+                        "start": seg.get("start"),
+                        "end": seg.get("end"),
+                        "completed": seg.get("completed"),
+                        "score": seg.get("reliability_score"),
+                        "action": seg.get("reliability_action"),
+                        "text": preview_text(seg.get("text")),
+                    }
+                    for seg in segments
+                ],
             )
             for seg in segments:
                 wl_metrics.track_segment_emitted(completed=seg.get("completed", False))
@@ -608,6 +717,18 @@ class ServeClientBase(object):
             window_duration_seconds=duration,
             no_speech_threshold=self.no_speech_thresh,
         )
+        log_process_event(
+            "server.local_agreement_result",
+            uid=self.client_uid,
+            input_segment_count=len(segments),
+            completed_count=len(result.completed),
+            partial_present=result.partial is not None,
+            confirmed_until_seconds=round(result.confirmed_until, 3),
+            processing_offset_seconds=round(self.processing_offset, 3),
+            window_duration_seconds=round(duration, 3),
+            completed_preview=[preview_text(item.get("text")) for item in result.completed],
+            partial_preview=preview_text(result.partial.get("text")) if result.partial is not None else None,
+        )
 
         for completed in result.completed:
             segment = self.format_segment(
@@ -615,6 +736,9 @@ class ServeClientBase(object):
                 completed["end"],
                 completed["text"],
                 completed=True,
+                no_speech_prob=completed.get("no_speech_prob"),
+                avg_logprob=completed.get("avg_logprob"),
+                compression_ratio=completed.get("compression_ratio"),
             )
             self.transcript.append(segment)
             self.text.append(completed["text"])
@@ -630,13 +754,38 @@ class ServeClientBase(object):
                 self.timestamp_offset = max(self.timestamp_offset, retained_offset)
 
         last_segment = None
-        if result.partial is not None:
+        force_flush = bool(getattr(self, "force_flush_current", False))
+        if force_flush and result.partial is not None:
+            partial = result.partial
+            segment = self.format_segment(
+                partial["start"],
+                partial["end"],
+                partial["text"],
+                completed=True,
+                no_speech_prob=partial.get("no_speech_prob"),
+                avg_logprob=partial.get("avg_logprob"),
+                compression_ratio=partial.get("compression_ratio"),
+            )
+            self.transcript.append(segment)
+            self.text.append(partial["text"])
+            log_process_event(
+                "server.local_agreement_final_partial_promoted",
+                uid=self.client_uid,
+                start=segment.get("start"),
+                end=segment.get("end"),
+                text=preview_text(segment.get("text")),
+            )
+            last_segment = None
+        elif result.partial is not None:
             partial = result.partial
             last_segment = self.format_segment(
                 partial["start"],
                 partial["end"],
                 partial["text"],
                 completed=False,
+                no_speech_prob=partial.get("no_speech_prob"),
+                avg_logprob=partial.get("avg_logprob"),
+                compression_ratio=partial.get("compression_ratio"),
             )
 
         self._trim_transcript()

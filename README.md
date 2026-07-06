@@ -302,8 +302,25 @@ uv run python -m src.main --record --preprocess --transcribe --seconds 30
 | `--block-size`         | `1024`           | Ukuran blok audio per callback (frame). |
 | `--queue-size`         | `64`             | Maks blok audio yang diantrekan per stream. |
 | `--mic-channels`       | `1`              | Channel mikrofon (mono = 1). |
+| `--mic-device`         | default OS       | Index/nama input microphone. Pakai ini untuk memilih mic headset atau mic laptop. |
+| `--speaker-device`     | default speaker  | Index/nama speaker loopback. Pakai ini untuk memilih output headset atau speaker laptop yang sedang dipakai meeting. |
+| `--mic-client-vad` / `--no-mic-client-vad` | on | VAD ringan di client untuk mic. Matikan sementara jika suara mic terbukti hilang di `logs/process.log`. |
+| `--speaker-client-vad` / `--no-speaker-client-vad` | off | VAD ringan di client untuk speaker/system audio. Default off karena volume loopback aplikasi meeting/YouTube sering rendah dan berisiko membuang ucapan sebelum ASR. |
 | `--output-dir`         | `audio`          | Direktori output WAV (hanya batch mode). |
 | `--seconds`            | `3.0`            | Durasi rekaman (hanya `--record`). |
+
+Contoh memilih headset:
+
+```powershell
+uv run python -m src.main --live --mic-device "Headset" --speaker-device "Headset"
+```
+
+Nilai device bisa berupa index atau potongan nama perangkat. Web UI dan desktop
+UI menampilkan daftar device yang sudah diringkas sehingga pengguna bisa memilih
+mic headset, mic laptop, speaker headset, atau speaker laptop tanpa melihat
+duplikasi internal Windows seperti MME/DirectSound/WDM-KS, Sound Mapper, Stereo
+Mix, atau PC Speaker. Endpoint speaker tetap dipilih dari daftar loopback
+terpisah.
 
 ### Parameter WhisperLive
 
@@ -321,6 +338,10 @@ uv run python -m src.main --record --preprocess --transcribe --seconds 30
 | `--whisperlive-no-speech-thresh` | `0.75` | Filter `no_speech_prob` segment di WhisperLive. Lebih longgar agar kandidat transcript tidak habis dibuang. |
 | `--live-chunk-seconds` | `0.5` | Durasi kirim audio dari client. 500 ms menekan overhead paket tanpa membuat transcript terasa lambat. |
 | `--audio-format` | `int16` | Format payload audio ke WhisperLive. PCM16 lebih hemat bandwidth dibanding `float32`. |
+| `--auto-reconnect` / `--no-auto-reconnect` | on | Reconnect otomatis jika WebSocket putus. Saat aktif, sesi tidak langsung berhenti ketika server/network transient error. |
+| `--reconnect-initial-backoff-seconds` | `1` | Delay awal sebelum reconnect ulang setelah disconnect. |
+| `--reconnect-max-backoff-seconds` | `30` | Batas maksimum exponential backoff reconnect. |
+| `--reconnect-buffer-seconds` | `30` | Durasi maksimum buffer chunk audio lokal per source saat reconnect. Jika buffer penuh, chunk tertua dibuang agar audio terbaru tetap diprioritaskan. |
 | `--local-agreement` / `--no-local-agreement` | on | Server memakai sliding window dan hanya mengunci teks yang stabil di dua hipotesis berurutan. |
 | `--local-agreement-window-seconds` | `20` | Durasi maksimum buffer konteks server. Cukup untuk konteks meeting tanpa membuat inferensi terlalu berat. |
 | `--local-agreement-hop-seconds` | `3` | Interval minimum antar transkripsi window jika ada audio baru. Lebih kecil = lebih realtime, lebih berat. |
@@ -332,7 +353,7 @@ uv run python -m src.main --record --preprocess --transcribe --seconds 30
 | `--debug-chunk-archive` / `--no-debug-chunk-archive` | off | Simpan setiap chunk sebagai WAV hanya untuk debugging. Default off agar disk I/O rendah. |
 | `--chunk-archive-dir` | `audio/chunks` | Direktori chunk debug saat `--debug-chunk-archive` aktif. |
 | `--initial-prompt` | prompt EYD/PUEBI konservatif | Instruksi decode Bahasa Indonesia: gunakan ejaan baku hanya untuk kata yang jelas dan jangan menambah isi. |
-| `--hotwords` | glossary PLN/teknis | Istilah yang perlu dipertahankan seperti `API`, `database`, `PLN`, `meteran`, `token listrik`. |
+| `--hotwords` | kosong | Istilah bantu decode. Default kosong karena hotwords dapat bocor menjadi transcript saat audio lemah/noisy. Aktifkan hanya untuk sesi/domain yang benar-benar membutuhkan glossary. |
 
 ### Parameter lokal/batch
 
@@ -359,13 +380,43 @@ uv run python -m src.main --record --preprocess --transcribe --seconds 30
 
 | Mode | File default | Catatan |
 | --- | --- | --- |
-| Live CLI / UI | `audio/transcript_log.json` | JSON append-style, disimpan setiap hasil final diterima. |
+| Live CLI / UI | `audio/transcript_log.json` | JSON append-style. Entry `stability=candidate` adalah live hypothesis/review; entry `stability=stable` adalah hasil completed Local Agreement. |
 | Live chunk archive debug | `audio/chunks/<session>/<source>/*.wav` | Hanya dibuat saat `--debug-chunk-archive` aktif. Default produksi tidak menulis ribuan file kecil. |
 | Batch phase 4 | `audio/transcript.phase4.json` | Output lengkap mode `--transcribe`. |
 | Diagnostik client | `logs/transcriber.log` | Detail koneksi, chunk audio, VAD/preprocess, dan status WhisperLive. |
+| Process log client | `logs/process.log` | JSONL event per tahap: capture start, backend/device, chunk created, VAD pass/drop, queue, WebSocket, SERVER_READY, chunk sent, END_OF_AUDIO, transcript received. |
+| Process log server | `logs/whisperlive/process.log` | JSONL event dari container: client connected, options, audio received, buffer size, boundary wait/process, ASR start/end, local agreement, TVE score/pending/drop/emit, send to client. |
 
 Gunakan `--transcript-log audio\nama_file.json` untuk menyimpan live transcript
 ke file berbeda.
+
+Untuk observability production, gunakan process log sebagai sumber investigasi
+utama karena setiap baris adalah JSON mandiri.
+
+Reconnect otomatis menulis event tambahan ke `logs/process.log`:
+
+- `client.chunk_buffered`: chunk ditahan di RAM karena source sedang disconnected.
+- `client.reconnect_status`: percobaan reconnect, gagal, atau berhasil.
+- `client.reconnect_buffer_flushed`: buffer lokal berhasil dikirim ulang ke server.
+
+Buffer reconnect bersifat bounded per source dan default-nya 30 detik. Ketika
+buffer penuh, chunk tertua dibuang agar audio terbaru tetap diprioritaskan.
+
+```powershell
+Get-Content -Wait logs\process.log
+Get-Content -Wait logs\whisperlive\process.log
+```
+
+Jika transcript mic kosong, cek event `client.vad_drop` di `logs/process.log`.
+Jika mayoritas reason adalah `vad_silence`, coba pilih device mic yang benar
+atau jalankan sementara dengan `--no-mic-client-vad` untuk memastikan audio
+benar-benar masuk ke server.
+
+Jika transcript mic justru berisi audio meeting/speaker, biasanya device mic
+yang dipilih adalah endpoint salah seperti Stereo Mix/loopback atau mic headset
+menangkap suara output. Web UI menyaring alias tersebut dari dropdown mic; cek
+`/api/audio-devices` untuk melihat `diagnostics.raw_mic_count` dan jumlah device
+mic yang benar-benar ditampilkan.
 
 ## Kualitas Transkrip
 

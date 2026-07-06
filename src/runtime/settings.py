@@ -1,5 +1,3 @@
-"""Environment-backed runtime settings helpers."""
-
 from __future__ import annotations
 
 import os
@@ -7,28 +5,31 @@ from pathlib import Path
 
 
 def load_env_file(path: Path = Path(".env")) -> None:
-    """Load simple KEY=VALUE pairs from .env without overriding real env vars."""
+    # memuat environtment variabel dari file .env ke dalam os.environ
 
-    if not path.exists():
+    if not path.exists(): # jika tidak ada
+        print(f"File .env tidak ditemukan di {path.resolve()}.")
         return
     for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
+        line = raw_line.strip() # menghapus spasi
+
         if not line or line.startswith("#") or "=" not in line:
             continue
-        key, value = line.split("=", 1)
+
+        key, value = line.split("=", 1) # memisahkan key dan value
         key = key.strip()
-        value = value.strip().strip('"').strip("'")
+        value = value.strip().strip('"').strip("'") # menghapus tanda kutip di awal dan akhir value
         if key:
-            os.environ.setdefault(key, value)
+            os.environ.setdefault(key, value) # menambahkan key dan value ke os.environ
 
 
 def env_optional(name: str) -> str | None:
-    value = os.getenv(name)
-    return value if value else None
+    value = os.getenv(name) # mengambil nilai dari environtment variabel
+    return value if value else None # mengembalikan nilai jika ada, jika tidak mengembalikan None
 
 
 def env_str(name: str, default: str) -> str:
-    return os.getenv(name) or default
+    return os.getenv(name) or default 
 
 
 def env_int(name: str, default: int) -> int:

@@ -391,6 +391,20 @@
         </div>
         <div class="inline">
           <div class="field">
+            <label for="micDevice">Mic Device</label>
+            <select id="micDevice">
+              <option value="">Default microphone</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="speakerDevice">Speaker Device</label>
+            <select id="speakerDevice">
+              <option value="">Default speaker loopback</option>
+            </select>
+          </div>
+        </div>
+        <div class="inline">
+          <div class="field">
             <label for="vad">VAD Threshold</label>
             <input id="vad" type="number" min="0.1" max="0.95" step="0.01" value="0.55" />
           </div>
@@ -453,6 +467,8 @@
         <label class="check-row"><input id="localAgreement" type="checkbox" checked /> Local agreement</label>
         <label class="check-row"><input id="dynamicPrompt" type="checkbox" checked /> Dynamic prompt</label>
         <label class="check-row"><input id="speechBoundary" type="checkbox" checked /> Speech boundary detection</label>
+        <label class="check-row"><input id="micClientVad" type="checkbox" checked /> Mic client VAD</label>
+        <label class="check-row"><input id="speakerClientVad" type="checkbox" /> Speaker client VAD</label>
         <label class="check-row"><input id="hidePartials" type="checkbox" checked /> Hide unstable partials</label>
         <label class="check-row"><input id="debugChunkArchive" type="checkbox" /> Debug chunk archive</label>
         <label class="check-row"><input id="resetTranscript" type="checkbox" checked /> Archive old transcript on start</label>
@@ -514,6 +530,10 @@
           model: $("model").value,
           language: $("language").value.trim() || "id",
           chunkSeconds: Number($("chunkSeconds").value || 0.5),
+          micDevice: $("micDevice").value,
+          speakerDevice: $("speakerDevice").value,
+          micClientVad: $("micClientVad").checked,
+          speakerClientVad: $("speakerClientVad").checked,
           vadThreshold: Number($("vad").value || 0.55),
           noSpeechThresh: Number($("noSpeech").value || 0.75),
           readyTimeout: Number($("readyTimeout").value || 300),
@@ -547,6 +567,31 @@
         renderStatus(data);
         renderTranscript(data.transcript.entries || []);
         renderLogs(data.logs || []);
+      }
+
+      async function loadAudioDevices() {
+        try {
+          const res = await fetch("/api/audio-devices");
+          const data = await res.json();
+          fillDeviceSelect("micDevice", data.mic || [], "Default microphone");
+          fillDeviceSelect("speakerDevice", data.speaker || [], "Default speaker loopback");
+        } catch {
+          // Device selection is optional; keep default entries if probing fails.
+        }
+      }
+
+      function fillDeviceSelect(id, devices, defaultLabel) {
+        const select = $(id);
+        const current = select.value;
+        select.innerHTML = `<option value="">${escapeHtml(defaultLabel)}</option>` + devices.map((device) => {
+          const id = device.id ?? device.index ?? "";
+          const suffix = device.channels ? ` (${device.channels} ch)` : "";
+          const label = device.label || device.name || id;
+          return `<option value="${escapeHtml(id)}">${escapeHtml(label)}${suffix}</option>`;
+        }).join("");
+        if ([...select.options].some((option) => option.value === current)) {
+          select.value = current;
+        }
       }
 
       function renderStatus(data) {
@@ -638,6 +683,7 @@
       $("filter").addEventListener("change", () => renderTranscript(latestEntries));
       $("search").addEventListener("input", () => renderTranscript(latestEntries));
 
+      loadAudioDevices();
       refresh();
       setInterval(refresh, 1500);
     </script>

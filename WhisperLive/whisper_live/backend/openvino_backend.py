@@ -141,8 +141,11 @@ class ServeClientOpenVINO(ServeClientBase):
         segments = []
         if len(result):
             self.t_start = None
+            transcript_len_before = len(self.transcript)
             last_segment = self.update_segments(result, duration)
-            segments = self.prepare_segments(last_segment)
+            segments = self.transcript[transcript_len_before:]
+            if last_segment is not None:
+                segments = segments + [last_segment]
 
         if len(segments):
             self.send_transcription_to_client(segments)

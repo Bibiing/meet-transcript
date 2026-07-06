@@ -13,6 +13,7 @@ dependencies = [
     "openai-whisper>=20250625",
     "numba>=0.62",
     "websocket-client>=1.8",
+    "PyQt6>=6.6",
 ]
 
 [dependency-groups]

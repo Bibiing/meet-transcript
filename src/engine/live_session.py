@@ -1,20 +1,3 @@
-"""Real-time live transcription session — concurrent streaming pipeline.
-
-Architecture
-------------
-Two capture threads (mic + speaker) accumulate raw AudioFrame objects
-until *chunk_seconds* worth of audio have been collected, then push the
-preprocessed chunks into a shared queue.  A single transcription loop on
-the main thread drains that queue, calls Whisper, and prints results as
-they arrive.
-
-Using a single transcription thread is intentional: Whisper is CPU-bound
-and not thread-safe, so serialising calls avoids race conditions and gives
-predictable memory usage.  The capture threads are non-blocking and will
-drop chunks if the transcription queue overflows (prefer fresh audio over
-stale buffered audio in a live-meeting scenario).
-"""
-
 from __future__ import annotations
 
 import logging
@@ -35,8 +18,14 @@ from src.capture.win_loopback import WindowsLoopbackConfig, WindowsLoopbackStrea
 from src.engine.preprocessing import AudioPreprocessor, PreprocessConfig, PreprocessedAudioChunk
 from src.engine.whisper import OpenAIWhisperTranscriber, TranscriptionResult, WhisperConfig
 from src.utils.formatter import format_transcript_line, result_to_line
-from src.utils.os_detector import OperatingSystem, detect_os
-from src.utils.transcript_log import TranscriptLog
+from src.utils.logging import TranscriptLog, log_process_event
+from src.utils.os_detector import AudioBackend, get_audio_backend
+
+
+def detect_os() -> object:
+    """Compatibility shim untuk test lama; runtime memakai get_audio_backend()."""
+
+    return get_audio_backend()
 
 _log = logging.getLogger(__name__)
 
@@ -66,6 +55,8 @@ class LiveSessionConfig:
     sample_rate: int | None = None
     block_size: int = 1_024
     queue_size: int = 128
+    mic_device: int | str | None = None
+    speaker_device: int | str | None = None
     max_chunk_queue_size: int = 16
     max_chunks_processed: int | None = None
     transcript_log_path: Path | None = None
@@ -140,6 +131,7 @@ def run_live_session(
                 MicrophoneConfig(
                     sample_rate=cfg.sample_rate,
                     block_size=cfg.block_size,
+                    device=cfg.mic_device,
                     queue_size=cfg.queue_size,
                 )
             )
@@ -164,13 +156,14 @@ def run_live_session(
             _log.warning("live session: mic stream unavailable — %s", exc)
 
     if cfg.source in ("speaker", "both"):
-        os_ = detect_os()
-        if os_ is OperatingSystem.WINDOWS:
+        audio_backend = get_audio_backend()
+        if audio_backend is AudioBackend.WASAPI_LOOPBACK:
             try:
                 spk_stream = WindowsLoopbackStream(
                     WindowsLoopbackConfig(
                         sample_rate=cfg.sample_rate,
                         block_size=cfg.block_size,
+                        device=cfg.speaker_device,
                         queue_size=cfg.queue_size,
                     )
                 )
@@ -200,7 +193,7 @@ def run_live_session(
         else:
             _log.warning(
                 "live session: speaker capture not supported on %s — mic only",
-                os_.value,
+                audio_backend.value,
             )
 
     if not capture_streams:
@@ -363,6 +356,15 @@ def _reader_thread(
         source_name = frame.source
         frames_seen += 1
         if not first_frame_logged:
+            log_process_event(
+                "client.capture_start",
+                source=frame.source,
+                sample_rate=frame.sample_rate,
+                channels=frame.channels,
+                frame_count=frame.frame_count,
+                frame_rms=round(_frame_rms(frame), 6),
+                status=frame.status or "",
+            )
             _log.info(
                 "live session: first frame source=%s sample_rate=%s channels=%s frames=%s rms=%.6f status=%s",
                 frame.source,
@@ -382,9 +384,20 @@ def _reader_thread(
 
         input_rms = _buffer_rms(buffer)
         input_frames = sum(frame.frame_count for frame in buffer)
+        log_process_event(
+            "client.chunk_created",
+            source=source_name,
+            duration_seconds=round(total_duration, 3),
+            input_frames=input_frames,
+            input_rms=round(input_rms, 6),
+            queue_size=chunk_queue.qsize(),
+        )
         # Preprocess the accumulated buffer
         chunks = preprocessor.preprocess_frames(buffer)
         buffer = []
+        for decision in preprocessor.last_decisions:
+            event = "client.vad_pass" if decision.get("passed") else "client.vad_drop"
+            log_process_event(event, **decision, queue_size=chunk_queue.qsize())
         if not chunks:
             dropped_by_preprocess += 1
             _log.info(
@@ -401,6 +414,17 @@ def _reader_thread(
             try:
                 chunk_queue.put_nowait(chunk)
                 chunks_enqueued += 1
+                log_process_event(
+                    "client.chunk_queued",
+                    source=chunk.source,
+                    start_seconds=round(chunk.start_seconds, 3),
+                    duration_seconds=round(chunk.duration_seconds, 3),
+                    frame_count=chunk.frame_count,
+                    input_rms_db=round(chunk.input_rms_db, 2),
+                    output_rms_db=round(chunk.rms_db, 2),
+                    queue_size=chunk_queue.qsize(),
+                    chunks_enqueued=chunks_enqueued,
+                )
                 _log.debug(
                     "live session: queued chunk source=%s duration=%.3f input_rms_db=%.2f output_rms_db=%.2f queued=%s",
                     chunk.source,
@@ -419,6 +443,13 @@ def _reader_thread(
                     chunk_queue.put_nowait(chunk)
                     chunks_enqueued += 1
                     stats.chunks_dropped += 1
+                    log_process_event(
+                        "client.chunk_queue_drop",
+                        source=source_name,
+                        reason="queue_full_drop_oldest",
+                        queue_size=chunk_queue.qsize(),
+                        chunks_dropped=stats.chunks_dropped,
+                    )
                     _log.warning(
                         "live session: chunk queue full — dropped oldest %s chunk", source_name
                     )
@@ -438,9 +469,24 @@ def _reader_thread(
         )
         if partial_duration >= preprocessor.config.min_chunk_seconds:
             for chunk in preprocessor.preprocess_frames(buffer):
+                for decision in preprocessor.last_decisions:
+                    event = "client.vad_pass" if decision.get("passed") else "client.vad_drop"
+                    log_process_event(event, final_partial=True, **decision, queue_size=chunk_queue.qsize())
                 try:
                     chunk_queue.put_nowait(chunk)
                     chunks_enqueued += 1
+                    log_process_event(
+                        "client.chunk_queued",
+                        source=chunk.source,
+                        start_seconds=round(chunk.start_seconds, 3),
+                        duration_seconds=round(chunk.duration_seconds, 3),
+                        frame_count=chunk.frame_count,
+                        input_rms_db=round(chunk.input_rms_db, 2),
+                        output_rms_db=round(chunk.rms_db, 2),
+                        queue_size=chunk_queue.qsize(),
+                        chunks_enqueued=chunks_enqueued,
+                        final_partial=True,
+                    )
                     _log.info(
                         "live session: queued final partial chunk source=%s duration=%.3f input_rms_db=%.2f output_rms_db=%.2f",
                         chunk.source,
@@ -450,6 +496,13 @@ def _reader_thread(
                     )
                 except queue.Full:
                     stats.chunks_dropped += 1
+                    log_process_event(
+                        "client.chunk_queue_drop",
+                        source=source_name,
+                        reason="final_partial_queue_full",
+                        queue_size=chunk_queue.qsize(),
+                        chunks_dropped=stats.chunks_dropped,
+                    )
                     _log.warning("live session: final partial chunk dropped because queue is full source=%s", source_name)
     _log.debug(
         "live session: reader thread exiting (source=%s frames_seen=%s chunks_enqueued=%s dropped_windows=%s)",

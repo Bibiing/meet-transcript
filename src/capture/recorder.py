@@ -1,5 +1,3 @@
-"""Phase 2 audio capture recorder."""
-
 from __future__ import annotations
 
 import argparse
@@ -17,48 +15,49 @@ from src.capture.mac_sys_audio import MacSystemAudioConfig, MacSystemAudioStream
 from src.capture.mic_stream import MicrophoneConfig, MicrophoneStream
 from src.capture.wav_sink import write_frames_to_wav
 from src.capture.win_loopback import WindowsLoopbackConfig, WindowsLoopbackStream
-from src.utils.os_detector import OperatingSystem, detect_os
+from src.utils.os_detector import AudioBackend, get_audio_backend
 
 _log = logging.getLogger(__name__)
 
-
 CaptureSource = Literal["mic", "speaker", "both"]
 
-
 @dataclass(frozen=True, slots=True)
-class Phase2CaptureOptions:
-    seconds: float = 3.0
-    output_dir: Path = Path("audio")
-    source: CaptureSource = "both"
-    sample_rate: int | None = None      
-    block_size: int = 1_024
-    queue_size: int = 64
-    mic_channels: int | None = None     
-    speaker_channels: int | None = None 
+class CaptureOptions:
+    seconds: float = 3.0                            # durasi perekaman dalam detik
+    output_dir: Path = Path("audio")                # direktori output untuk menyimpan file WAV
+    source: CaptureSource = "both"                  # sumber audio yang akan direkam: "mic", "speaker", atau "both"
+    sample_rate: int | None = None                  # sample rate dalam Hz
+    block_size: int = 1_024                         # ukuran blok audio dalam sampel
+    queue_size: int = 64                            # ukuran antrian untuk buffer audio
+    mic_channels: int | None = None                 # jumlah saluran untuk mikrofon
+    speaker_channels: int | None = None             # jumlah saluran untuk speaker
+    mic_device: int | str | None = None             # perangkat mikrofon
+    speaker_device: int | str | None = None         # perangkat speaker
 
 
 @dataclass(frozen=True, slots=True)
 class CaptureResult:
-    source: str
-    path: Path | None = None
-    frame_count: int = 0
-    duration_seconds: float = 0.0
-    sample_rate: int = 0
-    channels: int = 0
-    warning: str = ""
+    source: str                                     # sumber audio yang direkam: "mic" atau "speaker"
+    path: Path | None = None                        # path ke file WAV yang dihasilkan
+    frame_count: int = 0                            # jumlah frame yang direkam
+    duration_seconds: float = 0.0                   # durasi perekaman dalam detik
+    sample_rate: int = 0                            # sample rate dalam Hz
+    channels: int = 0                               # jumlah saluran audio
+    warning: str = ""                               # peringatan jika ada masalah selama perekaman
 
     @property
-    def ok(self) -> bool:
-        return self.path is not None and not self.warning
+    def ok(self) -> bool: return self.path is not None and not self.warning # mengembalikan True jika perekaman berhasil dan tidak ada peringatan
 
-
+# rekam audio dari stream selama beberapa detik dan kembalikan daftar frame audio
 def record_stream(stream: object, seconds: float) -> list[AudioFrame]:
     frames: list[AudioFrame] = []
     stream.start()
     try:
-        deadline = monotonic() + seconds + 3.0
-        captured_seconds = 0.0
-        while captured_seconds < seconds and monotonic() < deadline:
+        deadline = monotonic() + seconds + 3.0 # tambahkan 3 detik untuk toleransi
+        captured_seconds = 0.0  # jumlah detik yang telah direkam
+
+        # loop untuk membaca frame dari stream hingga durasi yang diminta tercapai atau waktu habis
+        while captured_seconds < seconds and monotonic() < deadline:    
             frame = stream.read_frame(timeout=0.25)
             if frame is not None:
                 frames.append(frame)
@@ -68,65 +67,68 @@ def record_stream(stream: object, seconds: float) -> list[AudioFrame]:
     return frames
 
 
-def run_phase2_capture(options: Phase2CaptureOptions) -> list[CaptureResult]:
-    """Record requested phase 2 streams to WAV files."""
-
+def run_capture(options: CaptureOptions) -> list[CaptureResult]:
     if options.seconds <= 0:
-        raise ValueError("seconds must be positive")
+        raise ValueError("invalid seconds: must be positive")
     if options.sample_rate is not None and options.sample_rate <= 0:
-        raise ValueError("sample_rate must be positive")
+        raise ValueError("invalid sample_rate: must be positive")
     if options.block_size <= 0:
-        raise ValueError("block_size must be positive")
+        raise ValueError("invalid block_size: must be positive")
     if options.queue_size <= 0:
-        raise ValueError("queue_size must be positive")
+        raise ValueError("invalid queue_size: must be positive")
     if options.mic_channels is not None and options.mic_channels <= 0:
-        raise ValueError("mic_channels must be positive")
+        raise ValueError("invalid mic_channels: must be positive")
     if options.speaker_channels is not None and options.speaker_channels <= 0:
-        raise ValueError("speaker_channels must be positive")
+        raise ValueError("invalid speaker_channels: must be positive")
 
-    options.output_dir.mkdir(parents=True, exist_ok=True)
+    options.output_dir.mkdir(parents=True, exist_ok=True) 
     results: list[CaptureResult] = []
 
     if options.source in ("mic", "both"):
-        results.append(_record_microphone(options))
+        results.append(_record_microphone(options)) 
 
     if options.source in ("speaker", "both"):
-        results.append(_record_speaker(options))
+        results.append(_record_speaker(options, get_audio_backend()))
 
-    # Let PortAudio settle before process exit on slower hosts.
+    # tunggu untuk memastikan semua frame audio telah ditulis ke file WAV sebelum keluar
     sleep(0.05)
     return results
 
 
-def _record_microphone(options: Phase2CaptureOptions) -> CaptureResult:
+Phase2CaptureOptions = CaptureOptions
+run_phase2_capture = run_capture
+
+
+def _record_microphone(options: CaptureOptions) -> CaptureResult:
     try:
         stream = MicrophoneStream(
             MicrophoneConfig(
                 sample_rate=options.sample_rate,
                 channels=options.mic_channels,
                 block_size=options.block_size,
+                device=options.mic_device,
                 queue_size=options.queue_size,
             )
         )
-        frames = record_stream(stream, options.seconds)
-        return _write_result("mic", options.output_dir / "mic.wav", frames)
+        frames = record_stream(stream, options.seconds)                     # rekam audio dari stream mikrofon
+        return _write_result("mic", options.output_dir / "mic.wav", frames) # tulis hasil rekaman ke file WAV dan kembalikan hasilnya
     except CaptureError as exc:
         return CaptureResult(source="mic", warning=str(exc))
 
 
-def _record_speaker(options: Phase2CaptureOptions) -> CaptureResult:
-    operating_system = detect_os()
+def _record_speaker(options: CaptureOptions, audio_backend: AudioBackend) -> CaptureResult:
     try:
-        if operating_system is OperatingSystem.WINDOWS:
+        if audio_backend is AudioBackend.WASAPI_LOOPBACK:
             stream = WindowsLoopbackStream(
                 WindowsLoopbackConfig(
                     sample_rate=options.sample_rate,
                     channels=options.speaker_channels,
                     block_size=options.block_size,
+                    device=options.speaker_device,
                     queue_size=options.queue_size,
                 )
             )
-        elif operating_system is OperatingSystem.MACOS:
+        elif audio_backend is AudioBackend.SCREENCAPTUREKIT:
             stream = MacSystemAudioStream(
                 MacSystemAudioConfig(
                     sample_rate=options.sample_rate,
@@ -136,7 +138,7 @@ def _record_speaker(options: Phase2CaptureOptions) -> CaptureResult:
                 )
             )
         else:
-            return CaptureResult(source="speaker", warning=f"speaker capture is unsupported on {operating_system.value}")
+            return CaptureResult(source="speaker", warning=f"speaker capture is unsupported on {audio_backend.value}")
 
         frames = record_stream(stream, options.seconds)
         return _write_result("speaker", options.output_dir / "speaker.wav", frames)
@@ -204,8 +206,8 @@ def main() -> int:
     parser.add_argument("--speaker-channels", type=int, default=2)
     args = parser.parse_args()
 
-    results = run_phase2_capture(
-        Phase2CaptureOptions(
+    results = run_capture(
+        CaptureOptions(
             seconds=args.seconds,
             output_dir=args.output_dir,
             source=args.source,
