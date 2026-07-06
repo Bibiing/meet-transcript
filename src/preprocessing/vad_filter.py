@@ -1,5 +1,3 @@
-"""Voice activity detection filters for preprocessed audio."""
-
 from __future__ import annotations
 
 from dataclasses import dataclass

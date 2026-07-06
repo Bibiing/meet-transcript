@@ -4,9 +4,9 @@ from pathlib import Path
 
 import numpy as np
 
-from src.capture.audio_frame import AudioFrame
+from src.capture.models import AudioFrame
 from src.capture.wav_sink import write_frames_to_wav
-from src.engine.whisperlive_replay import _read_wav_as_frame
+from src.whisper.replay import _read_wav_as_frame
 
 
 def test_read_wav_as_frame_preserves_source_and_shape() -> None:

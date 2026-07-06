@@ -6,19 +6,12 @@ from dataclasses import dataclass
 import platform
 from typing import Any, Protocol
 
-from src.capture.audio_frame import AudioFrame, normalize_samples
+from src.capture.models import AudioFrame, normalize_samples
 from src.capture.errors import CaptureNotSupportedError
 from src.capture.queued_stream import Clock, QueuedAudioStream
 
 
-@dataclass(frozen=True, slots=True)
-class MacSystemAudioConfig:
-    sample_rate: int = 48_000
-    channels: int = 2
-    block_size: int = 1_024
-    dtype: str = "float32"
-    queue_size: int = 64
-    excludes_current_process_audio: bool = True
+from src.capture.models import MacSystemAudioConfig
 
 
 class ScreenCaptureKitProvider(Protocol):

@@ -4,31 +4,40 @@ import logging
 import queue
 import signal
 import threading
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from time import monotonic, perf_counter
 from typing import Literal
 
-from src.engine.preprocessing import PreprocessedAudioChunk
-from src.engine.transcript_merger import MEETING_SOURCE_LABELS, TranscriptMerger
-from src.engine.whisperlive_client import (
+from src.preprocessing.core import PreprocessedAudioChunk
+from src.whisper.merger import MEETING_SOURCE_LABELS, TranscriptMerger
+from src.whisper.client_base import (
     DEFAULT_READY_TIMEOUT_SECONDS,
     WhisperLiveConnectionConfig,
     WhisperLiveProfile,
 )
-from src.utils.logging import TranscriptLog, log_process_event
+from src.utils.logging import (
+    TranscriptLog,
+    clear_process_log_context,
+    configure_process_logging,
+    flush_process_log_summaries,
+    log_process_event,
+)
 
-from src.engine.whisperlive_client_reconnect import (
+from src.whisper.client_reconnect import (
     ReconnectPolicy,
     _BufferedReconnectClient,
 )
-from src.engine.whisperlive_capture import _build_capture_streams
-from src.engine.whisperlive_session_utils import (
+from src.whisper.capture import _build_capture_streams
+from src.whisper.session_utils import (
     TranscriptCallback,
     LogCallback,
     MergedEntryCallback,
     _ChunkArchive,
     _PartialTranscriptPreview,
+    _RollingAudioArchive,
+    TranscriptQualityTracker,
     _wait_for_final_results,
     _requested_sources,
     _events_from_segments,
@@ -39,61 +48,9 @@ from src.engine.whisperlive_session_utils import (
 _log = logging.getLogger(__name__)
 
 
-# konfigurasi default untuk sesi live WhisperLive
-@dataclass(frozen=True, slots=True)
-class WhisperLiveSessionConfig:
-    # server dan koneksi
-    server_host: str = "localhost"
-    server_port: int = 9090
-    use_wss: bool = False
-    api_key: str | None = None
-    ready_timeout: float = DEFAULT_READY_TIMEOUT_SECONDS
-    
-    # audio capture dan preprocessing
-    chunk_seconds: float = 0.5
-    audio_format: Literal["float32", "int16", "uint8"] = "int16"
-    source: Literal["mic", "speaker", "both"] = "both"
-    sample_rate: int | None = None
-    block_size: int = 1_024
-    queue_size: int = 128
-    mic_device: int | str | None = None
-    speaker_device: int | str | None = None
-    
-    # vad (voice activity detection)
-    mic_client_vad: bool = True
-    speaker_client_vad: bool = False
-    max_chunk_queue_size: int = 32
-    
-    # koneksi dan reconnect
-    auto_reconnect: bool = True
-    reconnect_initial_backoff_seconds: float = 1.0
-    reconnect_max_backoff_seconds: float = 30.0
-    reconnect_buffer_seconds: float = 30.0
-    final_drain_seconds: float = 10.0
-    
-    # output dan logging
-    show_partials: bool = True
-    log_transcript: Path | None = None
-    chunk_archive_dir: Path | None = None
-    
-    profile: WhisperLiveProfile = field(default_factory=WhisperLiveProfile)
+from src.whisper.models import WhisperLiveSessionConfig, WhisperLiveSessionStats
 
-# stats untuk sesi live WhisperLive
-@dataclass
-class WhisperLiveSessionStats:
-    chunks_sent: int = 0
-    chunks_dropped: int = 0
-    chunks_buffered: int = 0
-    reconnect_attempts: int = 0
-    reconnect_successes: int = 0
-    results_received: int = 0
-    start_time: float = field(default_factory=perf_counter)
-
-    # waktu yang telah berlalu sejak sesi dimulai
-    @property
-    def elapsed_seconds(self) -> float:
-        return perf_counter() - self.start_time
-
+# live mode
 # capture mic/speaker audio dan stream setiap source ke WhisperLive
 # Args:
 #     config: konfigurasi sesi.
@@ -106,16 +63,21 @@ class WhisperLiveSessionStats:
 #     WhisperLiveSessionStats: statistik runtime untuk sesi yang telah selesai. 
 
 def run_whisperlive_session(
-    config: WhisperLiveSessionConfig | None = None,
+    config: WhisperLiveSessionConfig,
     *,
-    on_result: TranscriptCallback | None = None,
-    stop_event: threading.Event | None = None,
-    on_log: LogCallback | None = None,
-    on_merged_entry: MergedEntryCallback | None = None,
-    install_signal_handlers: bool = True,
+    on_result: TranscriptCallback | None = None, # hasil yang telah di merge
+    stop_event: threading.Event | None = None, # event eksternal untuk menghentikan sesi
+    on_log: LogCallback | None = None, # callback log/status untuk UI; None berarti print ke stdout
+    on_merged_entry: MergedEntryCallback | None = None, # callback entry hasil merge untuk GUI
+    install_signal_handlers: bool = True, # False saat berjalan di thread GUI/QThread
 ) -> WhisperLiveSessionStats:
-    cfg = config or WhisperLiveSessionConfig()
+    cfg = config
     stats = WhisperLiveSessionStats()
+    configure_process_logging(
+        session_id=cfg.session_id,
+        include_hot_path=cfg.process_log_include_hot_path,
+        summary_interval_seconds=cfg.process_log_summary_interval_seconds,
+    )
     _stop = stop_event or threading.Event()
     chunk_queue: queue.Queue[PreprocessedAudioChunk] = queue.Queue(maxsize=cfg.max_chunk_queue_size)
     reader_threads: list[threading.Thread] = []
@@ -127,17 +89,61 @@ def run_whisperlive_session(
         else:
             print(text, flush=True)
 
+    # buat log transcript
     transcript_log: TranscriptLog | None = None
     if cfg.log_transcript:
-        transcript_log = TranscriptLog(cfg.log_transcript)
+        transcript_log = TranscriptLog.load(cfg.log_transcript) if cfg.resume_transcript_log else TranscriptLog(cfg.log_transcript)
         transcript_log.save()
-    transcript_merger = TranscriptMerger()
+
+    transcript_merger = TranscriptMerger(max_emitted_keys=cfg.merger_emitted_cache_max_entries)
     transcript_lock = threading.Lock()
+    
     candidate_transcript_keys: set[tuple[str, int, str]] = set()
+    candidate_transcript_order: deque[tuple[str, int, str]] = deque()
     partial_preview = _PartialTranscriptPreview() if cfg.show_partials else None
     chunk_archive = _ChunkArchive(cfg.chunk_archive_dir) if cfg.chunk_archive_dir is not None else None
+    rolling_archive = (
+        _RollingAudioArchive(
+            cfg.rolling_audio_archive_dir,
+            session_id=cfg.session_id,
+            segment_seconds=cfg.rolling_audio_segment_seconds,
+            metadata={
+                "session_id": cfg.session_id,
+                "model": cfg.profile.model,
+                "language": cfg.profile.language,
+                "source": cfg.source,
+                "chunk_seconds": cfg.chunk_seconds,
+                "audio_format": cfg.audio_format,
+                "mic_preprocess": {
+                    "client_vad": cfg.mic_client_vad,
+                    "vad_rms_threshold": cfg.mic_vad_rms_threshold,
+                    "vad_peak_threshold": cfg.mic_vad_peak_threshold,
+                    "vad_speech_fraction": cfg.mic_vad_speech_fraction,
+                    "min_input_rms_db": cfg.mic_min_input_rms_db,
+                    "target_rms_db": cfg.mic_target_rms_db,
+                    "max_normalization_gain_db": cfg.mic_max_normalization_gain_db,
+                },
+                "speaker_preprocess": {
+                    "client_vad": cfg.speaker_client_vad,
+                    "vad_rms_threshold": cfg.speaker_vad_rms_threshold,
+                    "vad_peak_threshold": cfg.speaker_vad_peak_threshold,
+                    "vad_speech_fraction": cfg.speaker_vad_speech_fraction,
+                    "min_input_rms_db": cfg.speaker_min_input_rms_db,
+                    "target_rms_db": cfg.speaker_target_rms_db,
+                    "max_normalization_gain_db": cfg.speaker_max_normalization_gain_db,
+                },
+            },
+        )
+        if cfg.rolling_audio_archive_dir is not None
+        else None
+    )
+    quality_tracker = TranscriptQualityTracker()
+    if rolling_archive is not None:
+        stats.rolling_audio_dir = rolling_archive.root
+    
     log_process_event(
         "client.session_start",
+        session_id=cfg.session_id,
         server_host=cfg.server_host,
         server_port=cfg.server_port,
         use_wss=cfg.use_wss,
@@ -156,7 +162,42 @@ def run_whisperlive_session(
         reconnect_initial_backoff_seconds=cfg.reconnect_initial_backoff_seconds,
         reconnect_max_backoff_seconds=cfg.reconnect_max_backoff_seconds,
         reconnect_buffer_seconds=cfg.reconnect_buffer_seconds,
+        process_log_include_hot_path=cfg.process_log_include_hot_path,
+        process_log_summary_interval_seconds=cfg.process_log_summary_interval_seconds,
+        candidate_cache_max_entries=cfg.candidate_cache_max_entries,
+        merger_emitted_cache_max_entries=cfg.merger_emitted_cache_max_entries,
+        mic_preprocess={
+            "client_vad": cfg.mic_client_vad,
+            "vad_rms_threshold": cfg.mic_vad_rms_threshold,
+            "vad_peak_threshold": cfg.mic_vad_peak_threshold,
+            "vad_speech_fraction": cfg.mic_vad_speech_fraction,
+            "min_input_rms_db": cfg.mic_min_input_rms_db,
+            "target_rms_db": cfg.mic_target_rms_db,
+            "max_normalization_gain_db": cfg.mic_max_normalization_gain_db,
+        },
+        speaker_preprocess={
+            "client_vad": cfg.speaker_client_vad,
+            "vad_rms_threshold": cfg.speaker_vad_rms_threshold,
+            "vad_peak_threshold": cfg.speaker_vad_peak_threshold,
+            "vad_speech_fraction": cfg.speaker_vad_speech_fraction,
+            "min_input_rms_db": cfg.speaker_min_input_rms_db,
+            "target_rms_db": cfg.speaker_target_rms_db,
+            "max_normalization_gain_db": cfg.speaker_max_normalization_gain_db,
+        },
+        rolling_audio_archive_dir=cfg.rolling_audio_archive_dir,
+        rolling_audio_segment_seconds=cfg.rolling_audio_segment_seconds,
+        resume_transcript_log=cfg.resume_transcript_log,
     )
+
+    def _remember_candidate_key(key: tuple[str, int, str]) -> bool:
+        if key in candidate_transcript_keys:
+            return False
+        candidate_transcript_keys.add(key)
+        candidate_transcript_order.append(key)
+        while len(candidate_transcript_order) > max(1, cfg.candidate_cache_max_entries):
+            oldest = candidate_transcript_order.popleft()
+            candidate_transcript_keys.discard(oldest)
+        return True
 
     def handle_status(source: str, message: dict) -> None:
         # Status WebSocket dipisah dari transcript supaya UI bisa menampilkan
@@ -281,6 +322,7 @@ def run_whisperlive_session(
         if partial_preview is not None:
             partial_preview.show(source, segments)
         for event in _events_from_segments(source, cfg.profile.model, cfg.profile.language, segments):
+            quality_tracker.observe_event(event)
             if not event.completed and transcript_log is not None and event.result.text.strip():
                 # Candidate disimpan sekali per window agar transcript audit
                 # tidak kosong ketika TVE menahan hasil sebagai belum final.
@@ -289,8 +331,7 @@ def run_whisperlive_session(
                     int(event.result.start_seconds // 3),
                     " ".join(event.result.text.lower().split())[:180],
                 )
-                if candidate_key not in candidate_transcript_keys:
-                    candidate_transcript_keys.add(candidate_key)
+                if _remember_candidate_key(candidate_key):
                     label = MEETING_SOURCE_LABELS.get(event.result.source, event.result.source.upper())
                     display = (
                         f"[{_format_timestamp(event.result.start_seconds)} - "
@@ -337,7 +378,8 @@ def run_whisperlive_session(
                     text=entry.result.text[:160],
                 )
                 _emit_merged_entry(entry, transcript_log, on_result, on_log=on_log, on_merged_entry=on_merged_entry)
-                stats.results_received += 1
+                quality_tracker.observe_emit(entry.result.source)
+                stats.add_result_received()
 
     # client reconnect buffer dan koneksi ke server WhisperLive
     connection_config = WhisperLiveConnectionConfig(
@@ -431,17 +473,15 @@ def run_whisperlive_session(
                     continue
                 client = clients.get(chunk.source)
                 if client is None:
-                    stats.chunks_dropped += 1
+                    stats.add_chunks_dropped()
                     continue
                 try:
                     if chunk_archive is not None:
                         chunk_archive.save(chunk)
+                    if rolling_archive is not None:
+                        rolling_archive.save(chunk)
                     outcome = client.send(chunk)
-                    stats.chunks_sent += outcome.sent
-                    stats.chunks_dropped += outcome.dropped
-                    stats.chunks_buffered += outcome.buffered
-                    stats.reconnect_attempts += outcome.reconnect_attempts
-                    stats.reconnect_successes += outcome.reconnect_successes
+                    stats.add_send_outcome(outcome)
                     log_process_event(
                         "client.chunk_sent",
                         source=chunk.source,
@@ -463,7 +503,7 @@ def run_whisperlive_session(
                         chunk.rms_db,
                     )
                 except Exception as exc:
-                    stats.chunks_dropped += 1
+                    stats.add_chunks_dropped()
                     log_process_event(
                         "client.chunk_send_error",
                         source=chunk.source,
@@ -489,7 +529,7 @@ def run_whisperlive_session(
                 if hasattr(signal, "SIGBREAK") and original_sigbreak is not None:
                     signal.signal(signal.SIGBREAK, original_sigbreak)
 
-            drained = _drain_pending_chunks(chunk_queue, clients, stats, chunk_archive)
+            drained = _drain_pending_chunks(chunk_queue, clients, stats, chunk_archive, rolling_archive)
             if drained:
                 _print(f"Finalisasi: mengirim {drained} chunk tersisa...")
             flushed_reconnect = _flush_reconnect_buffers(clients, stats, timeout_seconds=min(5.0, cfg.final_drain_seconds))
@@ -523,7 +563,15 @@ def run_whisperlive_session(
                     final_flush=True,
                 )
                 _emit_merged_entry(entry, transcript_log, on_result, on_log=on_log, on_merged_entry=on_merged_entry)
-                stats.results_received += 1
+                quality_tracker.observe_emit(entry.result.source)
+                stats.add_result_received()
+
+            if rolling_archive is not None:
+                rolling_archive.close()
+                _print(f"Rolling audio archive: {rolling_archive.root}")
+
+            transcript_summary = quality_tracker.summary()
+            stats.set_transcript_summary(transcript_summary)
 
             _print("\n" + "=" * 60)
             _print(f"Sesi selesai. Durasi: {elapsed:.0f}s")
@@ -538,7 +586,29 @@ def run_whisperlive_session(
                 _print(f"Transcript log: {cfg.log_transcript}")
             if chunk_archive is not None:
                 _print(f"Chunk archive: {chunk_archive.root}")
+            if cfg.source in ("speaker", "both") and stats.chunks_sent == 0:
+                _print(
+                    "[WARN] Tidak ada chunk audio speaker yang dikirim. "
+                    "Pastikan ada audio meeting/media yang sedang diputar dan device loopback benar."
+                )
+                log_process_event(
+                    "client.no_audio_chunks",
+                    source="speaker",
+                    reason="no_speaker_chunks_sent",
+                    hint="play meeting/media audio and verify loopback device selection",
+                )
+            _print(
+                "Transcript summary: "
+                f"stable={transcript_summary.get('stable', 0)} "
+                f"candidate={transcript_summary.get('candidate', 0)} "
+                f"stable_ratio={transcript_summary.get('stable_ratio')}"
+            )
             _print("=" * 60)
+            log_process_event(
+                "client.session_summary",
+                transcript=transcript_summary,
+                rolling_audio_dir=str(rolling_archive.root) if rolling_archive is not None else None,
+            )
             log_process_event(
                 "client.finalization_complete",
                 chunks_sent=stats.chunks_sent,
@@ -551,6 +621,8 @@ def run_whisperlive_session(
     finally:
         for client in clients.values():
             client.close(send_end_of_audio=False)
+        flush_process_log_summaries()
+        clear_process_log_context()
 
     return stats
 
@@ -602,6 +674,7 @@ def _drain_pending_chunks(
     clients: dict[str, _BufferedReconnectClient],
     stats: WhisperLiveSessionStats,
     chunk_archive: "_ChunkArchive | None" = None,
+    rolling_archive: "_RollingAudioArchive | None" = None,
 ) -> int:
     """Kirim sisa chunk di queue sebelum END_OF_AUDIO."""
     drained = 0
@@ -613,7 +686,7 @@ def _drain_pending_chunks(
 
         client = clients.get(chunk.source)
         if client is None:
-            stats.chunks_dropped += 1
+            stats.add_chunks_dropped()
             log_process_event(
                 "client.chunk_send_drop",
                 source=chunk.source,
@@ -624,12 +697,10 @@ def _drain_pending_chunks(
         try:
             if chunk_archive is not None:
                 chunk_archive.save(chunk)
+            if rolling_archive is not None:
+                rolling_archive.save(chunk)
             outcome = client.send(chunk)
-            stats.chunks_sent += outcome.sent
-            stats.chunks_dropped += outcome.dropped
-            stats.chunks_buffered += outcome.buffered
-            stats.reconnect_attempts += outcome.reconnect_attempts
-            stats.reconnect_successes += outcome.reconnect_successes
+            stats.add_send_outcome(outcome)
             drained += outcome.sent
             log_process_event(
                 "client.chunk_sent",
@@ -653,7 +724,7 @@ def _drain_pending_chunks(
                 chunk.rms_db,
             )
         except Exception as exc:
-            stats.chunks_dropped += 1
+            stats.add_chunks_dropped()
             log_process_event(
                 "client.chunk_send_error",
                 source=chunk.source,
@@ -691,11 +762,7 @@ def _flush_reconnect_buffers(
                     reconnect_attempts=outcome.reconnect_attempts,
                     reconnect_successes=outcome.reconnect_successes,
                 )
-            stats.chunks_sent += outcome.sent
-            stats.chunks_dropped += outcome.dropped
-            stats.chunks_buffered += outcome.buffered
-            stats.reconnect_attempts += outcome.reconnect_attempts
-            stats.reconnect_successes += outcome.reconnect_successes
+            stats.add_send_outcome(outcome)
             total_sent += outcome.sent
             progressed = progressed or bool(outcome.sent or outcome.dropped or outcome.reconnect_successes)
 
@@ -706,6 +773,6 @@ def _flush_reconnect_buffers(
 
     remaining = sum(client.buffered_count for client in clients.values())
     if remaining:
-        stats.chunks_dropped += remaining
+        stats.add_chunks_dropped(remaining)
         log_process_event("client.reconnect_buffer_flush_timeout", remaining_chunks=remaining)
     return total_sent

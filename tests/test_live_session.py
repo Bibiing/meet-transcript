@@ -1,18 +1,16 @@
-"""Tests for the live transcription session pipeline."""
-
 from __future__ import annotations
 
 import queue
 import threading
-from typing import Any
-from unittest.mock import MagicMock, patch
+import time
 
 import numpy as np
 import pytest
 
-from src.capture.audio_frame import AudioFrame
-from src.engine.live_session import LiveSessionConfig, LiveSessionStats, _reader_thread, run_live_session
-from src.engine.preprocessing import AudioPreprocessor, PreprocessConfig, PreprocessedAudioChunk
+from src.capture.models import AudioFrame
+from src.preprocessing.core import AudioPreprocessor, PreprocessConfig, PreprocessedAudioChunk
+from src.whisper.capture import _build_capture_streams, _reader_thread
+from src.whisper.models import WhisperLiveSessionConfig, WhisperLiveSessionStats
 
 
 def _make_frame(
@@ -20,6 +18,7 @@ def _make_frame(
     duration_seconds: float = 0.5,
     sample_rate: int = 16_000,
     rms: float = 0.05,
+    timestamp_seconds: float = 0.0,
 ) -> AudioFrame:
     n_samples = int(sample_rate * duration_seconds)
     t = np.linspace(0, duration_seconds, n_samples, dtype=np.float32)
@@ -29,14 +28,12 @@ def _make_frame(
         samples=samples,
         sample_rate=sample_rate,
         channels=1,
-        timestamp_seconds=0.0,
+        timestamp_seconds=timestamp_seconds,
     )
 
 
 class FakeMicStream:
-    """Minimal mic stream stub that returns a fixed set of frames."""
-
-    def __init__(self, frames: list[AudioFrame], delay_after: float = 0.0) -> None:
+    def __init__(self, frames: list[AudioFrame]) -> None:
         self._frames = list(frames)
         self._idx = 0
         self._started = False
@@ -55,133 +52,117 @@ class FakeMicStream:
         return None  # exhausted
 
 
-class FakeWhisperModel:
-    def transcribe(self, audio: Any, **kwargs: Any) -> dict:
-        text = "halo dari live session"
-        return {
-            "text": text,
-            "language": kwargs.get("language") or "id",
-            "segments": [{"start": 0.0, "end": 1.0, "text": text}],
-        }
-
-
-# --------------------------------------------------------------------------- #
-# _reader_thread unit tests                                                    #
-# --------------------------------------------------------------------------- #
-
 def test_reader_thread_accumulates_and_pushes_chunks() -> None:
-    """Reader thread must push a preprocessed chunk after chunk_seconds have accumulated."""
-    # 8 frames × 0.5s = 4.0s — should trigger one chunk push
     frames = [_make_frame(source="mic", duration_seconds=0.5, sample_rate=16_000) for _ in range(8)]
     stream = FakeMicStream(frames)
     chunk_queue: queue.Queue[PreprocessedAudioChunk] = queue.Queue()
     stop_event = threading.Event()
-    stats = LiveSessionStats()
+    stats = WhisperLiveSessionStats()
 
     preprocessor = AudioPreprocessor(PreprocessConfig(chunk_seconds=4.0))
-
     t = threading.Thread(
         target=_reader_thread,
         args=(stream, preprocessor, chunk_queue, 4.0, stop_event, stats),
     )
     t.start()
-    t.join(timeout=5.0)
+    assert _wait_for_queue(chunk_queue)
     stop_event.set()
+    t.join(timeout=2.0)
 
-    assert not chunk_queue.empty(), "reader thread must push at least one chunk"
     chunk = chunk_queue.get_nowait()
     assert chunk.source == "mic"
     assert chunk.sample_rate == 16_000
 
 
-def test_reader_thread_drops_chunk_when_queue_full() -> None:
-    """When the chunk queue is full the reader must not block and must track dropped count."""
-    frames = [_make_frame(source="mic", duration_seconds=0.5, sample_rate=16_000) for _ in range(8)]
+def test_reader_thread_normalizes_absolute_frame_timestamps_to_session_relative() -> None:
+    frames = [
+        _make_frame(
+            source="speaker",
+            duration_seconds=0.5,
+            sample_rate=16_000,
+            timestamp_seconds=12_524.0 + (index * 0.5),
+        )
+        for index in range(8)
+    ]
     stream = FakeMicStream(frames)
-    chunk_queue: queue.Queue[PreprocessedAudioChunk] = queue.Queue(maxsize=0)  # always full-like
+    chunk_queue: queue.Queue[PreprocessedAudioChunk] = queue.Queue()
     stop_event = threading.Event()
-    stats = LiveSessionStats()
+    stats = WhisperLiveSessionStats()
 
     preprocessor = AudioPreprocessor(PreprocessConfig(chunk_seconds=4.0))
+    t = threading.Thread(
+        target=_reader_thread,
+        args=(stream, preprocessor, chunk_queue, 4.0, stop_event, stats),
+    )
+    t.start()
+    assert _wait_for_queue(chunk_queue)
+    stop_event.set()
+    t.join(timeout=2.0)
 
-    # Fill the queue to capacity (maxsize=1) so put_nowait raises Full
+    chunk = chunk_queue.get_nowait()
+    assert chunk.source == "speaker"
+    assert chunk.start_seconds == 0.0
+
+
+def test_reader_thread_drops_chunk_when_queue_full() -> None:
+    frames = [_make_frame(source="mic", duration_seconds=0.5, sample_rate=16_000) for _ in range(8)]
+    stream = FakeMicStream(frames)
+    stop_event = threading.Event()
+    stats = WhisperLiveSessionStats()
+
+    preprocessor = AudioPreprocessor(PreprocessConfig(chunk_seconds=4.0))
     tiny_queue: queue.Queue[PreprocessedAudioChunk] = queue.Queue(maxsize=1)
-    # Pre-fill
     dummy_frame = _make_frame(source="mic", duration_seconds=4.0, sample_rate=16_000)
     dummy_chunk = preprocessor.preprocess_frames([dummy_frame])
-    if dummy_chunk:
-        tiny_queue.put_nowait(dummy_chunk[0])
+    assert dummy_chunk
+    tiny_queue.put_nowait(dummy_chunk[0])
 
     t = threading.Thread(
         target=_reader_thread,
         args=(stream, preprocessor, tiny_queue, 4.0, stop_event, stats),
     )
     t.start()
-    t.join(timeout=5.0)
+    assert _wait_for(lambda: stats.chunks_dropped >= 1)
     stop_event.set()
+    t.join(timeout=2.0)
 
-    # Should not have hung — test passes if it reaches here
-    assert True
+    assert stats.chunks_dropped >= 1
 
 
-# --------------------------------------------------------------------------- #
-# run_live_session integration (heavily mocked)                                #
-# --------------------------------------------------------------------------- #
+def test_build_capture_streams_creates_mic_reader(monkeypatch: pytest.MonkeyPatch) -> None:
+    created = {}
 
-def test_live_session_returns_stats_and_calls_on_result(monkeypatch: pytest.MonkeyPatch) -> None:
-    """run_live_session must return LiveSessionStats and invoke on_result for accepted results."""
-    # 8 speech frames = 4s → one preprocessed chunk → one Whisper call
-    speech_frames = [_make_frame(source="mic", duration_seconds=0.5) for _ in range(8)]
+    class FakeMicrophoneStream:
+        def __init__(self, config) -> None:
+            created["config"] = config
 
-    fake_mic = FakeMicStream(speech_frames)
-    fake_model = FakeWhisperModel()
+    monkeypatch.setattr("src.whisper.capture.MicrophoneStream", FakeMicrophoneStream)
 
-    # Patch MicrophoneStream so we don't open real audio device
-    monkeypatch.setattr(
-        "src.engine.live_session.MicrophoneStream",
-        lambda config: fake_mic,
-    )
-    # Patch detect_os so speaker branch is skipped in CI
-    monkeypatch.setattr(
-        "src.engine.live_session.detect_os",
-        lambda: MagicMock(value="windows"),
-    )
-    # Patch WindowsLoopbackStream to raise CaptureNotSupportedError (so only mic runs)
-    from src.capture.errors import CaptureNotSupportedError
-    monkeypatch.setattr(
-        "src.engine.live_session.WindowsLoopbackStream",
-        lambda config: (_ for _ in ()).throw(CaptureNotSupportedError("test: no loopback")),
+    chunk_queue: queue.Queue[PreprocessedAudioChunk] = queue.Queue()
+    stop_event = threading.Event()
+    stats = WhisperLiveSessionStats()
+
+    streams, threads = _build_capture_streams(
+        WhisperLiveSessionConfig(source="mic", chunk_seconds=0.5, mic_device="Headset"),
+        chunk_queue,
+        stop_event,
+        stats,
     )
 
-    received: list = []
+    assert len(streams) == 1
+    assert len(threads) == 1
+    assert created["config"].device == "Headset"
+    assert threads[0].name == "whisperlive-mic-reader"
 
-    cfg = LiveSessionConfig(
-        chunk_seconds=4.0,
-        source="both",  # speaker will be skipped gracefully
-        max_chunks_processed=1,
-        whisper_config=__import__("src.engine.whisper", fromlist=["WhisperConfig"]).WhisperConfig(
-            model_name="tiny",
-            fp16=False,
-        ),
-    )
 
-    with patch("src.engine.live_session.OpenAIWhisperTranscriber") as MockTranscriber:
-        instance = MockTranscriber.return_value
+def _wait_for_queue(chunk_queue: queue.Queue[PreprocessedAudioChunk], timeout_seconds: float = 2.0) -> bool:
+    return _wait_for(lambda: not chunk_queue.empty(), timeout_seconds=timeout_seconds)
 
-        def fake_transcribe(chunk: PreprocessedAudioChunk):
-            from src.engine.whisper import TranscriptionResult, TranscriptionSegment
-            return TranscriptionResult(
-                source=chunk.source,
-                text="halo dari live session",
-                model_name="tiny",
-                language="id",
-                start_seconds=chunk.start_seconds,
-                duration_seconds=chunk.duration_seconds,
-            )
 
-        instance.transcribe_chunk.side_effect = fake_transcribe
-
-        stats = run_live_session(cfg, on_result=received.append)
-
-    assert isinstance(stats, LiveSessionStats)
-    assert stats.chunks_processed >= 0  # may be 0 if chunk queue empty before transcriber starts
+def _wait_for(predicate, timeout_seconds: float = 2.0) -> bool:
+    stop_at = time.monotonic() + timeout_seconds
+    while time.monotonic() < stop_at:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()

@@ -1,42 +1,40 @@
 from __future__ import annotations
 import argparse
+import platform
 from pathlib import Path
 
-from src.capture.recorder import CaptureResult, CaptureOptions, run_capture, run_phase2_capture
-from src.engine.live_session import LiveSessionConfig, run_live_session
-from src.engine.preprocess_runtime import PreprocessResult, preprocess_audio_dir
-from src.engine.whisper import TranscriptionResult, WhisperConfig, transcribe_preprocessed_audio_dir
-from src.engine.whisperlive_client import DEFAULT_HOTWORDS, DEFAULT_INITIAL_PROMPT, WhisperLiveProfile
-from src.engine.whisperlive_replay import WhisperLiveReplayConfig, replay_wav_to_whisperlive
-from src.engine.whisperlive_session import WhisperLiveSessionConfig, run_whisperlive_session
-from src.runtime.settings import env_bool, env_float, env_int, env_optional, env_str, load_env_file
-from src.utils.formatter import format_transcript_results
-from src.utils.logging import TranscriptLog, configure_logging
+from src.capture.recorder import CaptureResult, CaptureOptions, run_capture
+from src.preprocessing.file_processing import PreprocessResult, preprocess_audio_dir
+
+# live session
+from src.whisper import (
+    WhisperLiveProfile,
+    DEFAULT_HOTWORDS,
+    DEFAULT_INITIAL_PROMPT,
+    # replay
+    WhisperLiveReplayConfig,
+    replay_wav_to_whisperlive,
+    # session
+    WhisperLiveSessionConfig,
+    run_whisperlive_session, 
+)
+
+from src.settings import env_bool, env_float, env_int, env_optional, env_str, load_env_file
+from src.utils.logging import configure_logging
 from src.utils.os_detector import get_audio_backend
 
 
 DEFAULT_SERVER_READY_TIMEOUT = 300.0
 
-
-def main(argv: list[str] | None = None) -> int:
-    load_env_file(Path(".env"))
-    env_model = env_optional("WHISPERLIVE_MODEL")
-
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # Mode menjalankan aplikasi
     parser = argparse.ArgumentParser(description="Multiplatform real-time transcriber")
-    parser.add_argument("--mode", choices=("record", "preprocess", "transcribe", "live", "replay-file"), default=None, help="Mode kerja aplikasi")
-    parser.add_argument("--record", action="store_true", help="record mic/speaker WAV files")
-    parser.add_argument("--preprocess", action="store_true", help="preprocess captured WAV files")
-    parser.add_argument("--transcribe", action="store_true", help="transcribe preprocessed WAV files")
-    parser.add_argument("--live", action="store_true", help="run live WhisperLive session")
-    parser.add_argument("--replay-file", type=Path, default=None, help="stream a WAV file to WhisperLive for smoke testing")
-    parser.add_argument("--replay-source", choices=("mic", "speaker"), default="mic", help="source label used by --replay-file")
-    parser.add_argument("--replay-realtime", action="store_true", help="send replay chunks with real-time pacing")
+    parser.add_argument("--mode", choices=("record", "preprocess", "live", "replay-file"), default=None, help="Mode kerja aplikasi")
 
     # ASR / WhisperLive konfigurasi
-    parser.add_argument("--asr-backend", choices=("whisperlive", "local"), default="whisperlive", help="ASR backend for --live: WhisperLive server (default) or local OpenAI Whisper",)
-    parser.add_argument("--server-host", default=env_str("WHISPERLIVE_HOST", "localhost"), help="WhisperLive server host for --live")
-    parser.add_argument("--server-port", type=int, default=env_int("WHISPERLIVE_PORT", 9090), help="WhisperLive websocket port for --live")
+    parser.add_argument("--asr-backend", choices=("whisperlive",), default="whisperlive", help="ASR backend for live mode: WhisperLive server")
+    parser.add_argument("--server-host", default=env_str("WHISPERLIVE_HOST", "localhost"), help="WhisperLive server host for live mode")
+    parser.add_argument("--server-port", type=int, default=env_int("WHISPERLIVE_PORT", 9090), help="WhisperLive websocket port for live mode")
     parser.add_argument("--server-wss", action="store_true", help="Use wss:// for WhisperLive websocket")
     parser.add_argument("--server-api-key", default=None, help="Optional WhisperLive API key")
     parser.add_argument("--server-ready-timeout", type=float, default=env_float("WHISPERLIVE_READY_TIMEOUT", DEFAULT_SERVER_READY_TIMEOUT), help="seconds to wait for WhisperLive SERVER_READY",)
@@ -64,6 +62,18 @@ def main(argv: list[str] | None = None) -> int:
     # Voice Activity Detection (VAD)
     parser.add_argument("--mic-client-vad", action=argparse.BooleanOptionalAction, default=env_bool("PLN_MIC_CLIENT_VAD", True), help="enable client-side VAD for microphone chunks",)
     parser.add_argument("--speaker-client-vad", action=argparse.BooleanOptionalAction, default=env_bool("PLN_SPEAKER_CLIENT_VAD", False), help="enable client-side VAD for speaker/system-audio chunks",)
+    parser.add_argument("--mic-vad-rms-threshold", type=float, default=env_float("PLN_MIC_VAD_RMS_THRESHOLD", 0.025), help="microphone client VAD RMS threshold")
+    parser.add_argument("--mic-vad-peak-threshold", type=float, default=env_float("PLN_MIC_VAD_PEAK_THRESHOLD", 0.08), help="microphone client VAD peak threshold")
+    parser.add_argument("--mic-vad-speech-fraction", type=float, default=env_float("PLN_MIC_VAD_SPEECH_FRACTION", 0.35), help="minimum active sub-frame fraction for microphone VAD")
+    parser.add_argument("--mic-min-input-rms-db", type=float, default=env_float("PLN_MIC_MIN_INPUT_RMS_DB", -38.0), help="microphone chunks below this input RMS dB are dropped")
+    parser.add_argument("--mic-target-rms-db", type=float, default=env_float("PLN_MIC_TARGET_RMS_DB", -20.0), help="microphone target RMS dB after normalization")
+    parser.add_argument("--mic-max-normalization-gain-db", type=float, default=env_float("PLN_MIC_MAX_GAIN_DB", 18.0), help="maximum microphone normalization gain in dB")
+    parser.add_argument("--speaker-vad-rms-threshold", type=float, default=env_float("PLN_SPEAKER_VAD_RMS_THRESHOLD", 0.008), help="speaker client VAD RMS threshold")
+    parser.add_argument("--speaker-vad-peak-threshold", type=float, default=env_float("PLN_SPEAKER_VAD_PEAK_THRESHOLD", 0.05), help="speaker client VAD peak threshold")
+    parser.add_argument("--speaker-vad-speech-fraction", type=float, default=env_float("PLN_SPEAKER_VAD_SPEECH_FRACTION", 0.20), help="minimum active sub-frame fraction for speaker VAD")
+    parser.add_argument("--speaker-min-input-rms-db", type=float, default=env_float("PLN_SPEAKER_MIN_INPUT_RMS_DB", -48.0), help="speaker chunks below this input RMS dB are dropped")
+    parser.add_argument("--speaker-target-rms-db", type=float, default=env_float("PLN_SPEAKER_TARGET_RMS_DB", -23.0), help="speaker target RMS dB after normalization")
+    parser.add_argument("--speaker-max-normalization-gain-db", type=float, default=env_float("PLN_SPEAKER_MAX_GAIN_DB", 18.0), help="maximum speaker normalization gain in dB")
     parser.add_argument("--vad-threshold", type=float, default=env_float("WHISPERLIVE_VAD_THRESHOLD", 0.55), help="WhisperLive server VAD threshold")
     parser.add_argument("--server-vad", action=argparse.BooleanOptionalAction, default=env_bool("WHISPERLIVE_USE_VAD", False), help="enable server-side Faster-Whisper VAD in addition to client preprocessing",)
     
@@ -88,6 +98,9 @@ def main(argv: list[str] | None = None) -> int:
     # debugging & arsip chunk
     parser.add_argument("--debug-chunk-archive", action=argparse.BooleanOptionalAction, default=env_bool("WHISPERLIVE_DEBUG_CHUNK_ARCHIVE", False), help="write each live chunk to WAV files for debugging",)
     parser.add_argument("--chunk-archive-dir", type=Path, default=Path("audio") / "chunks", help="directory used when --debug-chunk-archive is enabled",)
+    parser.add_argument("--rolling-audio-archive", action=argparse.BooleanOptionalAction, default=env_bool("WHISPERLIVE_ROLLING_AUDIO_ARCHIVE", False), help="write larger rolling preprocessed WAV segments for final reprocess")
+    parser.add_argument("--rolling-audio-dir", type=Path, default=Path("audio") / "rolling", help="directory used when --rolling-audio-archive is enabled")
+    parser.add_argument("--rolling-audio-segment-seconds", type=float, default=env_float("WHISPERLIVE_ROLLING_AUDIO_SEGMENT_SECONDS", 60.0), help="seconds per rolling audio WAV segment")
     
     # prompt & boundary speach
     parser.add_argument("--dynamic-prompt", action=argparse.BooleanOptionalAction, default=env_bool("WHISPERLIVE_DYNAMIC_PROMPT", True), help="send confirmed transcript text back to Whisper as decode context",)
@@ -103,13 +116,29 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--resume-transcript-log", action="store_true", help="append to an existing transcript log")
     parser.add_argument("--log-level", default=env_str("LOG_LEVEL", "INFO"), help="DEBUG, INFO, WARNING, ERROR, or CRITICAL")
     parser.add_argument("--log-file", type=Path, default=Path("logs") / "transcriber.log")
+    parser.add_argument("--process-log-hot-path-detail", action=argparse.BooleanOptionalAction, default=env_bool("PROCESS_LOG_HOT_PATH_DETAIL", False), help="write every capture/chunk hot-path event instead of periodic summaries")
+    parser.add_argument("--process-log-summary-interval-seconds", type=float, default=env_float("PROCESS_LOG_SUMMARY_INTERVAL_SECONDS", 5.0), help="seconds between process log hot-path summary records")
+    parser.add_argument("--candidate-cache-max-entries", type=int, default=env_int("WHISPERLIVE_CANDIDATE_CACHE_MAX_ENTRIES", 2000), help="maximum candidate transcript keys kept for dedupe")
+    parser.add_argument("--merger-emitted-cache-max-entries", type=int, default=env_int("WHISPERLIVE_MERGER_EMITTED_CACHE_MAX_ENTRIES", 5000), help="maximum emitted transcript keys kept for dedupe")
     parser.add_argument("--hide-partials", action=argparse.BooleanOptionalAction, default=env_bool("WHISPERLIVE_HIDE_PARTIALS", True), help="hide unstable live partial transcript previews",)
 
-    args = parser.parse_args(argv)
+    # Replay-file mode
+    parser.add_argument("--replay-file", type=Path, default=None, help="WAV file path to replay to WhisperLive server")
+    parser.add_argument("--replay-source", choices=("mic", "speaker"), default="speaker", help="source label for replay-file mode")
+    parser.add_argument("--replay-realtime", action=argparse.BooleanOptionalAction, default=True, help="replay at realtime speed (True) or as fast as possible (False)")
+
+    return parser.parse_args(argv)
+
+def main(argv: list[str] | None = None) -> int:
+    load_env_file(Path(".env"))
+    env_model = env_optional("WHISPERLIVE_MODEL")
+
+    args = parse_args(argv)
     mode = _resolve_mode(args)
     logger = configure_logging(args.log_level, args.log_file)   # konfigurasi log
     audio_backend = get_audio_backend()                         # deteksi backend audio
 
+    print(f"Detected OS: {platform.system().strip().lower()}")
     print(f"Audio backend: {audio_backend.value}")
     logger.info("runtime audio_backend=%s", audio_backend.value)
 
@@ -123,7 +152,7 @@ def main(argv: list[str] | None = None) -> int:
             logger.info("capture start source=%s seconds=%s output_dir=%s", args.source, args.seconds, args.output_dir)
             print(f"source={args.source} seconds={args.seconds:g} output_dir={args.output_dir}")
 
-            capture_results = run_phase2_capture(
+            capture_results = run_capture(
                 CaptureOptions(
                     seconds=args.seconds,
                     output_dir=args.output_dir,
@@ -177,66 +206,11 @@ def main(argv: list[str] | None = None) -> int:
                         result.duration_seconds,
                     )
             return 0 if any(result.output_path is not None for result in preprocess_results) else 2
-        
-        case "transcribe":
-            # Transkripsi membaca hasil preprocessing dan menulis JSON final.
-            input_dir = args.preprocess_output_dir or args.output_dir
-            transcript_output = args.transcript_output or (input_dir / "transcript.phase4.json")
-            log_transcript = args.transcript_log or (args.output_dir / "transcript_log.json")
-            
-            transcript_log = TranscriptLog.load(log_transcript) if args.resume_transcript_log else TranscriptLog(log_transcript)
-            transcript_log.save()
-
-            logger.info(
-                "transcription start model=%s input_dir=%s transcript_output=%s transcript_log=%s",
-                args.whisper_model or "small",
-                input_dir,
-                transcript_output,
-                log_transcript,
-            )
-            print (f"Transcription started: {input_dir}")
-            print(f"model={args.whisper_model or 'small'} input_dir={input_dir} output={transcript_output}")
-
-            transcript_results = transcribe_preprocessed_audio_dir(
-                input_dir,
-                config=WhisperConfig(
-                    model_name=args.whisper_model or "small",
-                    language=args.whisper_language,
-                    task=args.whisper_task,
-                    device=args.whisper_device,
-                    fp16=args.whisper_fp16,
-                    overlap_seconds=args.whisper_overlap_seconds,
-                    file_chunk_seconds=args.whisper_file_chunk_seconds,
-                    min_segment_avg_logprob=args.whisper_min_logprob,
-                    logprob_threshold=args.whisper_min_logprob,
-                    max_segment_no_speech_prob=args.whisper_max_no_speech,
-                    no_speech_threshold=args.whisper_max_no_speech,
-                    max_segment_compression_ratio=args.whisper_max_compression,
-                    compression_ratio_threshold=args.whisper_max_compression,
-                ),
-                output_path=transcript_output,
-                on_result=transcript_log.append_result,
-            )
-            _print_transcription_results(transcript_results)
-            for result in transcript_results:
-                logger.info(
-                    "transcription source=%s model=%s language=%s chars=%s",
-                    result.source,
-                    result.model_name,
-                    result.language,
-                    len(result.text),
-                )
-            logger.info("transcript_log path=%s entries=%s", log_transcript, len(transcript_log.entries))
-            if transcript_results:
-                print(f"Transcript log: {log_transcript}")
-            return 0
 
         case "live":
             log_transcript = args.transcript_log or (args.output_dir / "transcript_log.json")
 
-            live_model = args.whisper_model or (
-                (env_model or "small") if args.asr_backend == "whisperlive" else "small"
-            )
+            live_model = args.whisper_model or env_model or "small"
 
             # ASR whisper server live
             profile = WhisperLiveProfile(
@@ -274,6 +248,18 @@ def main(argv: list[str] | None = None) -> int:
                 speaker_device=_device_arg(args.speaker_device),
                 mic_client_vad=args.mic_client_vad,
                 speaker_client_vad=args.speaker_client_vad,
+                mic_vad_rms_threshold=args.mic_vad_rms_threshold,
+                mic_vad_peak_threshold=args.mic_vad_peak_threshold,
+                mic_vad_speech_fraction=args.mic_vad_speech_fraction,
+                mic_min_input_rms_db=args.mic_min_input_rms_db,
+                mic_target_rms_db=args.mic_target_rms_db,
+                mic_max_normalization_gain_db=args.mic_max_normalization_gain_db,
+                speaker_vad_rms_threshold=args.speaker_vad_rms_threshold,
+                speaker_vad_peak_threshold=args.speaker_vad_peak_threshold,
+                speaker_vad_speech_fraction=args.speaker_vad_speech_fraction,
+                speaker_min_input_rms_db=args.speaker_min_input_rms_db,
+                speaker_target_rms_db=args.speaker_target_rms_db,
+                speaker_max_normalization_gain_db=args.speaker_max_normalization_gain_db,
                 auto_reconnect=args.auto_reconnect,
                 reconnect_initial_backoff_seconds=args.reconnect_initial_backoff_seconds,
                 reconnect_max_backoff_seconds=args.reconnect_max_backoff_seconds,
@@ -281,7 +267,14 @@ def main(argv: list[str] | None = None) -> int:
                 final_drain_seconds=args.final_drain_seconds,
                 show_partials=not args.hide_partials,
                 log_transcript=log_transcript,
+                resume_transcript_log=args.resume_transcript_log,
                 chunk_archive_dir=args.chunk_archive_dir if args.debug_chunk_archive else None,
+                rolling_audio_archive_dir=args.rolling_audio_dir if args.rolling_audio_archive else None,
+                rolling_audio_segment_seconds=args.rolling_audio_segment_seconds,
+                process_log_include_hot_path=args.process_log_hot_path_detail,
+                process_log_summary_interval_seconds=args.process_log_summary_interval_seconds,
+                candidate_cache_max_entries=args.candidate_cache_max_entries,
+                merger_emitted_cache_max_entries=args.merger_emitted_cache_max_entries,
                 profile=profile,
             )
 
@@ -297,46 +290,6 @@ def main(argv: list[str] | None = None) -> int:
             # jalankan sesi live WhisperLive
             run_whisperlive_session(live_cfg)
             return 0
-
-            # DRAFT: Local Whisper implementation (Client-Server only)
-            # # ASR whisper lokal
-            # whisper_cfg = WhisperConfig(
-            #     model_name=live_model,
-            #     language=args.whisper_language,
-            #     task=args.whisper_task,
-            #     device=args.whisper_device,
-            #     fp16=args.whisper_fp16,
-            #     min_segment_avg_logprob=args.whisper_min_logprob,
-            #     logprob_threshold=args.whisper_min_logprob,
-            #     max_segment_no_speech_prob=args.whisper_max_no_speech,
-            #     no_speech_threshold=args.whisper_max_no_speech,
-            #     max_segment_compression_ratio=args.whisper_max_compression,
-            #     compression_ratio_threshold=args.whisper_max_compression,
-            # )
-            # 
-            # # Konfigurasi sesi live lokal
-            # live_cfg = LiveSessionConfig(
-            #     chunk_seconds=args.live_chunk_seconds,
-            #     source=args.source,
-            #     sample_rate=args.sample_rate,
-            #     block_size=args.block_size,
-            #     queue_size=args.queue_size,
-            #     mic_device=_device_arg(args.mic_device),
-            #     speaker_device=_device_arg(args.speaker_device),
-            #     transcript_log_path=log_transcript,
-            #     whisper_config=whisper_cfg,
-            # )
-            # 
-            # logger.info(
-            #     "live session start source=%s chunk_seconds=%s model=%s",
-            #     args.source,
-            #     args.live_chunk_seconds,
-            #     live_model,
-            # )
-            # 
-            # # jalankan sesi live lokal
-            # run_live_session(live_cfg)
-            # return 0
         
         case "replay-file":
             # Replay untuk test whisper langsung dari file.
@@ -379,22 +332,16 @@ def main(argv: list[str] | None = None) -> int:
         case _:
             print(f"Error: mode tidak dikenal: {mode}")
             return 1
-
+    return 0
 
 def _resolve_mode(args: argparse.Namespace) -> str | None:
+    # Jika --mode diberikan secara eksplisit, gunakan itu.
     if args.mode:
         return args.mode
-    selected = [
-        ("record", args.record),
-        ("preprocess", args.preprocess),
-        ("transcribe", args.transcribe),
-        ("live", args.live),
-        ("replay-file", args.replay_file is not None),
-    ]
-    modes = [name for name, enabled in selected if enabled]
-    if len(modes) > 1:
-        raise SystemExit("Pilih hanya satu mode: record, preprocess, transcribe, live, atau replay-file")
-    return modes[0] if modes else None
+    # Jika --replay-file diberikan tanpa --mode, asumsikan mode replay-file.
+    if args.replay_file is not None:
+        return "replay-file"
+    return None
 
 
 def _print_capture_results(results: list[CaptureResult]) -> None:
@@ -453,21 +400,6 @@ def _print_preprocess_results(results: list[PreprocessResult]) -> None:
             f"chunks={result.chunk_count} duration={result.duration_seconds:.2f}s "
             "sample_rate=16000 channels=1"
         )
-
-
-def _print_transcription_results(results: list[TranscriptionResult]) -> None:
-    if not results:
-        print("[WHISPER] warning: no preprocessed audio files were transcribed")
-        return
-
-    lines = format_transcript_results(results)
-    if not lines:
-        rejected = sum(len(result.rejected_segments) for result in results)
-        print(f"[WHISPER] skipped: no transcript passed quality gate; rejected_segments={rejected}")
-        return
-
-    for line in lines:
-        print(line)
 
 
 if __name__ == "__main__":

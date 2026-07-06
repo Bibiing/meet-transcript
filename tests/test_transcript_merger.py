@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from src.engine.transcript_merger import TranscriptMerger
-from src.engine.whisper import TranscriptionResult
+from src.whisper.merger import TranscriptMerger
+from src.whisper.models import TranscriptionResult
 
 
 def _result(source: str, start: float, end: float, text: str) -> TranscriptionResult:
@@ -52,3 +52,16 @@ def test_merger_skips_incomplete_partial_segments() -> None:
 
     assert merger.add_result(_result("mic", 0.0, 1.0, "belum stabil"), completed=False) == []
     assert merger.flush() == []
+
+
+def test_merger_bounds_emitted_key_cache() -> None:
+    merger = TranscriptMerger(reorder_delay_seconds=0.0, max_emitted_keys=2)
+    first = _result("speaker", 0.0, 1.0, "pertama")
+
+    assert merger.add_result(first)
+    assert merger.add_result(_result("speaker", 1.0, 2.0, "kedua"))
+    assert merger.add_result(_result("speaker", 2.0, 3.0, "ketiga"))
+
+    # Key pertama sudah keluar dari bounded dedupe cache, sehingga boleh muncul
+    # lagi pada sesi panjang tanpa membuat set tumbuh tanpa batas.
+    assert merger.add_result(first)

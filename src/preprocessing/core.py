@@ -7,45 +7,14 @@ from typing import Any, Iterable
 import numpy as np
 from scipy import signal
 
-from src.capture.audio_frame import AudioFrame
-from src.engine.vad_filter import EnergyVad, VoiceActivityDetector
+from src.capture.models import AudioFrame
+from src.preprocessing.vad_filter import EnergyVad, VoiceActivityDetector
 
 # yang perlu diketahui:
 # RMS merupakan ukuran energi rata-rata dari sinyal audio. RMS yang lebih tinggi berarti audio lebih keras, sedangkan RMS yang lebih rendah berarti audio lebih lembut.
 # ASR (Automatic Speech Recognition) adalah proses mengubah sinyal audio menjadi teks. Untuk ASR, kualitas audio sangat penting agar model dapat mengenali ucapan dengan akurat. (Whisper)
 
-# konfigurasi default untuk preprocessing audio.
-@dataclass(frozen=True, slots=True)
-class PreprocessConfig:
-    target_sample_rate: int = 16_000            # 16000 Hz untuk Whisper
-    chunk_seconds: float = 2.5                  # durasi chunk audio untuk dikirim ke WhisperLive
-    highpass_cutoff_hz: float = 80.0            # frekuensi potong high-pass filter, > mengurangi noise low-frequency, < mengurangi kualitas suara. 
-    highpass_order: int = 2                     # order filter untuk high-pass filter. 2 karena order 2 memberikan roll-off yang cukup untuk mengurangi noise low-frequency, tapi tidak terlalu tinggi sehingga tidak merusak kualitas suara.             
-    target_rms_db: float = -20.0                # target RMS level untuk normalisasi audio. -20 dBFS adalah level yang baik untuk audio manusia, karena memberikan headroom yang cukup untuk puncak suara tanpa distorsi.
-    clip_limit: float = 0.95                    # batas clipping untuk normalisasi audio. 0.95 berarti bahwa amplitudo audio akan dibatasi pada 95% dari nilai maksimum, untuk menghindari distorsi.
-    vad_rms_threshold: float = 0.015            # threshold RMS untuk VAD. 0.015 adalah nilai yang baik untuk mendeteksi suara manusia, karena lebih sensitif terhadap suara yang lebih lembut.
-    vad_peak_threshold: float = 0.05            # threshold puncak untuk VAD. 0.05 adalah nilai yang baik untuk mendeteksi suara manusia, karena lebih sensitif terhadap puncak suara yang lebih tinggi.
-    vad_speech_fraction: float = 0.30           # fraksi minimum frame yang harus terdeteksi sebagai suara untuk dianggap sebagai chunk suara. 0.30 berarti bahwa setidaknya 30% dari frame dalam chunk harus terdeteksi sebagai suara agar chunk tersebut dianggap sebagai chunk suara. 
-    min_input_rms_db: float = -42.0             # minimum RMS level untuk input audio agar diterima. -42 dBFS adalah level yang baik untuk audio manusia, karena lebih sensitif terhadap suara yang lebih lembut.
-    min_chunk_seconds: float = 1.0              # durasi minimum chunk audio agar diterima. 1.0 detik adalah durasi yang baik untuk audio manusia, karena memberikan cukup waktu untuk mendeteksi suara manusia.
-    max_normalization_gain_db: float = 24.0     # gain maksimum untuk normalisasi audio. 24 dB adalah gain yang baik untuk audio manusia, karena memberikan headroom yang cukup untuk puncak suara tanpa distorsi.
-
-
-# menyimpan chunk audio yang telah diproses beserta metadata diagnostik.
-@dataclass(frozen=True, slots=True)
-class PreprocessedAudioChunk:
-    source: str                 # sumber audio
-    samples: np.ndarray         # array 1D float32 audio mono
-    sample_rate: int            # sample rate audio
-    start_seconds: float        # waktu mulai chunk audio relatif terhadap awal sumber
-    duration_seconds: float     # durasi chunk audio 
-    rms_db: float               # RMS level dari chunk audio setelah normalisasi
-    input_rms_db: float = 0.0   # RMS level dari chunk audio sebelum normalisasi
-
-    @property
-    def frame_count(self) -> int:
-        return int(self.samples.shape[0])
-
+from src.preprocessing.models import PreprocessConfig, PreprocessedAudioChunk
 # mengubah audio yang ditangkap menjadi chunk mono 16 kHz untuk ASR.
 class AudioPreprocessor:
 
@@ -137,13 +106,14 @@ class AudioPreprocessor:
                     reason="too_short",
                 )
                 continue
-            if not self.vad.is_speech(chunk, self.config.target_sample_rate):
+            if self.config.client_vad_enabled and not self.vad.is_speech(chunk, self.config.target_sample_rate):
                 self._record_decision(
                     source=source,
                     start_seconds=chunk_start,
                     duration_seconds=duration_seconds,
                     passed=False,
                     reason="vad_silence",
+                    client_vad_enabled=True,
                     input_rms_db=_rms_db(chunk),
                 )
                 continue
@@ -155,6 +125,7 @@ class AudioPreprocessor:
                     duration_seconds=duration_seconds,
                     passed=False,
                     reason="below_min_rms",
+                    client_vad_enabled=self.config.client_vad_enabled,
                     input_rms_db=input_rms_db,
                 )
                 continue
@@ -171,7 +142,8 @@ class AudioPreprocessor:
                 start_seconds=chunk_start,
                 duration_seconds=duration_seconds,
                 passed=True,
-                reason="accepted",
+                reason="accepted" if self.config.client_vad_enabled else "vad_disabled_accepted",
+                client_vad_enabled=self.config.client_vad_enabled,
                 input_rms_db=input_rms_db,
                 output_rms_db=rms_db,
             )
@@ -197,6 +169,7 @@ class AudioPreprocessor:
         duration_seconds: float,
         passed: bool,
         reason: str,
+        client_vad_enabled: bool | None = None,
         input_rms_db: float | None = None,
         output_rms_db: float | None = None,
     ) -> None:
@@ -207,6 +180,8 @@ class AudioPreprocessor:
             "passed": passed,
             "reason": reason,
         }
+        if client_vad_enabled is not None:
+            decision["client_vad_enabled"] = client_vad_enabled
         if input_rms_db is not None:
             decision["input_rms_db"] = round(input_rms_db, 2)
         if output_rms_db is not None:

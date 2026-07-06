@@ -1,5 +1,8 @@
 from enum import Enum
+import logging
 import platform
+
+_log = logging.getLogger(__name__)
 
 class AudioBackend(str, Enum):
     WASAPI_LOOPBACK = "wasapi_loopback"     # Windows
@@ -9,7 +12,7 @@ class AudioBackend(str, Enum):
 
 def get_audio_backend(operating_system: str | None = None) -> AudioBackend:
     name = (operating_system or platform.system()).strip().lower()
-    print(f"Detected OS: {name}")
+    _log.info("detected operating system=%s", name)
 
     if name == "windows":
         return AudioBackend.WASAPI_LOOPBACK

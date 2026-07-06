@@ -5,14 +5,15 @@ import time
 
 import numpy as np
 
-from src.engine.preprocessing import PreprocessedAudioChunk
-from src.engine.whisperlive_client import (
+from src.preprocessing.core import PreprocessedAudioChunk
+from src.whisper.client_base import (
     WhisperLiveConnectionConfig,
     WhisperLiveProfile,
     WhisperLiveStreamClient,
 )
-from src.engine.whisperlive_session import _events_from_segments, _results_from_segments
-from src.engine.whisperlive_session import _BufferedReconnectClient, ReconnectPolicy
+from src.whisper.session_utils import _events_from_segments, _results_from_segments
+from src.whisper.client_reconnect import _BufferedReconnectClient
+from src.whisper.models import ReconnectPolicy
 
 
 class FakeWebSocket:
@@ -254,16 +255,16 @@ def test_buffered_reconnect_replays_local_audio_after_send_failure() -> None:
         on_status=lambda source, message: None,
     )
     # Inject factory through the connection client constructor by patching module default in this narrow test.
-    import src.engine.whisperlive_session as session_module
+    import src.whisper.client_reconnect as reconnect_module
 
-    original_client = session_module.WhisperLiveStreamClient
+    original_client = reconnect_module.WhisperLiveStreamClient
 
     class FactoryClient(original_client):
         def __init__(self, *args, **kwargs):
             kwargs["websocket_factory"] = factory
             super().__init__(*args, **kwargs)
 
-    session_module.WhisperLiveStreamClient = FactoryClient
+    reconnect_module.WhisperLiveStreamClient = FactoryClient
     try:
         wrapper.connect_initial()
         chunk1 = PreprocessedAudioChunk(
@@ -297,4 +298,4 @@ def test_buffered_reconnect_replays_local_audio_after_send_failure() -> None:
         assert len(created[1].sent_binary) == 2
     finally:
         wrapper.close(send_end_of_audio=False)
-        session_module.WhisperLiveStreamClient = original_client
+        reconnect_module.WhisperLiveStreamClient = original_client

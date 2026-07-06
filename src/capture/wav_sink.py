@@ -5,7 +5,7 @@ import wave
 
 import numpy as np
 
-from src.capture.audio_frame import AudioFrame
+from src.capture.models import AudioFrame
 
 # menulis daftar AudioFrame ke file WAV, mengembalikan path file output
 def write_frames_to_wav(path: str | Path, frames: list[AudioFrame]) -> Path:

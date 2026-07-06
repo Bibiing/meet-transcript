@@ -10,37 +10,16 @@ from typing import Literal
 
 import numpy as np
 
-from src.capture.audio_frame import AudioFrame
-from src.engine.preprocessing import AudioPreprocessor, PreprocessConfig
-from src.engine.whisperlive_client import (
-    DEFAULT_READY_TIMEOUT_SECONDS,
-    WhisperLiveConnectionConfig,
-    WhisperLiveProfile,
+from src.capture.models import AudioFrame
+from src.preprocessing.core import AudioPreprocessor, PreprocessConfig
+from src.whisper.client_base import (
     WhisperLiveStreamClient,
 )
-from src.engine.whisperlive_session import _events_from_segments
-from src.engine.transcript_merger import TranscriptMerger
+from src.whisper.session_utils import _events_from_segments
+from src.whisper.merger import TranscriptMerger
 
 
-@dataclass(frozen=True, slots=True)
-class WhisperLiveReplayConfig:
-    wav_path: Path
-    source: Literal["mic", "speaker"] = "mic"
-    server_host: str = "localhost"
-    server_port: int = 9090
-    use_wss: bool = False
-    api_key: str | None = None
-    ready_timeout: float = DEFAULT_READY_TIMEOUT_SECONDS
-    chunk_seconds: float = 0.5
-    audio_format: Literal["float32", "int16", "uint8"] = "int16"
-    realtime: bool = False
-    profile: WhisperLiveProfile = field(default_factory=WhisperLiveProfile)
-
-
-@dataclass(frozen=True, slots=True)
-class WhisperLiveReplayResult:
-    chunks_sent: int
-    results_received: int
+from src.whisper.models import WhisperLiveConnectionConfig, WhisperLiveReplayConfig, WhisperLiveReplayResult
 
 
 def replay_wav_to_whisperlive(config: WhisperLiveReplayConfig) -> WhisperLiveReplayResult:

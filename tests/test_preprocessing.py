@@ -1,16 +1,13 @@
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 import wave
 
 import numpy as np
 
-from src.capture.audio_frame import AudioFrame
+from src.capture.models import AudioFrame
 from src.capture.wav_sink import write_frames_to_wav
-from src.engine.chunk_queue import AsyncPreprocessQueue
-from src.engine.preprocess_runtime import preprocess_wav_file
-from src.engine.preprocessing import AudioPreprocessor, PreprocessConfig
+from src.preprocessing.core import AudioPreprocessor, PreprocessConfig
 
 
 def _frame(samples: np.ndarray, sample_rate: int = 48_000, source: str = "speaker") -> AudioFrame:
@@ -68,35 +65,48 @@ def test_highpass_filter_reduces_low_frequency_energy() -> None:
     assert np.abs(fft[speech_bin]) > np.abs(fft[low_bin]) * 5
 
 
-def test_async_preprocess_queue_publishes_chunks() -> None:
+def test_preprocessor_can_process_mic_source() -> None:
     sample_rate = 16_000
     t = np.arange(sample_rate, dtype=np.float32) / sample_rate
     speech = 0.1 * np.sin(2 * np.pi * 440 * t)
-    queue = AsyncPreprocessQueue(AudioPreprocessor(PreprocessConfig(chunk_seconds=1.0)))
+    preprocessor = AudioPreprocessor(PreprocessConfig(chunk_seconds=1.0))
 
-    async def run() -> None:
-        published = await queue.publish_frames([_frame(speech, sample_rate=sample_rate, source="mic")])
-        chunk = await queue.read()
-        assert published == 1
-        assert chunk.source == "mic"
-        assert chunk.sample_rate == 16_000
+    chunks = preprocessor.preprocess_frames([_frame(speech, sample_rate=sample_rate, source="mic")])
 
-    asyncio.run(run())
+    assert len(chunks) == 1
+    assert chunks[0].source == "mic"
+    assert chunks[0].sample_rate == 16_000
 
 
-def test_preprocess_wav_file_writes_16khz_mono_output() -> None:
-    sample_rate = 48_000
+def test_preprocessor_marks_vad_disabled_acceptance() -> None:
+    sample_rate = 16_000
     t = np.arange(sample_rate, dtype=np.float32) / sample_rate
-    speech = 0.1 * np.sin(2 * np.pi * 440 * t)
-    input_path = Path("tmp") / "phase3" / "input.wav"
-    output_path = Path("tmp") / "phase3" / "preprocessed.wav"
-    write_frames_to_wav(input_path, [_frame(speech, sample_rate=sample_rate, source="mic")])
+    low_speech = 0.01 * np.sin(2 * np.pi * 440 * t)
+    preprocessor = AudioPreprocessor(
+        PreprocessConfig(
+            chunk_seconds=1.0,
+            client_vad_enabled=False,
+            min_input_rms_db=-60.0,
+        )
+    )
 
-    result = preprocess_wav_file(input_path, output_path, source="mic")
+    chunks = preprocessor.preprocess_frames([_frame(low_speech, sample_rate=sample_rate, source="speaker")])
 
-    assert result.output_path == output_path
-    assert result.chunk_count == 1
-    with wave.open(str(output_path), "rb") as wav_file:
-        assert wav_file.getnchannels() == 1
-        assert wav_file.getframerate() == 16_000
-        assert wav_file.getnframes() > 0
+    assert len(chunks) == 1
+    assert preprocessor.last_decisions[0]["reason"] == "vad_disabled_accepted"
+    assert preprocessor.last_decisions[0]["client_vad_enabled"] is False
+
+
+def test_preprocessor_with_vad_disabled_still_drops_silence_by_noise_floor() -> None:
+    silence = np.zeros((16_000, 1), dtype=np.float32)
+    preprocessor = AudioPreprocessor(
+        PreprocessConfig(
+            chunk_seconds=1.0,
+            client_vad_enabled=False,
+            min_input_rms_db=-48.0,
+        )
+    )
+
+    assert preprocessor.preprocess_frames([_frame(silence, sample_rate=16_000, source="speaker")]) == []
+    assert preprocessor.last_decisions[0]["reason"] == "below_min_rms"
+    assert preprocessor.last_decisions[0]["client_vad_enabled"] is False

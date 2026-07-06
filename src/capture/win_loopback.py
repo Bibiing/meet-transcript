@@ -12,36 +12,11 @@ import numpy as np
 import soundcard as sc
 import sounddevice as sd
 
-from src.capture.audio_frame import AudioFrame, normalize_samples
+from src.capture.models import AudioFrame, normalize_samples, WasapiDevice, WindowsLoopbackConfig, SoundcardLoopbackDevice
 from src.capture.errors import CaptureNotSupportedError
 from src.capture.queued_stream import put_latest_frame
 
 _log = logging.getLogger(__name__)
-
-# tipe data untuk device loopback WASAPI dan soundcard
-@dataclass(frozen=True, slots=True)
-class WasapiDevice:
-    index: int
-    name: str
-    sample_rate: int
-    channels: int
-
-# Konfigurasi capture loopback speaker Windows
-@dataclass(frozen=True, slots=True)
-class WindowsLoopbackConfig:
-    sample_rate: int | None = None
-    channels: int | None = None
-    block_size: int = 1_024
-    device: int | str | None = None
-    queue_size: int = 64
-
-# Konfigurasi capture speaker macOS
-@dataclass(frozen=True, slots=True)
-class SoundcardLoopbackDevice:
-    index: int
-    name: str
-    channels: int
-    raw_device: Any
 
 
 class WindowsLoopbackStream:
@@ -146,7 +121,18 @@ class WindowsLoopbackStream:
         self.stop()
 
     def _record_loop(self) -> None:
-        assert self._recorder is not None
+        if self._recorder is None:
+            self._put_latest(
+                AudioFrame(
+                    source="speaker",
+                    samples=np.zeros((0, self.channels), dtype=np.float32),
+                    sample_rate=self.sample_rate,
+                    channels=self.channels,
+                    timestamp_seconds=perf_counter(),
+                    status="loopback recorder was not initialized",
+                )
+            )
+            return
         try:
             with self._recorder as recorder:
                 while not self._stop_event.is_set():

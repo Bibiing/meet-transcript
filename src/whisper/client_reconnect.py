@@ -7,28 +7,13 @@ from dataclasses import dataclass
 from time import perf_counter
 from typing import Callable, Literal
 
-from src.engine.preprocessing import PreprocessedAudioChunk
-from src.engine.whisperlive_client import WhisperLiveConnectionConfig, WhisperLiveStreamClient
+from src.preprocessing.core import PreprocessedAudioChunk
+from src.whisper.client_base import WhisperLiveStreamClient
 from src.utils.logging import log_process_event
 
 _log = logging.getLogger(__name__)
 
-# reconnect policy untuk client WhisperLive
-@dataclass(frozen=True, slots=True)
-class ReconnectPolicy:
-    enabled: bool = True
-    initial_backoff_seconds: float = 1.0    # waktu tunggu awal sebelum mencoba reconnect
-    max_backoff_seconds: float = 30.0       # batas waktu tunggu maksimal sebelum mencoba reconnect
-    buffer_seconds: float = 30.0            # batas buffer audio lokal untuk reconnect, dalam detik
-
-# hasil pengiriman chunk audio ke server WhisperLive
-@dataclass(frozen=True, slots=True)
-class SendOutcome:
-    sent: int = 0                   # jumlah chunk yang berhasil dikirim ke server
-    buffered: int = 0               # jumlah chunk yang berhasil disimpan di buffer lokal untuk reconnect
-    dropped: int = 0                # jumlah chunk yang diabaikan
-    reconnect_attempts: int = 0     # jumlah upaya reconnect
-    reconnect_successes: int = 0    # jumlah reconnect yang berhasil
+from src.whisper.models import ReconnectPolicy, SendOutcome
 
 # client wrapper dengan local audio buffer dan reconnect
 # capture thread tidak boleh berhenti hanya karena WebSocket terputus. Wrapper ini menahan chunk per source dalam bounded ring buffer, mencoba reconnect memakai exponential backoff, lalu mengirim ulang buffer secara FIFO.
@@ -36,7 +21,7 @@ class _BufferedReconnectClient:
     def __init__(
         self,
         source: Literal["mic", "speaker"],
-        connection_config: WhisperLiveConnectionConfig,
+        connection_config: "WhisperLiveConnectionConfig",
         *,
         policy: ReconnectPolicy,
         on_transcript: Callable[[str, list[dict], dict], None],

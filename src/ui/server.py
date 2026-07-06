@@ -1,7 +1,7 @@
 """Server web UI lokal untuk mengontrol client live transcriber.
 
 Server ini bukan server ASR. Ia hanya menyajikan HTML/JS lokal, endpoint status,
-daftar device audio, transcript log, dan menjalankan `python -m src.main --live`
+daftar device audio, transcript log, dan menjalankan `python -m src.main --mode live`
 sebagai subprocess.
 """
 
@@ -28,6 +28,7 @@ from typing import Any
 from src.capture.mic_stream import list_input_devices
 from src.capture.win_loopback import list_soundcard_loopback_devices
 from src.utils.logging import load_transcript_entries
+from src.utils.os_detector import AudioBackend, get_audio_backend
 
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
@@ -50,6 +51,18 @@ class UiOptions:
     speaker_device: int | str | None = None
     mic_client_vad: bool = True
     speaker_client_vad: bool = False
+    mic_vad_rms_threshold: float = 0.025
+    mic_vad_peak_threshold: float = 0.08
+    mic_vad_speech_fraction: float = 0.35
+    mic_min_input_rms_db: float = -38.0
+    mic_target_rms_db: float = -20.0
+    mic_max_normalization_gain_db: float = 18.0
+    speaker_vad_rms_threshold: float = 0.008
+    speaker_vad_peak_threshold: float = 0.05
+    speaker_vad_speech_fraction: float = 0.20
+    speaker_min_input_rms_db: float = -48.0
+    speaker_target_rms_db: float = -23.0
+    speaker_max_normalization_gain_db: float = 18.0
     vad_threshold: float = 0.55
     no_speech_thresh: float = 0.75
     ready_timeout: float = 300.0
@@ -66,7 +79,11 @@ class UiOptions:
     speech_boundary_silence_seconds: float = 0.8
     speech_boundary_max_wait_seconds: float = 5.0
     debug_chunk_archive: bool = False
+    rolling_audio_archive: bool = False
+    rolling_audio_segment_seconds: float = 60.0
     log_level: str = "INFO"
+    process_log_hot_path_detail: bool = False
+    process_log_summary_interval_seconds: float = 5.0
     hide_partials: bool = True
     reset_transcript: bool = False
     transcript_log: Path = DEFAULT_TRANSCRIPT_LOG
@@ -127,7 +144,8 @@ def build_live_command(options: UiOptions) -> list[str]:
         sys.executable,
         "-m",
         "src.main",
-        "--live",
+        "--mode",
+        "live",
         "--source",
         options.source,
         "--server-host",
@@ -144,6 +162,30 @@ def build_live_command(options: UiOptions) -> list[str]:
         _num(options.chunk_seconds),
         "--mic-client-vad" if options.mic_client_vad else "--no-mic-client-vad",
         "--speaker-client-vad" if options.speaker_client_vad else "--no-speaker-client-vad",
+        "--mic-vad-rms-threshold",
+        _num(options.mic_vad_rms_threshold),
+        "--mic-vad-peak-threshold",
+        _num(options.mic_vad_peak_threshold),
+        "--mic-vad-speech-fraction",
+        _num(options.mic_vad_speech_fraction),
+        "--mic-min-input-rms-db",
+        _num(options.mic_min_input_rms_db),
+        "--mic-target-rms-db",
+        _num(options.mic_target_rms_db),
+        "--mic-max-normalization-gain-db",
+        _num(options.mic_max_normalization_gain_db),
+        "--speaker-vad-rms-threshold",
+        _num(options.speaker_vad_rms_threshold),
+        "--speaker-vad-peak-threshold",
+        _num(options.speaker_vad_peak_threshold),
+        "--speaker-vad-speech-fraction",
+        _num(options.speaker_vad_speech_fraction),
+        "--speaker-min-input-rms-db",
+        _num(options.speaker_min_input_rms_db),
+        "--speaker-target-rms-db",
+        _num(options.speaker_target_rms_db),
+        "--speaker-max-normalization-gain-db",
+        _num(options.speaker_max_normalization_gain_db),
         "--vad-threshold",
         _num(options.vad_threshold),
         "--whisperlive-no-speech-thresh",
@@ -171,6 +213,10 @@ def build_live_command(options: UiOptions) -> list[str]:
         options.log_level,
         "--log-file",
         str(DEFAULT_LOG_FILE),
+        "--rolling-audio-segment-seconds",
+        _num(options.rolling_audio_segment_seconds),
+        "--process-log-summary-interval-seconds",
+        _num(options.process_log_summary_interval_seconds),
     ]
     if options.mic_device is not None:
         command.extend(["--mic-device", str(options.mic_device)])
@@ -183,6 +229,10 @@ def build_live_command(options: UiOptions) -> list[str]:
     command.append("--speech-boundary-detection" if options.speech_boundary_detection else "--no-speech-boundary-detection")
     if options.debug_chunk_archive:
         command.append("--debug-chunk-archive")
+    if options.rolling_audio_archive:
+        command.extend(["--rolling-audio-archive", "--rolling-audio-dir", str(ROOT_DIR / "audio" / "rolling")])
+    if options.process_log_hot_path_detail:
+        command.append("--process-log-hot-path-detail")
     return command
 
 
@@ -278,17 +328,39 @@ def transcript_payload(path: Path = DEFAULT_TRANSCRIPT_LOG) -> dict[str, Any]:
         except Exception as exc:
             error = str(exc)
 
+    final_entries = [entry for entry in entries if bool(entry.get("completed", True))]
     counts = {"mic": 0, "speaker": 0, "other": 0}
+    stability_counts = {"stable": 0, "candidate": 0, "other": 0}
     for entry in entries:
         source = str(entry.get("source") or "other")
         counts[source if source in counts else "other"] += 1
+        stability = str(entry.get("stability") or ("stable" if bool(entry.get("completed", True)) else "candidate"))
+        stability_counts[stability if stability in stability_counts else "other"] += 1
+
+    final_counts = {"mic": 0, "speaker": 0, "other": 0}
+    for entry in final_entries:
+        source = str(entry.get("source") or "other")
+        final_counts[source if source in final_counts else "other"] += 1
+
+    stable = stability_counts["stable"]
+    candidate = stability_counts["candidate"]
+    total_quality = stable + candidate
 
     return {
         "path": str(path.relative_to(ROOT_DIR)) if path.is_relative_to(ROOT_DIR) else str(path),
         "exists": path.exists(),
-        "entries": entries,
-        "count": len(entries),
-        "counts": counts,
+        "entries": final_entries,
+        "count": len(final_entries),
+        "counts": final_counts,
+        "audit_entries": entries,
+        "audit_count": len(entries),
+        "audit_counts": counts,
+        "quality": {
+            "stable": stable,
+            "candidate": candidate,
+            "stable_ratio": round(stable / total_quality, 3) if total_quality else None,
+            "stability_counts": stability_counts,
+        },
         "error": error,
         "updated_at": datetime.fromtimestamp(path.stat().st_mtime).isoformat() if path.exists() else None,
     }
@@ -305,7 +377,16 @@ def server_health(host: str = "localhost", port: int = 9090) -> dict[str, Any]:
 
 def audio_devices_payload() -> dict[str, Any]:
     """Payload daftar mic/speaker untuk dropdown UI."""
-    result: dict[str, Any] = {"mic": [], "speaker": [], "errors": {}, "diagnostics": {}}
+    backend = get_audio_backend()
+    result: dict[str, Any] = {
+        "mic": [],
+        "speaker": [],
+        "errors": {},
+        "diagnostics": {
+            "audio_backend": backend.value,
+            "speaker_capture": _speaker_capture_status(backend),
+        },
+    }
     try:
         raw_mic_devices = list_input_devices(include_system_aliases=True)
         mic_devices = list_input_devices(concise=True)
@@ -326,19 +407,46 @@ def audio_devices_payload() -> dict[str, Any]:
         ]
     except Exception as exc:
         result["errors"]["mic"] = str(exc)
-    try:
-        result["speaker"] = [
-            {
-                "id": str(device.index),
-                "index": device.index,
-                "name": device.name,
-                "channels": device.channels,
-            }
-            for device in list_soundcard_loopback_devices()
-        ]
-    except Exception as exc:
-        result["errors"]["speaker"] = str(exc)
+    if backend is AudioBackend.WASAPI_LOOPBACK:
+        try:
+            result["speaker"] = [
+                {
+                    "id": str(device.index),
+                    "index": device.index,
+                    "name": device.name,
+                    "channels": device.channels,
+                }
+                for device in list_soundcard_loopback_devices()
+            ]
+        except Exception as exc:
+            result["errors"]["speaker"] = str(exc)
     return result
+
+
+def _speaker_capture_status(backend: AudioBackend) -> dict[str, Any]:
+    if backend is AudioBackend.WASAPI_LOOPBACK:
+        return {
+            "supported": True,
+            "status": "supported",
+            "message": "Windows WASAPI loopback is available for speaker capture.",
+        }
+    if backend is AudioBackend.SCREENCAPTUREKIT:
+        return {
+            "supported": False,
+            "status": "experimental",
+            "message": "macOS speaker capture boundary exists, but native ScreenCaptureKit wiring is not production-ready.",
+        }
+    if backend is AudioBackend.SOUNDDEVICE_INPUT:
+        return {
+            "supported": False,
+            "status": "deferred",
+            "message": "Linux speaker capture is deferred until PipeWire/PulseAudio monitor capture is validated.",
+        }
+    return {
+        "supported": False,
+        "status": "unsupported",
+        "message": "Speaker/system-audio capture is unsupported on this platform.",
+    }
 
 
 class UiRequestHandler(SimpleHTTPRequestHandler):
@@ -405,11 +513,14 @@ class UiRequestHandler(SimpleHTTPRequestHandler):
 
     def _json(self, payload: dict[str, Any], *, status: HTTPStatus = HTTPStatus.OK) -> None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except ConnectionError:
+            pass  # Klien (browser) sudah menutup koneksi, kita abaikan saja error ini
 
 
 def _parse_options(payload: dict[str, Any]) -> UiOptions:
@@ -425,6 +536,18 @@ def _parse_options(payload: dict[str, Any]) -> UiOptions:
         speaker_device=_device_value(payload.get("speakerDevice")),
         mic_client_vad=bool(payload.get("micClientVad", True)),
         speaker_client_vad=bool(payload.get("speakerClientVad", False)),
+        mic_vad_rms_threshold=_float(payload.get("micVadRmsThreshold"), 0.025),
+        mic_vad_peak_threshold=_float(payload.get("micVadPeakThreshold"), 0.08),
+        mic_vad_speech_fraction=_float(payload.get("micVadSpeechFraction"), 0.35),
+        mic_min_input_rms_db=_float(payload.get("micMinInputRmsDb"), -38.0),
+        mic_target_rms_db=_float(payload.get("micTargetRmsDb"), -20.0),
+        mic_max_normalization_gain_db=_float(payload.get("micMaxNormalizationGainDb"), 18.0),
+        speaker_vad_rms_threshold=_float(payload.get("speakerVadRmsThreshold"), 0.008),
+        speaker_vad_peak_threshold=_float(payload.get("speakerVadPeakThreshold"), 0.05),
+        speaker_vad_speech_fraction=_float(payload.get("speakerVadSpeechFraction"), 0.20),
+        speaker_min_input_rms_db=_float(payload.get("speakerMinInputRmsDb"), -48.0),
+        speaker_target_rms_db=_float(payload.get("speakerTargetRmsDb"), -23.0),
+        speaker_max_normalization_gain_db=_float(payload.get("speakerMaxNormalizationGainDb"), 18.0),
         vad_threshold=_float(payload.get("vadThreshold"), 0.55),
         no_speech_thresh=_float(payload.get("noSpeechThresh"), 0.75),
         ready_timeout=_float(payload.get("readyTimeout"), 300.0),
@@ -441,7 +564,11 @@ def _parse_options(payload: dict[str, Any]) -> UiOptions:
         speech_boundary_silence_seconds=_float(payload.get("speechBoundarySilenceSeconds"), 0.8),
         speech_boundary_max_wait_seconds=_float(payload.get("speechBoundaryMaxWaitSeconds"), 5.0),
         debug_chunk_archive=bool(payload.get("debugChunkArchive", False)),
+        rolling_audio_archive=bool(payload.get("rollingAudioArchive", False)),
+        rolling_audio_segment_seconds=_float(payload.get("rollingAudioSegmentSeconds"), 60.0),
         log_level=_choice(str(payload.get("logLevel") or "INFO").upper(), {"DEBUG", "INFO", "WARNING", "ERROR"}, "INFO"),
+        process_log_hot_path_detail=bool(payload.get("processLogHotPathDetail", False)),
+        process_log_summary_interval_seconds=_float(payload.get("processLogSummaryIntervalSeconds"), 5.0),
         hide_partials=bool(payload.get("hidePartials", True)),
         reset_transcript=bool(payload.get("resetTranscript", False)),
         transcript_log=transcript_log,

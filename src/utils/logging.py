@@ -8,15 +8,21 @@ import sys
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Any
+from time import monotonic
+from typing import Any, TYPE_CHECKING
 
-from src.engine.whisper import TranscriptionResult
+if TYPE_CHECKING:
+    from src.whisper.models import TranscriptionResult
 from src.utils.formatter import format_transcript_line, result_to_line
 
 __all__ = [
     "configure_logging",
+    "configure_process_logging",
+    "clear_process_log_context",
+    "flush_process_log_summaries",
     "PROCESS_LOG_PATH",
     "log_process_event",
     "load_transcript_entries",
@@ -30,6 +36,8 @@ STABILITY_STABLE = "stable"
 STABILITY_CANDIDATE = "candidate"
 
 _managed_handlers: list[logging.Handler] = []
+_APP_LOG_MAX_BYTES = int(os.getenv("TRANSCRIBER_LOG_MAX_BYTES", "5000000") or 5_000_000)
+_APP_LOG_BACKUP_COUNT = int(os.getenv("TRANSCRIBER_LOG_BACKUP_COUNT", "5") or 5)
 
 # 1. Konfigurasi Logging Aplikasi
 def configure_logging(
@@ -54,8 +62,13 @@ def configure_logging(
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    # file handler untuk menulis log ke file
-    file_handler = logging.FileHandler(log_file, encoding="utf-8")  # handler menulis log
+    # file handler untuk menulis log ke file dengan rotasi agar log tidak tumbuh tanpa batas
+    file_handler = RotatingFileHandler(
+        log_file,
+        maxBytes=max(1, _APP_LOG_MAX_BYTES),
+        backupCount=max(0, _APP_LOG_BACKUP_COUNT),
+        encoding="utf-8",
+    )
     file_handler.setFormatter(formatter)                            # mengatur format log
     root.addHandler(file_handler)                                   # menambahkan handler ke logger root
 
@@ -86,36 +99,241 @@ def _coerce_level(level: str) -> int:
 _LOG = logging.getLogger("process_log") 
 _LOCK = threading.Lock()
 PROCESS_LOG_PATH = Path("logs") / "process.log"
+PROCESS_LOG_MAX_BYTES = int(os.getenv("PROCESS_LOG_MAX_BYTES", "5000000") or 5_000_000)
+PROCESS_LOG_BACKUP_COUNT = int(os.getenv("PROCESS_LOG_BACKUP_COUNT", "5") or 5)
 _TEXT_LIMIT = 500
+_HOT_PATH_EVENTS = {
+    "client.chunk_created",
+    "client.vad_pass",
+    "client.vad_drop",
+    "client.chunk_queued",
+    "client.chunk_sent",
+}
 
 _process_log_dir_ready = False  # cache: direktori logs/ hanya perlu dibuat sekali per proses
+_process_log_path = PROCESS_LOG_PATH
+_process_log_context: dict[str, Any] = {}
+_process_log_include_hot_path = False
+_process_log_summary_interval_seconds = 5.0
+_process_log_last_summary_at = 0.0
+_process_log_summaries: dict[tuple[str, str, str], dict[str, Any]] = {}
+
+
+def configure_process_logging(
+    *,
+    session_id: str | None = None,
+    include_hot_path: bool = False,
+    summary_interval_seconds: float = 5.0,
+    process_log_path: Path | None = None,
+) -> None:
+    """Atur context process log untuk satu live session.
+
+    Context disisipkan ke semua baris JSONL. Event hot-path dapat diringkas
+    agar `process.log` tetap terbaca ketika capture berjalan lama.
+    """
+
+    global _process_log_context
+    global _process_log_include_hot_path
+    global _process_log_summary_interval_seconds
+    global _process_log_last_summary_at
+    global _process_log_path
+    global _process_log_dir_ready
+
+    with _LOCK:
+        _flush_process_log_summaries_locked(force=True)
+        _process_log_context = {}
+        if session_id:
+            _process_log_context["session_id"] = session_id
+        _process_log_include_hot_path = include_hot_path
+        _process_log_summary_interval_seconds = max(0.1, float(summary_interval_seconds))
+        _process_log_last_summary_at = monotonic()
+        if process_log_path is not None:
+            _process_log_path = process_log_path
+            _process_log_dir_ready = False
+
+
+def clear_process_log_context() -> None:
+    """Bersihkan context session dan kembalikan path default process log."""
+
+    global _process_log_context
+    global _process_log_include_hot_path
+    global _process_log_summary_interval_seconds
+    global _process_log_last_summary_at
+    global _process_log_path
+    global _process_log_dir_ready
+
+    with _LOCK:
+        _flush_process_log_summaries_locked(force=True)
+        _process_log_context = {}
+        _process_log_include_hot_path = False
+        _process_log_summary_interval_seconds = 5.0
+        _process_log_last_summary_at = 0.0
+        _process_log_path = PROCESS_LOG_PATH
+        _process_log_dir_ready = False
+
+
+def flush_process_log_summaries() -> None:
+    """Tulis ringkasan hot-path yang masih tertahan."""
+
+    with _LOCK:
+        _flush_process_log_summaries_locked(force=True)
 
 # event log untuk proses capture, VAD, queue, WebSocket, dan transkripsi. Ditulis ke logs/process.log dalam format JSONL.
 def log_process_event(event: str, **fields: Any) -> None:
-    global _process_log_dir_ready
-
-    # buat record log dengan timestamp, event, dan fields tambahan. Fields akan diubah menjadi bentuk JSON-safe.
-    record = {
-        "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
-        "event": event,
-        **{key: _safe_value(value) for key, value in fields.items()},
-    }
+    now = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
     try:
-        # buat direktori logs/ jika belum ada
-        if not _process_log_dir_ready:
-            PROCESS_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-            _process_log_dir_ready = True
-        # tulis record log ke file dalam format JSONL
-        line = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
-
         # gunakan lock agar penulisan log thread-safe
         with _LOCK:
-            with PROCESS_LOG_PATH.open("a", encoding="utf-8") as handle:
-                handle.write(line + "\n")
-                
+            safe_fields = {key: _safe_value(value) for key, value in fields.items()}
+            if event in _HOT_PATH_EVENTS and not _process_log_include_hot_path:
+                _aggregate_hot_path_event(event, now, safe_fields)
+                _flush_process_log_summaries_locked(force=False)
+                return
+
+            record = {
+                "ts": now,
+                **{key: _safe_value(value) for key, value in _process_log_context.items()},
+                "event": event,
+                **safe_fields,
+            }
+            _write_process_record_locked(record)
+
     except Exception as exc:  # pragma: no cover - logging must never break capture
         _LOG.debug("failed to write process log event=%s error=%s", event, exc)
+
+
+def _aggregate_hot_path_event(event: str, ts: str, fields: dict[str, Any]) -> None:
+    key = (
+        event,
+        str(fields.get("source") or ""),
+        str(fields.get("reason") or ""),
+    )
+    summary = _process_log_summaries.setdefault(
+        key,
+        {
+            "event": event,
+            "source": fields.get("source"),
+            "reason": fields.get("reason"),
+            "count": 0,
+            "first_ts": ts,
+            "last_ts": ts,
+            "last": {},
+            "metrics": {},
+        },
+    )
+    summary["count"] = int(summary["count"]) + 1
+    summary["last_ts"] = ts
+    summary["last"] = {
+        key: fields[key]
+        for key in (
+            "passed",
+            "queue_size",
+            "chunks_sent",
+            "chunks_buffered",
+            "chunks_enqueued",
+            "sent",
+            "buffered",
+            "dropped",
+            "final_drain",
+            "final_partial",
+        )
+        if key in fields
+    }
+
+    metrics = summary["metrics"]
+    for metric_name in (
+        "input_rms_db",
+        "output_rms_db",
+        "input_rms",
+        "duration_seconds",
+        "queue_size",
+    ):
+        value = fields.get(metric_name)
+        if not isinstance(value, (int, float)):
+            continue
+        metric = metrics.setdefault(
+            metric_name,
+            {"min": float(value), "max": float(value), "sum": 0.0, "count": 0},
+        )
+        metric["min"] = min(float(metric["min"]), float(value))
+        metric["max"] = max(float(metric["max"]), float(value))
+        metric["sum"] = float(metric["sum"]) + float(value)
+        metric["count"] = int(metric["count"]) + 1
+
+
+def _flush_process_log_summaries_locked(*, force: bool) -> None:
+    global _process_log_last_summary_at
+
+    if not _process_log_summaries:
+        return
+    now = monotonic()
+    if not force and now - _process_log_last_summary_at < _process_log_summary_interval_seconds:
+        return
+
+    summaries: list[dict[str, Any]] = []
+    for summary in _process_log_summaries.values():
+        item = {
+            key: value
+            for key, value in summary.items()
+            if key != "metrics" and value is not None
+        }
+        metrics: dict[str, dict[str, Any]] = {}
+        for name, metric in summary["metrics"].items():
+            count = int(metric["count"])
+            if count <= 0:
+                continue
+            metrics[name] = {
+                "min": round(float(metric["min"]), 6),
+                "max": round(float(metric["max"]), 6),
+                "avg": round(float(metric["sum"]) / count, 6),
+            }
+        if metrics:
+            item["metrics"] = metrics
+        summaries.append(item)
+
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+        **{key: _safe_value(value) for key, value in _process_log_context.items()},
+        "event": "client.hot_path_summary",
+        "summary_interval_seconds": round(max(0.0, now - _process_log_last_summary_at), 3),
+        "summaries": summaries,
+    }
+    _process_log_summaries.clear()
+    _process_log_last_summary_at = now
+    _write_process_record_locked(record)
+
+
+def _write_process_record_locked(record: dict[str, Any]) -> None:
+    global _process_log_dir_ready
+
+    if not _process_log_dir_ready:
+        _process_log_path.parent.mkdir(parents=True, exist_ok=True)
+        _process_log_dir_ready = True
+
+    _rotate_process_log_if_needed_locked()
+    line = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+    with _process_log_path.open("a", encoding="utf-8") as handle:
+        handle.write(line + "\n")
+
+
+def _rotate_process_log_if_needed_locked() -> None:
+    if PROCESS_LOG_BACKUP_COUNT <= 0 or PROCESS_LOG_MAX_BYTES <= 0:
+        return
+    try:
+        if not _process_log_path.exists() or _process_log_path.stat().st_size < PROCESS_LOG_MAX_BYTES:
+            return
+        oldest = _process_log_path.with_name(f"{_process_log_path.name}.{PROCESS_LOG_BACKUP_COUNT}")
+        if oldest.exists():
+            oldest.unlink()
+        for index in range(PROCESS_LOG_BACKUP_COUNT - 1, 0, -1):
+            source = _process_log_path.with_name(f"{_process_log_path.name}.{index}")
+            target = _process_log_path.with_name(f"{_process_log_path.name}.{index + 1}")
+            if source.exists():
+                source.replace(target)
+        _process_log_path.replace(_process_log_path.with_name(f"{_process_log_path.name}.1"))
+    except OSError as exc:
+        _LOG.debug("failed to rotate process log path=%s error=%s", _process_log_path, exc)
 
 # karena dapat menerima tipe data apa saja, fungsi ini untuk mengubah nilai arbitrary (nilai yang bisa berupa tipe data apa saja, termasuk tipe data yang tidak bisa langsung di-serialize ke JSON, seperti objek custom, Path, atau float NaN/Infinity.) menjadi bentuk JSON-safe dan batasi teks panjang.
 def _safe_value(value: Any) -> Any:

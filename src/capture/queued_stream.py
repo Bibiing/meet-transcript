@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import logging
 from queue import Empty, Full, Queue
 from time import perf_counter
 from typing import Any, Callable
 
 import numpy as np
 
-from src.capture.audio_frame import AudioFrame, AudioSource, normalize_samples
+from src.capture.models import AudioFrame, AudioSource, normalize_samples
 from src.capture.errors import CaptureError
 
+_log = logging.getLogger(__name__)
 
 StreamFactory = Callable[..., Any]
 Clock = Callable[[], float]
@@ -122,19 +124,23 @@ class QueuedAudioStream:
         self.stop()
 
     def _on_audio(self, indata: np.ndarray, frames: int, time_info: Any, status: Any) -> None:
-        samples = normalize_samples(indata, self.channels)
-        timestamp = _timestamp_from_time_info(time_info, self._clock)
-        frame = AudioFrame(
-            source=self.source,
-            samples=samples,
-            sample_rate=self.sample_rate,
-            channels=self.channels,
-            timestamp_seconds=timestamp,
-            status=str(status) if status else "",
-        )
+        try:
+            samples = normalize_samples(indata, self.channels)
+            timestamp = _timestamp_from_time_info(time_info, self._clock)
+            frame = AudioFrame(
+                source=self.source,
+                samples=samples,
+                sample_rate=self.sample_rate,
+                channels=self.channels,
+                timestamp_seconds=timestamp,
+                status=str(status) if status else "",
+            )
 
-        self.frames_received += int(frames)
-        self._put_latest(frame)
+            self.frames_received += int(frames)
+            self._put_latest(frame)
+        except Exception as exc:  # pragma: no cover - audio callbacks must not crash host stream
+            self.frames_dropped += int(frames)
+            _log.debug("audio callback failed source=%s error=%s", self.source, exc)
 
     def _put_latest(self, frame: AudioFrame) -> None:
         self.frames_dropped += put_latest_frame(self._queue, frame)
@@ -144,7 +150,12 @@ def _timestamp_from_time_info(time_info: Any, clock: Clock) -> float:
     timestamp = getattr(time_info, "inputBufferAdcTime", None)
     if timestamp is not None:
         try:
-            return float(timestamp)
+            ts = float(timestamp)
+            # Beberapa audio backend mengembalikan inputBufferAdcTime=0.0
+            # meskipun atributnya ada. Ini bukan timestamp yang valid
+            # sehingga harus fallback ke perf_counter().
+            if ts > 0:
+                return ts
         except (TypeError, ValueError):
             pass
     return float(clock())

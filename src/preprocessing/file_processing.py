@@ -6,21 +6,36 @@ import wave
 
 import numpy as np
 
-from src.capture.audio_frame import AudioFrame
+from src.capture.models import AudioFrame
+from src.preprocessing.models import PreprocessConfig, PreprocessedAudioChunk
 from src.capture.wav_sink import write_frames_to_wav
-from src.engine.preprocessing import AudioPreprocessor, PreprocessConfig, PreprocessedAudioChunk
+from src.preprocessing.core import AudioPreprocessor
 
 
-@dataclass(frozen=True, slots=True)
-class PreprocessResult:
-    source: str
-    input_path: Path
-    output_path: Path | None
-    chunk_count: int
-    duration_seconds: float
-    warning: str = ""
+from src.preprocessing.models import PreprocessResult
 
-# kenapa tidak ada reference yang menggunakan fungsi ini?
+# mode: preprocess
+def preprocess_audio_dir(
+    input_dir: Path = Path("audio"),
+    output_dir: Path = Path("audio"),
+) -> list[PreprocessResult]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    processor = AudioPreprocessor(PreprocessConfig())
+    return [
+        preprocess_wav_file(
+            input_dir / "mic.wav",
+            output_dir / "mic.preprocessed.wav",
+            source="mic",
+            preprocessor=processor,
+        ),
+        preprocess_wav_file(
+            input_dir / "speaker.wav",
+            output_dir / "speaker.preprocessed.wav",
+            source="speaker",
+            preprocessor=processor,
+        ),
+    ]
+
 def preprocess_wav_file(
     input_path: Path,
     output_path: Path,
@@ -64,30 +79,6 @@ def preprocess_wav_file(
         chunk_count=len(chunks),
         duration_seconds=duration,
     )
-
-# mode: preprocess
-def preprocess_audio_dir(
-    input_dir: Path = Path("audio"),
-    output_dir: Path = Path("audio"),
-    *,
-    preprocessor: AudioPreprocessor | None = None,
-) -> list[PreprocessResult]:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    processor = preprocessor or AudioPreprocessor(PreprocessConfig())
-    return [
-        preprocess_wav_file(
-            input_dir / "mic.wav",
-            output_dir / "mic.preprocessed.wav",
-            source="mic",
-            preprocessor=processor,
-        ),
-        preprocess_wav_file(
-            input_dir / "speaker.wav",
-            output_dir / "speaker.preprocessed.wav",
-            source="speaker",
-            preprocessor=processor,
-        ),
-    ]
 
 # membaca file WAV menjadi AudioFrame, yang berisi sampel audio, sample rate, jumlah channel, dan timestamp
 def _read_wav_as_frame(path: Path, *, source: str) -> AudioFrame:

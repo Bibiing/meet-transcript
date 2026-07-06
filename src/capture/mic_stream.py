@@ -12,17 +12,7 @@ from src.capture.queued_stream import QueuedAudioStream, StreamFactory
 
 _log = logging.getLogger(__name__)
 
-@dataclass(frozen=True, slots=True)
-class MicrophoneConfig:
-    """Konfigurasi capture mikrofon yang dipakai oleh MicrophoneStream."""
-
-    sample_rate: int | None = None  
-    channels: int | None = None     
-    block_size: int = 1_024
-    dtype: str = "float32"
-    latency: str | float | None = "low"
-    device: int | str | None = None
-    queue_size: int = 64
+from src.capture.models import MicrophoneConfig
 
 
 class MicrophoneStream(QueuedAudioStream):

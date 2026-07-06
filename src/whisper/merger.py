@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 
-from src.engine.whisper import TranscriptionResult
+from src.whisper.models import TranscriptionResult
 
 
 MEETING_SOURCE_LABELS = {
@@ -13,18 +14,7 @@ MEETING_SOURCE_LABELS = {
 }
 
 
-@dataclass(frozen=True, slots=True)
-class MergedTranscriptEntry:
-    result: TranscriptionResult
-    label: str
-
-    @property
-    def display(self) -> str:
-        return (
-            f"[{_format_timestamp(self.result.start_seconds)} - "
-            f"{_format_timestamp(self.result.end_seconds)}] "
-            f"[{self.label}] {self.result.text.strip()}"
-        )
+from src.whisper.models import MergedTranscriptEntry
 
 
 @dataclass(slots=True)
@@ -33,8 +23,10 @@ class TranscriptMerger:
 
     source_labels: dict[str, str] = field(default_factory=lambda: dict(MEETING_SOURCE_LABELS))
     reorder_delay_seconds: float = 0.75
+    max_emitted_keys: int = 5_000
     _pending: list[TranscriptionResult] = field(default_factory=list)
     _emitted_keys: set[tuple[str, float, float, str]] = field(default_factory=set)
+    _emitted_order: deque[tuple[str, float, float, str]] = field(default_factory=deque)
     _max_seen_start: float = 0.0
 
     def add_result(self, result: TranscriptionResult, *, completed: bool = True) -> list[MergedTranscriptEntry]:
@@ -47,7 +39,7 @@ class TranscriptMerger:
         if key in self._emitted_keys:
             return []
 
-        self._emitted_keys.add(key)
+        self._remember_emitted_key(key)
         self._pending.append(result)
         self._max_seen_start = max(self._max_seen_start, result.start_seconds)
         return self.pop_ready()
@@ -78,6 +70,13 @@ class TranscriptMerger:
             label=self.source_labels.get(result.source, result.source.upper()),
         )
 
+    def _remember_emitted_key(self, key: tuple[str, float, float, str]) -> None:
+        self._emitted_keys.add(key)
+        self._emitted_order.append(key)
+        while len(self._emitted_order) > max(1, self.max_emitted_keys):
+            oldest = self._emitted_order.popleft()
+            self._emitted_keys.discard(oldest)
+
 
 def _result_key(result: TranscriptionResult) -> tuple[str, float, float, str]:
     return (
@@ -87,11 +86,3 @@ def _result_key(result: TranscriptionResult) -> tuple[str, float, float, str]:
         " ".join(result.text.lower().split()),
     )
 
-
-def _format_timestamp(seconds: float) -> str:
-    total = max(0, int(round(seconds)))
-    minutes, sec = divmod(total, 60)
-    hours, minutes = divmod(minutes, 60)
-    if hours:
-        return f"{hours:02d}:{minutes:02d}:{sec:02d}"
-    return f"{minutes:02d}:{sec:02d}"

@@ -1,10 +1,3 @@
-"""Primitive client WebSocket untuk komunikasi dengan server WhisperLive.
-
-Setiap source audio memakai satu koneksi sendiri. Kelas di modul ini mengurus
-handshake, pengiriman opsi model, encoding payload audio, penerimaan SERVER_READY,
-dan parsing segment transcript dari server.
-"""
-
 from __future__ import annotations
 
 import json
@@ -18,89 +11,17 @@ from typing import Any, Callable, Literal
 
 import numpy as np
 
-from src.engine.preprocessing import PreprocessedAudioChunk
-
+from src.preprocessing.core import PreprocessedAudioChunk
 
 _log = logging.getLogger(__name__)
 
-DEFAULT_READY_TIMEOUT_SECONDS = 300.0
-
-DEFAULT_INITIAL_PROMPT = ""
-
-
-DEFAULT_HOTWORDS = ""
-
-
-TranscriptCallback = Callable[[str, list[dict[str, Any]], dict[str, Any]], None]
-StatusCallback = Callable[[str, dict[str, Any]], None]
-WebSocketFactory = Callable[..., Any]
-
-
-@dataclass(frozen=True, slots=True)
-class WhisperLiveProfile:
-    """Profil ASR yang dikirim ke WhisperLive saat stream tersambung."""
-
-    language: str = "id"
-    task: Literal["transcribe", "translate"] = "transcribe"
-    model: str = "small"
-    use_vad: bool = False
-    vad_threshold: float = 0.55
-    vad_min_speech_duration_ms: int = 250
-    vad_min_silence_duration_ms: int = 500
-    vad_speech_pad_ms: int = 200
-    no_speech_thresh: float = 0.75
-    decode_no_speech_threshold: float = 0.75
-    log_prob_threshold: float = -1.2
-    compression_ratio_threshold: float = 2.6
-    condition_on_previous_text: bool = False
-    repetition_penalty: float = 1.15
-    no_repeat_ngram_size: int = 3
-    hallucination_silence_threshold: float = 1.0
-    temperature: float = 0.0
-    beam_size: int = 5
-    clip_audio: bool = True
-    same_output_threshold: int = 3
-    send_last_n_segments: int = 10
-    word_timestamps: bool = True
-    local_agreement: bool = True
-    local_agreement_window_seconds: float = 20.0
-    local_agreement_hop_seconds: float = 3.0
-    local_agreement_trailing_guard_seconds: float = 0.6
-    local_agreement_retain_seconds: float = 1.0
-    dynamic_prompt: bool = True
-    dynamic_prompt_max_chars: int = 700
-    speech_boundary_detection: bool = True
-    speech_boundary_silence_seconds: float = 0.8
-    speech_boundary_max_wait_seconds: float = 5.0
-    initial_prompt: str = DEFAULT_INITIAL_PROMPT
-    hotwords: str = DEFAULT_HOTWORDS
-
-    def vad_parameters(self) -> dict[str, int | float]:
-        return {
-            "threshold": self.vad_threshold,
-            "min_speech_duration_ms": self.vad_min_speech_duration_ms,
-            "min_silence_duration_ms": self.vad_min_silence_duration_ms,
-            "speech_pad_ms": self.vad_speech_pad_ms,
-        }
-
-
-@dataclass(frozen=True, slots=True)
-class WhisperLiveConnectionConfig:
-    host: str = "localhost"
-    port: int = 9090
-    use_wss: bool = False
-    sample_rate: int = 16_000
-    channels: int = 1
-    audio_format: Literal["float32", "int16", "uint8"] = "int16"
-    connect_timeout: float = 10.0
-    ready_timeout: float = DEFAULT_READY_TIMEOUT_SECONDS
-    api_key: str | None = None
-    profile: WhisperLiveProfile = field(default_factory=WhisperLiveProfile)
-
-    @property
-    def url(self) -> str:
-        protocol = "wss" if self.use_wss else "ws"
-        return f"{protocol}://{self.host}:{self.port}"
+from src.whisper.models import (
+    DEFAULT_READY_TIMEOUT_SECONDS,
+    DEFAULT_INITIAL_PROMPT,
+    DEFAULT_HOTWORDS,
+    WhisperLiveProfile,
+    WhisperLiveConnectionConfig,
+)
 
 
 class WhisperLiveStreamClient:

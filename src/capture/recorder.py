@@ -1,15 +1,13 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
 import logging
 from pathlib import Path
 from time import monotonic, sleep
-from typing import Literal
 
 import numpy as np
 
-from src.capture.audio_frame import AudioFrame
+from src.capture.models import AudioFrame, CaptureOptions, CaptureResult
 from src.capture.errors import CaptureError
 from src.capture.mac_sys_audio import MacSystemAudioConfig, MacSystemAudioStream
 from src.capture.mic_stream import MicrophoneConfig, MicrophoneStream
@@ -19,52 +17,31 @@ from src.utils.os_detector import AudioBackend, get_audio_backend
 
 _log = logging.getLogger(__name__)
 
-CaptureSource = Literal["mic", "speaker", "both"]
-
-@dataclass(frozen=True, slots=True)
-class CaptureOptions:
-    seconds: float = 3.0                            # durasi perekaman dalam detik
-    output_dir: Path = Path("audio")                # direktori output untuk menyimpan file WAV
-    source: CaptureSource = "both"                  # sumber audio yang akan direkam: "mic", "speaker", atau "both"
-    sample_rate: int | None = None                  # sample rate dalam Hz
-    block_size: int = 1_024                         # ukuran blok audio dalam sampel
-    queue_size: int = 64                            # ukuran antrian untuk buffer audio
-    mic_channels: int | None = None                 # jumlah saluran untuk mikrofon
-    speaker_channels: int | None = None             # jumlah saluran untuk speaker
-    mic_device: int | str | None = None             # perangkat mikrofon
-    speaker_device: int | str | None = None         # perangkat speaker
-
-
-@dataclass(frozen=True, slots=True)
-class CaptureResult:
-    source: str                                     # sumber audio yang direkam: "mic" atau "speaker"
-    path: Path | None = None                        # path ke file WAV yang dihasilkan
-    frame_count: int = 0                            # jumlah frame yang direkam
-    duration_seconds: float = 0.0                   # durasi perekaman dalam detik
-    sample_rate: int = 0                            # sample rate dalam Hz
-    channels: int = 0                               # jumlah saluran audio
-    warning: str = ""                               # peringatan jika ada masalah selama perekaman
-
-    @property
-    def ok(self) -> bool: return self.path is not None and not self.warning # mengembalikan True jika perekaman berhasil dan tidak ada peringatan
-
 # rekam audio dari stream selama beberapa detik dan kembalikan daftar frame audio
 def record_stream(stream: object, seconds: float) -> list[AudioFrame]:
     frames: list[AudioFrame] = []
-    stream.start()
-    try:
-        deadline = monotonic() + seconds + 3.0 # tambahkan 3 detik untuk toleransi
-        captured_seconds = 0.0  # jumlah detik yang telah direkam
-
-        # loop untuk membaca frame dari stream hingga durasi yang diminta tercapai atau waktu habis
-        while captured_seconds < seconds and monotonic() < deadline:    
-            frame = stream.read_frame(timeout=0.25)
-            if frame is not None:
-                frames.append(frame)
-                captured_seconds += frame.duration_seconds
-    finally:
-        stream.stop()
+    if hasattr(stream, "__enter__") and hasattr(stream, "__exit__"):
+        with stream:  # type: ignore[operator]
+            _collect_frames(stream, seconds, frames)
+    else:
+        stream.start()
+        try:
+            _collect_frames(stream, seconds, frames)
+        finally:
+            stream.stop()
     return frames
+
+
+def _collect_frames(stream: object, seconds: float, frames: list[AudioFrame]) -> None:
+    deadline = monotonic() + seconds + 3.0 # tambahkan 3 detik untuk toleransi
+    captured_seconds = 0.0  # jumlah detik yang telah direkam
+
+    # loop untuk membaca frame dari stream hingga durasi yang diminta tercapai atau waktu habis
+    while captured_seconds < seconds and monotonic() < deadline:
+        frame = stream.read_frame(timeout=0.25)
+        if frame is not None:
+            frames.append(frame)
+            captured_seconds += frame.duration_seconds
 
 
 def run_capture(options: CaptureOptions) -> list[CaptureResult]:

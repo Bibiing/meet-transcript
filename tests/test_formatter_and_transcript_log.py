@@ -3,9 +3,15 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from src.engine.whisper import TranscriptionResult
+from src.whisper.models import TranscriptionResult
 from src.utils.formatter import format_transcript_results
-from src.utils.logging import TranscriptLog
+from src.utils.logging import (
+    TranscriptLog,
+    clear_process_log_context,
+    configure_process_logging,
+    flush_process_log_summaries,
+    log_process_event,
+)
 
 
 def test_format_transcript_results_sorts_and_labels_sources() -> None:
@@ -105,3 +111,40 @@ def test_transcript_log_can_store_candidate_metadata(tmp_path: Path) -> None:
     assert entry["reliability_score"] == 0.73
     payload = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
     assert payload[0]["reliability_action"] == "review"
+
+
+def test_process_log_adds_session_id_and_summarizes_hot_path(tmp_path: Path) -> None:
+    path = tmp_path / "process.log"
+    configure_process_logging(
+        session_id="test-session",
+        include_hot_path=False,
+        summary_interval_seconds=999.0,
+        process_log_path=path,
+    )
+
+    try:
+        log_process_event("client.session_start", source="speaker")
+        log_process_event(
+            "client.chunk_sent",
+            source="speaker",
+            input_rms_db=-31.5,
+            output_rms_db=-22.0,
+            sent=1,
+            chunks_sent=1,
+        )
+        flush_process_log_summaries()
+
+        records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    finally:
+        clear_process_log_context()
+
+    assert records[0]["event"] == "client.session_start"
+    assert records[0]["session_id"] == "test-session"
+    assert not any(record["event"] == "client.chunk_sent" for record in records)
+
+    summary = next(record for record in records if record["event"] == "client.hot_path_summary")
+    assert summary["session_id"] == "test-session"
+    assert summary["summaries"][0]["event"] == "client.chunk_sent"
+    assert summary["summaries"][0]["source"] == "speaker"
+    assert summary["summaries"][0]["count"] == 1
+    assert summary["summaries"][0]["metrics"]["input_rms_db"]["avg"] == -31.5

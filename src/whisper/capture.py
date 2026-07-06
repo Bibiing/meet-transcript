@@ -3,50 +3,33 @@ from __future__ import annotations
 import logging
 import queue
 import threading
+from dataclasses import replace
 
 from src.capture.errors import CaptureError, CaptureNotSupportedError
 from src.capture.mac_sys_audio import MacSystemAudioConfig, MacSystemAudioStream
 from src.capture.mic_stream import MicrophoneConfig, MicrophoneStream
 from src.capture.win_loopback import WindowsLoopbackConfig, WindowsLoopbackStream
-from src.capture.audio_frame import AudioFrame
-from src.engine.preprocessing import AudioPreprocessor, PreprocessConfig, PreprocessedAudioChunk
+from src.capture.models import AudioFrame
+from src.preprocessing.core import AudioPreprocessor, PreprocessConfig, PreprocessedAudioChunk
 import numpy as np
 from src.utils.logging import log_process_event
 from src.utils.os_detector import AudioBackend, get_audio_backend
+from src.whisper.models import WhisperLiveSessionConfig, WhisperLiveSessionStats
 
 _log = logging.getLogger(__name__)
 
+# stream capture mic/speaker beserta reader thread-nya digunakan untuk menginisialisasi stream audio dari mikrofon dan speaker, serta membuat thread pembaca yang akan memproses audio dari hardware ke dalam antrian chunk.
 def _build_capture_streams(
-    cfg: "WhisperLiveSessionConfig",
+    cfg: WhisperLiveSessionConfig,
     chunk_queue: queue.Queue[PreprocessedAudioChunk],
     stop_event: threading.Event,
-    stats: "WhisperLiveSessionStats",
+    stats: WhisperLiveSessionStats,
 ) -> tuple[list[object], list[threading.Thread]]:
-    """Bangun stream capture mic/speaker beserta reader thread-nya."""
     capture_streams: list[object] = []
     reader_threads: list[threading.Thread] = []
     
-    # Konfigurasi preprocessing untuk mikrofon
-    mic_preprocess_config = PreprocessConfig(
-        chunk_seconds=cfg.chunk_seconds,
-        min_chunk_seconds=cfg.chunk_seconds,
-    )
-    if not cfg.mic_client_vad:
-        mic_preprocess_config = _without_client_vad(mic_preprocess_config)
-        
-    # Konfigurasi preprocessing untuk speaker
-    speaker_preprocess_config = PreprocessConfig(
-        chunk_seconds=cfg.chunk_seconds,
-        min_chunk_seconds=cfg.chunk_seconds,
-        vad_rms_threshold=0.008,
-        vad_peak_threshold=0.03,
-        vad_speech_fraction=0.20,
-        min_input_rms_db=-48.0,
-    )
-    if not cfg.speaker_client_vad:
-        # Speaker loopback biasanya sudah bersih, jadi VAD client boleh dimatikan
-        # agar audio pelan dari meeting tidak ikut terbuang.
-        speaker_preprocess_config = _without_client_vad(speaker_preprocess_config)
+    mic_preprocess_config = _build_mic_preprocess_config(cfg)
+    speaker_preprocess_config = _build_speaker_preprocess_config(cfg)
 
     # Inisialisasi stream mikrofon
     if cfg.source in ("mic", "both"):
@@ -60,6 +43,7 @@ def _build_capture_streams(
                 )
             )
             capture_streams.append(mic_stream)
+
             log_process_event(
                 "client.capture_backend",
                 source="mic",
@@ -70,8 +54,9 @@ def _build_capture_streams(
                 device=cfg.mic_device,
                 client_vad=cfg.mic_client_vad,
             )
+
             reader_threads.append(_reader("mic", mic_stream, mic_preprocess_config, chunk_queue, stop_event, stats))
-        except Exception as exc:  # pragma: no cover
+        except Exception as exc: 
             log_process_event("client.capture_backend_error", source="mic", backend="microphone", error=str(exc))
             _log.warning("whisperlive session: mic unavailable: %s", exc)
 
@@ -105,6 +90,7 @@ def _build_capture_streams(
                 "client.capture_backend",
                 source="speaker",
                 backend=backend,
+                backend_audio=backend_audio.value,
                 backenn_audio=backend_audio.value,
                 sample_rate=cfg.sample_rate,
                 block_size=cfg.block_size,
@@ -114,39 +100,53 @@ def _build_capture_streams(
             )
             reader_threads.append(_reader("speaker", speaker_stream, speaker_preprocess_config, chunk_queue, stop_event, stats))
         except CaptureNotSupportedError as exc:
-            log_process_event("client.capture_backend_error", source="speaker", backenn_audio=backend_audio.value, error=str(exc))
+            log_process_event(
+                "client.capture_backend_error",
+                source="speaker",
+                backend_audio=backend_audio.value,
+                backenn_audio=backend_audio.value,
+                error=str(exc),
+            )
             _log.warning("whisperlive session: speaker unavailable: %s", exc)
 
     return capture_streams, reader_threads
 
-
-def _without_client_vad(config: PreprocessConfig) -> PreprocessConfig:
-    """Kembalikan konfigurasi preprocessing tanpa gate VAD client."""
+def _build_mic_preprocess_config(cfg: WhisperLiveSessionConfig) -> PreprocessConfig:
     return PreprocessConfig(
-        target_sample_rate=config.target_sample_rate,
-        chunk_seconds=config.chunk_seconds,
-        highpass_cutoff_hz=config.highpass_cutoff_hz,
-        highpass_order=config.highpass_order,
-        target_rms_db=config.target_rms_db,
-        clip_limit=config.clip_limit,
-        vad_rms_threshold=0.0,
-        vad_peak_threshold=0.0,
-        vad_speech_fraction=0.0,
-        min_input_rms_db=float("-inf"),
-        min_chunk_seconds=config.min_chunk_seconds,
-        max_normalization_gain_db=config.max_normalization_gain_db,
+        chunk_seconds=cfg.chunk_seconds,
+        min_chunk_seconds=cfg.chunk_seconds,
+        target_rms_db=cfg.mic_target_rms_db,
+        max_normalization_gain_db=cfg.mic_max_normalization_gain_db,
+        vad_rms_threshold=cfg.mic_vad_rms_threshold,
+        vad_peak_threshold=cfg.mic_vad_peak_threshold,
+        vad_speech_fraction=cfg.mic_vad_speech_fraction,
+        client_vad_enabled=cfg.mic_client_vad,
+        min_input_rms_db=cfg.mic_min_input_rms_db,
     )
 
 
+def _build_speaker_preprocess_config(cfg: WhisperLiveSessionConfig) -> PreprocessConfig:
+    return PreprocessConfig(
+        chunk_seconds=cfg.chunk_seconds,
+        min_chunk_seconds=cfg.chunk_seconds,
+        target_rms_db=cfg.speaker_target_rms_db,
+        max_normalization_gain_db=cfg.speaker_max_normalization_gain_db,
+        vad_rms_threshold=cfg.speaker_vad_rms_threshold,
+        vad_peak_threshold=cfg.speaker_vad_peak_threshold,
+        vad_speech_fraction=cfg.speaker_vad_speech_fraction,
+        client_vad_enabled=cfg.speaker_client_vad,
+        min_input_rms_db=cfg.speaker_min_input_rms_db,
+    )
+
+# membuat thread pembaca stream yang memproses audio dari hardware ke dalam antrian chunk 
 def _reader(
     source: str,
     stream: object,
     preprocess_config: PreprocessConfig,
     chunk_queue: queue.Queue[PreprocessedAudioChunk],
     stop_event: threading.Event,
-    stats: "WhisperLiveSessionStats",
+    stats: WhisperLiveSessionStats,
 ) -> threading.Thread:
-    """Membuat thread pembaca stream yang memproses audio dari hardware ke dalam antrian chunk."""
     return threading.Thread(
         target=_reader_thread,
         args=(
@@ -163,7 +163,7 @@ def _reader(
 
 
 # akumulasi frame dari *stream*, preprocess, push ke *chunk_queue*.
-# fungsi ini berjalan di thread daemon sendiri. Tidak sengaja merujuk model Whisper — hanya penangkapan audio dan preprocessing yang terjadi di sini.  Thread-safety dipertahankan dengan:
+# berjalan di thread daemon sendiri. Tidak merujuk model Whisper — hanya penangkapan audio dan preprocessing yang terjadi di sini.  Thread-safety dipertahankan dengan:
 #   - Hanya menulis ke *chunk_queue* (Queue thread-safe).
 #   - Hanya membaca *stop_event.is_set()* (bool-like atomik).
 #   - *preprocessor* TIDAK dibagikan antar thread.
@@ -174,21 +174,25 @@ def _reader_thread(
     chunk_queue: queue.Queue[PreprocessedAudioChunk],
     chunk_seconds: float,
     stop_event: threading.Event,
-    stats: "WhisperLiveSessionStats",
+    stats: WhisperLiveSessionStats,
 ) -> None:
     buffer: list[AudioFrame] = []
     source_name = "unknown"
     frames_seen = 0
     chunks_enqueued = 0
     first_frame_logged = False
+    first_frame_timestamp: float | None = None
     dropped_by_preprocess = 0
 
     # loop pembaca frame audio dari stream. 
     while not stop_event.is_set():
-        frame = stream.read_frame(timeout=0.1)  # membaca frame audio dari stream dengan timeout 0.1 detik. jika terlalu cepat membebani cpu
-        if frame is None:
+        raw_frame = stream.read_frame(timeout=0.1)  # membaca frame audio dari stream dengan timeout 0.1 detik. jika terlalu cepat membebani cpu
+        if raw_frame is None:
             continue
 
+        if first_frame_timestamp is None:
+            first_frame_timestamp = raw_frame.timestamp_seconds
+        frame = _relative_frame(raw_frame, first_frame_timestamp)
         source_name = frame.source  # sumber audio dari frame
         frames_seen += 1 # increment jumlah frame yang telah dibaca dari stream    
         
@@ -200,6 +204,8 @@ def _reader_thread(
                 sample_rate=frame.sample_rate,
                 channels=frame.channels,
                 frame_count=frame.frame_count,
+                start_seconds=round(frame.timestamp_seconds, 3),
+                capture_clock_seconds=round(raw_frame.timestamp_seconds, 3),
                 frame_rms=round(_frame_rms(frame), 6),
                 status=frame.status or "",
             )
@@ -285,7 +291,7 @@ def _reader_thread(
                 try:
                     chunk_queue.put_nowait(chunk) # menambahkan chunk baru ke antrian tanpa menunggu jika antrian penuh.
                     chunks_enqueued += 1
-                    stats.chunks_dropped += 1
+                    stats.add_chunks_dropped()
 
                     log_process_event(
                         "client.chunk_queue_drop",
@@ -348,7 +354,7 @@ def _reader_thread(
                     )
                 
                 except queue.Full:
-                    stats.chunks_dropped += 1
+                    stats.add_chunks_dropped()
                     log_process_event(
                         "client.chunk_queue_drop",
                         source=source_name,
@@ -364,6 +370,13 @@ def _reader_thread(
         chunks_enqueued,
         dropped_by_preprocess,
     )
+
+
+def _relative_frame(frame: AudioFrame, first_frame_timestamp: float) -> AudioFrame:
+    relative_timestamp = max(0.0, frame.timestamp_seconds - first_frame_timestamp)
+    if relative_timestamp == frame.timestamp_seconds:
+        return frame
+    return replace(frame, timestamp_seconds=relative_timestamp)
 
 
 def _frame_rms(frame: AudioFrame) -> float:
