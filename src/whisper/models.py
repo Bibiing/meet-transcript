@@ -105,19 +105,14 @@ class WhisperLiveSessionConfig:
     mic_device: int | str | None = None
     speaker_device: int | str | None = None
     
-    # vad (voice activity detection)
-    mic_client_vad: bool = True
-    speaker_client_vad: bool = False
-    mic_vad_rms_threshold: float = 0.025
-    mic_vad_peak_threshold: float = 0.08
-    mic_vad_speech_fraction: float = 0.35
-    mic_min_input_rms_db: float = -38.0
+    # server-side VAD policy per source
+    mic_server_vad: bool = True
+    speaker_server_vad: bool = False
+
+    # client preprocessing level policy
     mic_target_rms_db: float = -20.0
     mic_max_normalization_gain_db: float = 18.0
-    speaker_vad_rms_threshold: float = 0.008
-    speaker_vad_peak_threshold: float = 0.05
-    speaker_vad_speech_fraction: float = 0.20
-    speaker_min_input_rms_db: float = -48.0
+    mic_min_input_rms_db: float = -38.0
     speaker_target_rms_db: float = -23.0
     speaker_max_normalization_gain_db: float = 18.0
     max_chunk_queue_size: int = 32

@@ -5,7 +5,7 @@ import queue
 import signal
 import threading
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from time import monotonic, perf_counter
 from typing import Literal
@@ -49,6 +49,31 @@ _log = logging.getLogger(__name__)
 
 
 from src.whisper.models import WhisperLiveSessionConfig, WhisperLiveSessionStats
+
+
+def _server_vad_for_source(cfg: WhisperLiveSessionConfig, source: str) -> bool:
+    if source == "mic":
+        return cfg.mic_server_vad
+    if source == "speaker":
+        return cfg.speaker_server_vad
+    return False
+
+
+def _connection_config_for_source(cfg: WhisperLiveSessionConfig, source: str) -> WhisperLiveConnectionConfig:
+    profile = replace(cfg.profile, use_vad=_server_vad_for_source(cfg, source))
+    return WhisperLiveConnectionConfig(
+        host=cfg.server_host,
+        port=cfg.server_port,
+        use_wss=cfg.use_wss,
+        sample_rate=cfg.sample_rate or 16_000,
+        channels=1,
+        audio_format=cfg.audio_format,
+        connect_timeout=10.0,
+        ready_timeout=cfg.ready_timeout,
+        api_key=cfg.api_key,
+        profile=profile,
+    )
+
 
 # live mode
 # capture mic/speaker audio dan stream setiap source ke WhisperLive
@@ -100,6 +125,7 @@ def run_whisperlive_session(
     
     candidate_transcript_keys: set[tuple[str, int, str]] = set()
     candidate_transcript_order: deque[tuple[str, int, str]] = deque()
+    active_sources = _requested_sources(cfg.source) # mengambil source yang aktif (mic, speaker, atau keduanya)
     partial_preview = _PartialTranscriptPreview() if cfg.show_partials else None
     chunk_archive = _ChunkArchive(cfg.chunk_archive_dir) if cfg.chunk_archive_dir is not None else None
     rolling_archive = (
@@ -114,21 +140,17 @@ def run_whisperlive_session(
                 "source": cfg.source,
                 "chunk_seconds": cfg.chunk_seconds,
                 "audio_format": cfg.audio_format,
+                "server_vad": {
+                    "mic": cfg.mic_server_vad,
+                    "speaker": cfg.speaker_server_vad,
+                    "vad_threshold": cfg.profile.vad_threshold,
+                    "vad_parameters": cfg.profile.vad_parameters(),
+                },
                 "mic_preprocess": {
-                    "client_vad": cfg.mic_client_vad,
-                    "vad_rms_threshold": cfg.mic_vad_rms_threshold,
-                    "vad_peak_threshold": cfg.mic_vad_peak_threshold,
-                    "vad_speech_fraction": cfg.mic_vad_speech_fraction,
-                    "min_input_rms_db": cfg.mic_min_input_rms_db,
                     "target_rms_db": cfg.mic_target_rms_db,
                     "max_normalization_gain_db": cfg.mic_max_normalization_gain_db,
                 },
                 "speaker_preprocess": {
-                    "client_vad": cfg.speaker_client_vad,
-                    "vad_rms_threshold": cfg.speaker_vad_rms_threshold,
-                    "vad_peak_threshold": cfg.speaker_vad_peak_threshold,
-                    "vad_speech_fraction": cfg.speaker_vad_speech_fraction,
-                    "min_input_rms_db": cfg.speaker_min_input_rms_db,
                     "target_rms_db": cfg.speaker_target_rms_db,
                     "max_normalization_gain_db": cfg.speaker_max_normalization_gain_db,
                 },
@@ -156,8 +178,10 @@ def run_whisperlive_session(
         ready_timeout=cfg.ready_timeout,
         mic_device=cfg.mic_device,
         speaker_device=cfg.speaker_device,
-        mic_client_vad=cfg.mic_client_vad,
-        speaker_client_vad=cfg.speaker_client_vad,
+        mic_server_vad=cfg.mic_server_vad,
+        speaker_server_vad=cfg.speaker_server_vad,
+        server_vad_threshold=cfg.profile.vad_threshold,
+        server_vad_parameters=cfg.profile.vad_parameters(),
         auto_reconnect=cfg.auto_reconnect,
         reconnect_initial_backoff_seconds=cfg.reconnect_initial_backoff_seconds,
         reconnect_max_backoff_seconds=cfg.reconnect_max_backoff_seconds,
@@ -167,20 +191,10 @@ def run_whisperlive_session(
         candidate_cache_max_entries=cfg.candidate_cache_max_entries,
         merger_emitted_cache_max_entries=cfg.merger_emitted_cache_max_entries,
         mic_preprocess={
-            "client_vad": cfg.mic_client_vad,
-            "vad_rms_threshold": cfg.mic_vad_rms_threshold,
-            "vad_peak_threshold": cfg.mic_vad_peak_threshold,
-            "vad_speech_fraction": cfg.mic_vad_speech_fraction,
-            "min_input_rms_db": cfg.mic_min_input_rms_db,
             "target_rms_db": cfg.mic_target_rms_db,
             "max_normalization_gain_db": cfg.mic_max_normalization_gain_db,
         },
         speaker_preprocess={
-            "client_vad": cfg.speaker_client_vad,
-            "vad_rms_threshold": cfg.speaker_vad_rms_threshold,
-            "vad_peak_threshold": cfg.speaker_vad_peak_threshold,
-            "vad_speech_fraction": cfg.speaker_vad_speech_fraction,
-            "min_input_rms_db": cfg.speaker_min_input_rms_db,
             "target_rms_db": cfg.speaker_target_rms_db,
             "max_normalization_gain_db": cfg.speaker_max_normalization_gain_db,
         },
@@ -219,7 +233,10 @@ def run_whisperlive_session(
             return
         if status == "CLIENT_OPTIONS_SENT":
             log_process_event("client.options_sent", source=source, details=message)
-            _print(f"[{label}] options sent audio_format={message.get('audio_format')}")
+            _print(
+                f"[{label}] options sent "
+                f"audio_format={message.get('audio_format')} server_vad={message.get('server_vad')}"
+            )
             _log.info("whisperlive options sent source=%s details=%s", source, message)
             return
         if status == "CLIENT_WAITING_SERVER_READY":
@@ -381,19 +398,6 @@ def run_whisperlive_session(
                 quality_tracker.observe_emit(entry.result.source)
                 stats.add_result_received()
 
-    # client reconnect buffer dan koneksi ke server WhisperLive
-    connection_config = WhisperLiveConnectionConfig(
-        host=cfg.server_host,
-        port=cfg.server_port,
-        use_wss=cfg.use_wss,
-        api_key=cfg.api_key,
-        ready_timeout=cfg.ready_timeout,
-        audio_format=cfg.audio_format,
-        profile=cfg.profile,
-    )
-
-    active_sources = _requested_sources(cfg.source) # mengambil source yang aktif (mic, speaker, atau keduanya)
-
     # policy reconnect untuk setiap source, agar jika koneksi terputus, client akan mencoba reconnect sesuai policy yang ditentukan
     reconnect_policy = ReconnectPolicy(
         enabled=cfg.auto_reconnect,
@@ -406,7 +410,7 @@ def run_whisperlive_session(
     clients = {
         source: _BufferedReconnectClient(
             source,
-            connection_config,
+            _connection_config_for_source(cfg, source),
             policy=reconnect_policy,
             on_transcript=handle_transcript,
             on_status=handle_status,
@@ -460,6 +464,13 @@ def run_whisperlive_session(
         _print(
             f"Server: {cfg.server_host}:{cfg.server_port}  |  "
             f"Model: {cfg.profile.model}  |  VAD: {cfg.profile.vad_threshold:.2f}"
+        )
+        _print(
+            "Server VAD: "
+            + ", ".join(f"{source.upper()}={_server_vad_for_source(cfg, source)}" for source in active_sources)
+        )
+        _print(
+            "Debug metadata: source-specific preprocessing, replay-ready chunks, and per-source server VAD decisions."
         )
         _print(f"Sumber: {', '.join(source.upper() for source in active_sources)}")
         _print("=" * 60)

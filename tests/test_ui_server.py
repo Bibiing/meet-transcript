@@ -18,8 +18,8 @@ def test_build_live_command_uses_python_module_and_transcript_log(tmp_path: Path
             chunk_seconds=0.5,
             mic_device=3,
             speaker_device="Headset",
-            mic_client_vad=False,
-            speaker_client_vad=False,
+            mic_server_vad=True,
+            speaker_server_vad=False,
             vad_threshold=0.5,
             no_speech_thresh=0.45,
             local_agreement=True,
@@ -49,8 +49,8 @@ def test_build_live_command_uses_python_module_and_transcript_log(tmp_path: Path
     assert "3" in command
     assert "--speaker-device" in command
     assert "Headset" in command
-    assert "--no-mic-client-vad" in command
-    assert "--no-speaker-client-vad" in command
+    assert "--mic-server-vad" in command
+    assert "--no-speaker-server-vad" in command
     assert "--transcript-log" in command
     assert str(transcript_log) in command
     assert "--hide-partials" in command

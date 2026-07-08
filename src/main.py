@@ -60,22 +60,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--speaker-device", default=env_optional("PLN_SPEAKER_DEVICE"), help="speaker/output loopback device index or name, for example headset speaker")
     
     # Voice Activity Detection (VAD)
-    parser.add_argument("--mic-client-vad", action=argparse.BooleanOptionalAction, default=env_bool("PLN_MIC_CLIENT_VAD", True), help="enable client-side VAD for microphone chunks",)
-    parser.add_argument("--speaker-client-vad", action=argparse.BooleanOptionalAction, default=env_bool("PLN_SPEAKER_CLIENT_VAD", False), help="enable client-side VAD for speaker/system-audio chunks",)
-    parser.add_argument("--mic-vad-rms-threshold", type=float, default=env_float("PLN_MIC_VAD_RMS_THRESHOLD", 0.025), help="microphone client VAD RMS threshold")
-    parser.add_argument("--mic-vad-peak-threshold", type=float, default=env_float("PLN_MIC_VAD_PEAK_THRESHOLD", 0.08), help="microphone client VAD peak threshold")
-    parser.add_argument("--mic-vad-speech-fraction", type=float, default=env_float("PLN_MIC_VAD_SPEECH_FRACTION", 0.35), help="minimum active sub-frame fraction for microphone VAD")
-    parser.add_argument("--mic-min-input-rms-db", type=float, default=env_float("PLN_MIC_MIN_INPUT_RMS_DB", -38.0), help="microphone chunks below this input RMS dB are dropped")
+    parser.add_argument("--mic-server-vad", action=argparse.BooleanOptionalAction, default=env_bool("PLN_MIC_SERVER_VAD", True), help="enable server-side VAD for microphone chunks")
+    parser.add_argument("--speaker-server-vad", action=argparse.BooleanOptionalAction, default=env_bool("PLN_SPEAKER_SERVER_VAD", False), help="enable server-side VAD for speaker/system-audio chunks")
     parser.add_argument("--mic-target-rms-db", type=float, default=env_float("PLN_MIC_TARGET_RMS_DB", -20.0), help="microphone target RMS dB after normalization")
     parser.add_argument("--mic-max-normalization-gain-db", type=float, default=env_float("PLN_MIC_MAX_GAIN_DB", 18.0), help="maximum microphone normalization gain in dB")
-    parser.add_argument("--speaker-vad-rms-threshold", type=float, default=env_float("PLN_SPEAKER_VAD_RMS_THRESHOLD", 0.008), help="speaker client VAD RMS threshold")
-    parser.add_argument("--speaker-vad-peak-threshold", type=float, default=env_float("PLN_SPEAKER_VAD_PEAK_THRESHOLD", 0.05), help="speaker client VAD peak threshold")
-    parser.add_argument("--speaker-vad-speech-fraction", type=float, default=env_float("PLN_SPEAKER_VAD_SPEECH_FRACTION", 0.20), help="minimum active sub-frame fraction for speaker VAD")
-    parser.add_argument("--speaker-min-input-rms-db", type=float, default=env_float("PLN_SPEAKER_MIN_INPUT_RMS_DB", -48.0), help="speaker chunks below this input RMS dB are dropped")
     parser.add_argument("--speaker-target-rms-db", type=float, default=env_float("PLN_SPEAKER_TARGET_RMS_DB", -23.0), help="speaker target RMS dB after normalization")
     parser.add_argument("--speaker-max-normalization-gain-db", type=float, default=env_float("PLN_SPEAKER_MAX_GAIN_DB", 18.0), help="maximum speaker normalization gain in dB")
     parser.add_argument("--vad-threshold", type=float, default=env_float("WHISPERLIVE_VAD_THRESHOLD", 0.55), help="WhisperLive server VAD threshold")
-    parser.add_argument("--server-vad", action=argparse.BooleanOptionalAction, default=env_bool("WHISPERLIVE_USE_VAD", False), help="enable server-side Faster-Whisper VAD in addition to client preprocessing",)
     
     # Konfigurasi Whisper / OpenAI ASR Model
     parser.add_argument("--whisper-model", default=None, help="Whisper model name")
@@ -217,7 +208,7 @@ def main(argv: list[str] | None = None) -> int:
                 language=args.whisper_language,
                 task=args.whisper_task,
                 model=live_model,
-                use_vad=args.server_vad,
+                use_vad=False,
                 vad_threshold=args.vad_threshold,
                 no_speech_thresh=args.whisperlive_no_speech_thresh,
                 local_agreement=args.local_agreement,
@@ -246,18 +237,10 @@ def main(argv: list[str] | None = None) -> int:
                 queue_size=args.queue_size,
                 mic_device=_device_arg(args.mic_device),
                 speaker_device=_device_arg(args.speaker_device),
-                mic_client_vad=args.mic_client_vad,
-                speaker_client_vad=args.speaker_client_vad,
-                mic_vad_rms_threshold=args.mic_vad_rms_threshold,
-                mic_vad_peak_threshold=args.mic_vad_peak_threshold,
-                mic_vad_speech_fraction=args.mic_vad_speech_fraction,
-                mic_min_input_rms_db=args.mic_min_input_rms_db,
+                mic_server_vad=args.mic_server_vad,
+                speaker_server_vad=args.speaker_server_vad,
                 mic_target_rms_db=args.mic_target_rms_db,
                 mic_max_normalization_gain_db=args.mic_max_normalization_gain_db,
-                speaker_vad_rms_threshold=args.speaker_vad_rms_threshold,
-                speaker_vad_peak_threshold=args.speaker_vad_peak_threshold,
-                speaker_vad_speech_fraction=args.speaker_vad_speech_fraction,
-                speaker_min_input_rms_db=args.speaker_min_input_rms_db,
                 speaker_target_rms_db=args.speaker_target_rms_db,
                 speaker_max_normalization_gain_db=args.speaker_max_normalization_gain_db,
                 auto_reconnect=args.auto_reconnect,
@@ -298,7 +281,7 @@ def main(argv: list[str] | None = None) -> int:
                 language=args.whisper_language,
                 task=args.whisper_task,
                 model=replay_model,
-                use_vad=args.server_vad,
+                use_vad=args.mic_server_vad if args.replay_source == "mic" else args.speaker_server_vad,
                 vad_threshold=args.vad_threshold,
                 no_speech_thresh=args.whisperlive_no_speech_thresh,
                 local_agreement=args.local_agreement,

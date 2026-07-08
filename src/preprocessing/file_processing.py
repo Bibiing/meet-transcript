@@ -56,9 +56,9 @@ def preprocess_wav_file(
 
     frame = _read_wav_as_frame(input_path, source=source)                   # membaca file WAV menjadi AudioFrame
     processor = preprocessor or AudioPreprocessor(PreprocessConfig())  
-    chunks = processor.preprocess_frames([frame])                           # berisi daftar PreprocessedAudioChunk yang lolos VAD
+    chunks = processor.preprocess_frames([frame])                           # berisi daftar PreprocessedAudioChunk hasil format conversion
 
-    # cek apakah ada chunk yang lolos VAD
+    # cek apakah ada chunk yang cukup panjang untuk diproses
     if not chunks:
         return PreprocessResult(
             source=source,
@@ -66,11 +66,11 @@ def preprocess_wav_file(
             output_path=None,
             chunk_count=0,
             duration_seconds=0.0,
-            warning="no speech chunk passed VAD",
+            warning="no chunk produced by preprocessing",
         )
 
-    output = _write_chunks(output_path, chunks) # menulis chunk yang lolos VAD ke file WAV output
-    duration = sum(chunk.duration_seconds for chunk in chunks) # mencatat durasi total dari semua chunk yang lolos VAD
+    output = _write_chunks(output_path, chunks) # menulis chunk hasil preprocessing ke file WAV output
+    duration = sum(chunk.duration_seconds for chunk in chunks) # mencatat durasi total chunk
 
     return PreprocessResult(
         source=source,
@@ -106,7 +106,7 @@ def _read_wav_as_frame(path: Path, *, source: str) -> AudioFrame:
     )
 
 # menulis daftar PreprocessedAudioChunk ke file WAV output, mengembalikan path file output
-# kenapa di perlukan? karena PreprocessedAudioChunk berisi sampel audio yang sudah lolos VAD, sample rate, dan timestamp, sehingga perlu diubah menjadi AudioFrame agar bisa ditulis ke file WAV
+# kenapa di perlukan? karena PreprocessedAudioChunk berisi sampel audio, sample rate, dan timestamp, sehingga perlu diubah menjadi AudioFrame agar bisa ditulis ke file WAV
 def _write_chunks(path: Path, chunks: list[PreprocessedAudioChunk]) -> Path:
     frames = [
         AudioFrame(

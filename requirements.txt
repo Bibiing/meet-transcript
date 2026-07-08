@@ -7,3 +7,4 @@ numba>=0.62
 websocket-client
 pytest
 pyobjc-framework-ScreenCaptureKit; sys_platform == "darwin"
+PyQt5

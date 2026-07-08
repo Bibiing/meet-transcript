@@ -30,6 +30,7 @@ def replay_wav_to_whisperlive(config: WhisperLiveReplayConfig) -> WhisperLiveRep
         PreprocessConfig(
             chunk_seconds=config.chunk_seconds,
             min_chunk_seconds=config.chunk_seconds,
+            noise_reduction_enabled=False,
         )
     )
     chunks = preprocessor.preprocess_frames([frame])

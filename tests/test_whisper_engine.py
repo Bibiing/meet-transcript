@@ -9,6 +9,7 @@ from src.whisper import (
 )
 from src.whisper.models import TranscriptionResult, TranscriptionSegment
 from src.whisper.models import SendOutcome, WhisperLiveSessionStats
+from src.whisper.session import _connection_config_for_source
 
 
 def test_whisperlive_profile_defaults_match_live_contract() -> None:
@@ -49,6 +50,16 @@ def test_whisperlive_replay_config_defaults_to_mic_source(tmp_path) -> None:
     assert config.source == "mic"
     assert config.chunk_seconds == 0.5
     assert config.audio_format == "int16"
+
+
+def test_connection_config_uses_source_specific_server_vad() -> None:
+    config = WhisperLiveSessionConfig(mic_server_vad=True, speaker_server_vad=False)
+
+    mic_config = _connection_config_for_source(config, "mic")
+    speaker_config = _connection_config_for_source(config, "speaker")
+
+    assert mic_config.profile.use_vad is True
+    assert speaker_config.profile.use_vad is False
 
 
 def test_transcription_result_end_seconds_uses_duration() -> None:

@@ -13,13 +13,12 @@ class PreprocessConfig:
     highpass_order: int = 2                     # order filter untuk high-pass filter
     target_rms_db: float = -20.0                # target RMS level untuk normalisasi audio
     clip_limit: float = 0.95                    # batas clipping untuk normalisasi audio
-    vad_rms_threshold: float = 0.015            # threshold RMS untuk VAD
-    vad_peak_threshold: float = 0.05            # threshold puncak untuk VAD
-    vad_speech_fraction: float = 0.30           # fraksi minimum frame yang harus terdeteksi
-    client_vad_enabled: bool = True             # aktifkan energy VAD lokal
-    min_input_rms_db: float = -42.0             # minimum RMS level untuk input audio agar diterima
     min_chunk_seconds: float = 1.0              # durasi minimum chunk audio agar diterima
     max_normalization_gain_db: float = 24.0     # gain maksimum untuk normalisasi audio
+    noise_reduction_enabled: bool = False       # live noise reduction is optional and non-destructive
+    noise_reduction_strength: float = 0.35      # conservative gain reduction factor for broadband noise
+    client_vad_enabled: bool = True            # legacy compatibility flag; production path keeps VAD on server
+    min_input_rms_db: float | None = None     # optional legacy threshold used only for very quiet/silent chunks
 
 
 # menyimpan chunk audio yang telah diproses beserta metadata diagnostik.

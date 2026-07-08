@@ -8,7 +8,6 @@ import numpy as np
 from scipy import signal
 
 from src.capture.models import AudioFrame
-from src.preprocessing.vad_filter import EnergyVad, VoiceActivityDetector
 
 # yang perlu diketahui:
 # RMS merupakan ukuran energi rata-rata dari sinyal audio. RMS yang lebih tinggi berarti audio lebih keras, sedangkan RMS yang lebih rendah berarti audio lebih lembut.
@@ -21,16 +20,9 @@ class AudioPreprocessor:
     def __init__(
         self,
         config: PreprocessConfig | None = None,
-        *,
-        vad: VoiceActivityDetector | None = None,
     ) -> None:
         self.config = config or PreprocessConfig()
         self._validate_config()
-        self.vad = vad or EnergyVad(
-            rms_threshold=self.config.vad_rms_threshold,
-            peak_threshold=self.config.vad_peak_threshold,
-            speech_fraction=self.config.vad_speech_fraction,
-        )
         self.last_decisions: list[dict[str, Any]] = []
 
     # menggabungkan frame audio
@@ -74,7 +66,7 @@ class AudioPreprocessor:
         source: str,
         start_seconds: float = 0.0,
     ) -> list[PreprocessedAudioChunk]:
-        """Run cast, mono, resample, high-pass, normalization, clip, and VAD."""
+        """Run cast, mono, resample, high-pass, normalization, and clip."""
 
         self.last_decisions = []
         audio = _as_float32_matrix(samples, channels)
@@ -90,8 +82,8 @@ class AudioPreprocessor:
         chunks: list[PreprocessedAudioChunk] = []
         chunk_size = int(round(self.config.chunk_seconds * self.config.target_sample_rate))
         for index, start in enumerate(range(0, filtered.shape[0], chunk_size)):
-            # Setiap chunk dievaluasi sendiri. Chunk pendek, silence, atau RMS
-            # terlalu rendah tidak dikirim agar Whisper tidak halusinasi.
+            # Client hanya melakukan transform format audio. Keputusan
+            # speech/no-speech adalah tanggung jawab server VAD.
             chunk = filtered[start : start + chunk_size]
             if chunk.size == 0:
                 continue
@@ -106,46 +98,44 @@ class AudioPreprocessor:
                     reason="too_short",
                 )
                 continue
-            if self.config.client_vad_enabled and not self.vad.is_speech(chunk, self.config.target_sample_rate):
-                self._record_decision(
-                    source=source,
-                    start_seconds=chunk_start,
-                    duration_seconds=duration_seconds,
-                    passed=False,
-                    reason="vad_silence",
-                    client_vad_enabled=True,
-                    input_rms_db=_rms_db(chunk),
-                )
-                continue
             input_rms_db = _rms_db(chunk)
-            if input_rms_db < self.config.min_input_rms_db:
+            if self._should_drop_legacy_silence(chunk, input_rms_db):
                 self._record_decision(
                     source=source,
                     start_seconds=chunk_start,
                     duration_seconds=duration_seconds,
                     passed=False,
                     reason="below_min_rms",
-                    client_vad_enabled=self.config.client_vad_enabled,
                     input_rms_db=input_rms_db,
+                    noise_reduction_enabled=self.config.noise_reduction_enabled,
+                    client_vad_enabled=self.config.client_vad_enabled,
                 )
                 continue
-
             normalized = _normalize_rms(
                 chunk,
                 target_db=self.config.target_rms_db,
                 max_gain_db=self.config.max_normalization_gain_db,
             )
-            clipped = np.clip(normalized, -self.config.clip_limit, self.config.clip_limit).astype(np.float32)
+            denoised = _apply_noise_reduction(
+                normalized,
+                enabled=self.config.noise_reduction_enabled,
+                strength=self.config.noise_reduction_strength,
+            )
+            clipped = np.clip(denoised, -self.config.clip_limit, self.config.clip_limit).astype(np.float32)
             rms_db = _rms_db(clipped)
+            decision_reason = "accepted"
+            if not self.config.client_vad_enabled:
+                decision_reason = "vad_disabled_accepted"
             self._record_decision(
                 source=source,
                 start_seconds=chunk_start,
                 duration_seconds=duration_seconds,
                 passed=True,
-                reason="accepted" if self.config.client_vad_enabled else "vad_disabled_accepted",
-                client_vad_enabled=self.config.client_vad_enabled,
+                reason=decision_reason,
                 input_rms_db=input_rms_db,
                 output_rms_db=rms_db,
+                noise_reduction_enabled=self.config.noise_reduction_enabled,
+                client_vad_enabled=self.config.client_vad_enabled,
             )
             chunks.append(
                 PreprocessedAudioChunk(
@@ -169,9 +159,10 @@ class AudioPreprocessor:
         duration_seconds: float,
         passed: bool,
         reason: str,
-        client_vad_enabled: bool | None = None,
         input_rms_db: float | None = None,
         output_rms_db: float | None = None,
+        noise_reduction_enabled: bool | None = None,
+        client_vad_enabled: bool | None = None,
     ) -> None:
         decision: dict[str, Any] = {
             "source": source,
@@ -180,13 +171,22 @@ class AudioPreprocessor:
             "passed": passed,
             "reason": reason,
         }
-        if client_vad_enabled is not None:
-            decision["client_vad_enabled"] = client_vad_enabled
         if input_rms_db is not None:
             decision["input_rms_db"] = round(input_rms_db, 2)
         if output_rms_db is not None:
             decision["output_rms_db"] = round(output_rms_db, 2)
+        if noise_reduction_enabled is not None:
+            decision["noise_reduction_enabled"] = noise_reduction_enabled
+        if client_vad_enabled is not None:
+            decision["client_vad_enabled"] = client_vad_enabled
         self.last_decisions.append(decision)
+
+    def _should_drop_legacy_silence(self, chunk: np.ndarray, input_rms_db: float) -> bool:
+        if chunk.size == 0:
+            return True
+        if self.config.min_input_rms_db is None:
+            return bool(np.allclose(chunk, 0.0, atol=1e-8))
+        return input_rms_db < self.config.min_input_rms_db
 
     def _validate_config(self) -> None:
         if self.config.target_sample_rate <= 0:
@@ -256,6 +256,18 @@ def _normalize_rms(samples: np.ndarray, *, target_db: float, max_gain_db: float)
     target = 10 ** (target_db / 20)
     gain = min(target / rms, 10 ** (max_gain_db / 20))
     return (samples * gain).astype(np.float32)
+
+
+def _apply_noise_reduction(samples: np.ndarray, *, enabled: bool, strength: float) -> np.ndarray:
+    if not enabled or samples.size == 0:
+        return samples.astype(np.float32, copy=True)
+    strength = float(np.clip(strength, 0.0, 1.0))
+    if strength <= 0.0:
+        return samples.astype(np.float32, copy=True)
+    noise_floor = np.median(np.abs(samples)) * 0.5
+    adjusted = samples.copy()
+    adjusted[np.abs(adjusted) < noise_floor] *= 1.0 - strength
+    return adjusted.astype(np.float32)
 
 
 def _rms_db(samples: np.ndarray) -> float:

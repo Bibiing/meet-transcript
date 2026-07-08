@@ -49,18 +49,10 @@ class UiOptions:
     chunk_seconds: float = 0.5
     mic_device: int | str | None = None
     speaker_device: int | str | None = None
-    mic_client_vad: bool = True
-    speaker_client_vad: bool = False
-    mic_vad_rms_threshold: float = 0.025
-    mic_vad_peak_threshold: float = 0.08
-    mic_vad_speech_fraction: float = 0.35
-    mic_min_input_rms_db: float = -38.0
+    mic_server_vad: bool = True
+    speaker_server_vad: bool = False
     mic_target_rms_db: float = -20.0
     mic_max_normalization_gain_db: float = 18.0
-    speaker_vad_rms_threshold: float = 0.008
-    speaker_vad_peak_threshold: float = 0.05
-    speaker_vad_speech_fraction: float = 0.20
-    speaker_min_input_rms_db: float = -48.0
     speaker_target_rms_db: float = -23.0
     speaker_max_normalization_gain_db: float = 18.0
     vad_threshold: float = 0.55
@@ -160,28 +152,12 @@ def build_live_command(options: UiOptions) -> list[str]:
         options.language,
         "--live-chunk-seconds",
         _num(options.chunk_seconds),
-        "--mic-client-vad" if options.mic_client_vad else "--no-mic-client-vad",
-        "--speaker-client-vad" if options.speaker_client_vad else "--no-speaker-client-vad",
-        "--mic-vad-rms-threshold",
-        _num(options.mic_vad_rms_threshold),
-        "--mic-vad-peak-threshold",
-        _num(options.mic_vad_peak_threshold),
-        "--mic-vad-speech-fraction",
-        _num(options.mic_vad_speech_fraction),
-        "--mic-min-input-rms-db",
-        _num(options.mic_min_input_rms_db),
+        "--mic-server-vad" if options.mic_server_vad else "--no-mic-server-vad",
+        "--speaker-server-vad" if options.speaker_server_vad else "--no-speaker-server-vad",
         "--mic-target-rms-db",
         _num(options.mic_target_rms_db),
         "--mic-max-normalization-gain-db",
         _num(options.mic_max_normalization_gain_db),
-        "--speaker-vad-rms-threshold",
-        _num(options.speaker_vad_rms_threshold),
-        "--speaker-vad-peak-threshold",
-        _num(options.speaker_vad_peak_threshold),
-        "--speaker-vad-speech-fraction",
-        _num(options.speaker_vad_speech_fraction),
-        "--speaker-min-input-rms-db",
-        _num(options.speaker_min_input_rms_db),
         "--speaker-target-rms-db",
         _num(options.speaker_target_rms_db),
         "--speaker-max-normalization-gain-db",
@@ -534,18 +510,10 @@ def _parse_options(payload: dict[str, Any]) -> UiOptions:
         chunk_seconds=_float(payload.get("chunkSeconds"), 0.5),
         mic_device=_device_value(payload.get("micDevice")),
         speaker_device=_device_value(payload.get("speakerDevice")),
-        mic_client_vad=bool(payload.get("micClientVad", True)),
-        speaker_client_vad=bool(payload.get("speakerClientVad", False)),
-        mic_vad_rms_threshold=_float(payload.get("micVadRmsThreshold"), 0.025),
-        mic_vad_peak_threshold=_float(payload.get("micVadPeakThreshold"), 0.08),
-        mic_vad_speech_fraction=_float(payload.get("micVadSpeechFraction"), 0.35),
-        mic_min_input_rms_db=_float(payload.get("micMinInputRmsDb"), -38.0),
+        mic_server_vad=bool(payload.get("micServerVad", payload.get("micClientVad", True))),
+        speaker_server_vad=bool(payload.get("speakerServerVad", payload.get("speakerClientVad", False))),
         mic_target_rms_db=_float(payload.get("micTargetRmsDb"), -20.0),
         mic_max_normalization_gain_db=_float(payload.get("micMaxNormalizationGainDb"), 18.0),
-        speaker_vad_rms_threshold=_float(payload.get("speakerVadRmsThreshold"), 0.008),
-        speaker_vad_peak_threshold=_float(payload.get("speakerVadPeakThreshold"), 0.05),
-        speaker_vad_speech_fraction=_float(payload.get("speakerVadSpeechFraction"), 0.20),
-        speaker_min_input_rms_db=_float(payload.get("speakerMinInputRmsDb"), -48.0),
         speaker_target_rms_db=_float(payload.get("speakerTargetRmsDb"), -23.0),
         speaker_max_normalization_gain_db=_float(payload.get("speakerMaxNormalizationGainDb"), 18.0),
         vad_threshold=_float(payload.get("vadThreshold"), 0.55),

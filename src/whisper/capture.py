@@ -52,7 +52,6 @@ def _build_capture_streams(
                 block_size=cfg.block_size,
                 queue_size=cfg.queue_size,
                 device=cfg.mic_device,
-                client_vad=cfg.mic_client_vad,
             )
 
             reader_threads.append(_reader("mic", mic_stream, mic_preprocess_config, chunk_queue, stop_event, stats))
@@ -96,7 +95,6 @@ def _build_capture_streams(
                 block_size=cfg.block_size,
                 queue_size=cfg.queue_size,
                 device=cfg.speaker_device,
-                client_vad=cfg.speaker_client_vad,
             )
             reader_threads.append(_reader("speaker", speaker_stream, speaker_preprocess_config, chunk_queue, stop_event, stats))
         except CaptureNotSupportedError as exc:
@@ -117,11 +115,7 @@ def _build_mic_preprocess_config(cfg: WhisperLiveSessionConfig) -> PreprocessCon
         min_chunk_seconds=cfg.chunk_seconds,
         target_rms_db=cfg.mic_target_rms_db,
         max_normalization_gain_db=cfg.mic_max_normalization_gain_db,
-        vad_rms_threshold=cfg.mic_vad_rms_threshold,
-        vad_peak_threshold=cfg.mic_vad_peak_threshold,
-        vad_speech_fraction=cfg.mic_vad_speech_fraction,
-        client_vad_enabled=cfg.mic_client_vad,
-        min_input_rms_db=cfg.mic_min_input_rms_db,
+        noise_reduction_enabled=False,
     )
 
 
@@ -131,11 +125,7 @@ def _build_speaker_preprocess_config(cfg: WhisperLiveSessionConfig) -> Preproces
         min_chunk_seconds=cfg.chunk_seconds,
         target_rms_db=cfg.speaker_target_rms_db,
         max_normalization_gain_db=cfg.speaker_max_normalization_gain_db,
-        vad_rms_threshold=cfg.speaker_vad_rms_threshold,
-        vad_peak_threshold=cfg.speaker_vad_peak_threshold,
-        vad_speech_fraction=cfg.speaker_vad_speech_fraction,
-        client_vad_enabled=cfg.speaker_client_vad,
-        min_input_rms_db=cfg.speaker_min_input_rms_db,
+        noise_reduction_enabled=False,
     )
 
 # membuat thread pembaca stream yang memproses audio dari hardware ke dalam antrian chunk 
@@ -242,8 +232,7 @@ def _reader_thread(
         buffer = [] # mengosongkan buffer setelah frame audio diubah menjadi chunk audio. 
 
         for decision in preprocessor.last_decisions:
-            event = "client.vad_pass" if decision.get("passed") else "client.vad_drop"
-            log_process_event(event, **decision, queue_size=chunk_queue.qsize())
+            log_process_event("client.preprocess_decision", **decision, queue_size=chunk_queue.qsize())
         
         if not chunks:
             dropped_by_preprocess += 1
@@ -327,8 +316,12 @@ def _reader_thread(
             # untuk setiap chunk audio yang dihasilkan dari buffer terakhir
             for chunk in preprocessor.preprocess_frames(buffer):
                 for decision in preprocessor.last_decisions:
-                    event = "client.vad_pass" if decision.get("passed") else "client.vad_drop"
-                    log_process_event(event, final_partial=True, **decision, queue_size=chunk_queue.qsize())
+                    log_process_event(
+                        "client.preprocess_decision",
+                        final_partial=True,
+                        **decision,
+                        queue_size=chunk_queue.qsize(),
+                    )
                 try:
                     chunk_queue.put_nowait(chunk) # menambahkan chunk audio terakhir ke antrian.
                     chunks_enqueued += 1 # increment jumlah chunk yang telah dimasukkan ke chunk_queue
