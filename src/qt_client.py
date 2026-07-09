@@ -3,10 +3,11 @@ from __future__ import annotations
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import Optional
 import json
 
-from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt6 import QtCore, QtGui, QtWidgets
 
 from src.ui.server import (
     audio_devices_payload,
@@ -28,6 +29,24 @@ TEXT = "#112629"
 TEXT_MUTED = "#C0D6D8"
 BORDER = "#B6CFD3"
 
+# Direktori root aplikasi, dihitung dari lokasi file ini (bukan cwd saat dijalankan).
+# Memastikan ikon tetap ditemukan meskipun aplikasi dijalankan dari folder lain (mis. via
+# `python -m src.qt_client` dari root project vs dijalankan langsung dari folder src).
+APP_ROOT = Path(__file__).resolve().parent
+ICON_DIR = APP_ROOT / "icon"
+
+
+def load_icon(filename: str) -> QtGui.QIcon:
+    """Muat ikon secara aman berdasarkan path absolut.
+
+    Mengembalikan QIcon kosong (bukan crash) jika file tidak ditemukan,
+    sehingga tombol tetap berfungsi dengan label teks meski ikon hilang.
+    """
+    path = ICON_DIR / filename
+    if not path.exists():
+        return QtGui.QIcon()
+    return QtGui.QIcon(str(path))
+
 
 
 class SettingsDialog(QtWidgets.QDialog):
@@ -36,6 +55,7 @@ class SettingsDialog(QtWidgets.QDialog):
         self.setWindowTitle("Settings")
         self.setModal(True)
         self.resize(520, 320)
+        self.setSizeGripEnabled(True)  # Memudahkan pengguna memperbesar dialog bila daftar Advanced panjang
 
         self.tabs = QtWidgets.QTabWidget()
         self.general = QtWidgets.QWidget()
@@ -58,8 +78,17 @@ class SettingsDialog(QtWidgets.QDialog):
         self.lang_select.addItems(["id", "en"])
         # LLM API key for resume/summary feature (stored in memory only)
         self.llm_api_key = QtWidgets.QLineEdit()
-        self.llm_api_key.setEchoMode(QtWidgets.QLineEdit.Password)
+        self.llm_api_key.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
         self.llm_api_key.setPlaceholderText("OpenAI / LLM API key")
+
+        # Tooltip singkat agar pengguna paham fungsi tiap field tanpa dokumentasi terpisah
+        self.host_input.setToolTip("Alamat server transcription (default: localhost)")
+        self.port_input.setToolTip("Port server transcription (1-65535)")
+        self.mic_select.setToolTip("Pilih perangkat mikrofon input")
+        self.spk_select.setToolTip("Pilih perangkat output/speaker yang direkam")
+        self.lang_select.setToolTip("Bahasa transkripsi")
+        self.model_select.setToolTip("Model Whisper: makin besar makin akurat namun makin berat")
+        self.llm_api_key.setToolTip("API key untuk fitur ringkasan (Summarize). Disimpan hanya di memori, tidak ditulis ke disk")
 
         g_layout.addRow("Server host:", self.host_input)
         g_layout.addRow("Server port:", self.port_input)
@@ -138,6 +167,22 @@ class SettingsDialog(QtWidgets.QDialog):
         self.log_level = QtWidgets.QComboBox()
         self.log_level.addItems(["DEBUG", "INFO", "WARNING", "ERROR"])
 
+        # Tooltip untuk parameter teknis agar pengguna non-teknis tetap paham fungsinya
+        self.mic_server_vad_cb.setToolTip("Aktifkan Voice Activity Detection di server untuk audio mikrofon")
+        self.speaker_server_vad_cb.setToolTip("Aktifkan Voice Activity Detection di server untuk audio speaker")
+        self.mic_target_rms.setToolTip("Target volume (RMS) mikrofon setelah normalisasi, dalam dB")
+        self.mic_max_gain.setToolTip("Batas maksimal penguatan (gain) yang diterapkan pada mikrofon")
+        self.spk_target_rms.setToolTip("Target volume (RMS) speaker setelah normalisasi, dalam dB")
+        self.spk_max_gain.setToolTip("Batas maksimal penguatan (gain) yang diterapkan pada speaker")
+        self.vad_threshold.setToolTip("Ambang sensitivitas deteksi suara (0-1). Semakin tinggi, semakin ketat")
+        self.no_speech_thresh.setToolTip("Ambang probabilitas untuk menganggap segmen sebagai 'tidak ada suara'")
+        self.speech_boundary_silence.setToolTip("Durasi hening (detik) sebelum segmen ucapan dianggap selesai")
+        self.speech_boundary_max_wait.setToolTip("Waktu tunggu maksimum (detik) sebelum segmen dipotong paksa")
+        self.debug_chunk_archive_cb.setToolTip("Simpan potongan audio mentah untuk keperluan debugging")
+        self.rolling_audio_archive_cb.setToolTip("Simpan rekaman audio berkelanjutan ke disk")
+        self.rolling_audio_segment.setToolTip("Panjang tiap segmen arsip audio berkelanjutan, dalam detik")
+        self.log_level.setToolTip("Tingkat detail log aplikasi")
+
         a_layout.addRow("Mic server VAD:", self.mic_server_vad_cb)
         a_layout.addRow("Speaker server VAD:", self.speaker_server_vad_cb)
         a_layout.addRow("Mic target RMS (dB):", self.mic_target_rms)
@@ -159,23 +204,22 @@ class SettingsDialog(QtWidgets.QDialog):
 
         self.advanced.setLayout(a_layout)
 
-        btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
-        btns.accepted.connect(self.accept)
-        btns.rejected.connect(self.reject)
-
-        btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
 
         # Beri label dan ID khusus untuk di-styling nanti
-        ok_btn = btns.button(QtWidgets.QDialogButtonBox.Ok)
+        ok_btn = btns.button(QtWidgets.QDialogButtonBox.StandardButton.Ok)
         ok_btn.setText("Save Settings")
         ok_btn.setObjectName("SaveBtn")
-        ok_btn.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+        ok_btn.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
+        ok_btn.setToolTip("Simpan pengaturan dan tutup dialog")
+        ok_btn.setDefault(True)  # Enter langsung menyimpan, sesuai konvensi dialog standar
 
-        cancel_btn = btns.button(QtWidgets.QDialogButtonBox.Cancel)
+        cancel_btn = btns.button(QtWidgets.QDialogButtonBox.StandardButton.Cancel)
         cancel_btn.setObjectName("CancelBtn")
-        cancel_btn.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+        cancel_btn.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
+        cancel_btn.setToolTip("Batalkan perubahan (Esc)")
 
         main = QtWidgets.QVBoxLayout()
         main.addWidget(self.tabs)
@@ -243,7 +287,7 @@ class CompactWidget(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("PLN Meeting Transcriber")
-        self.setWindowFlags(QtCore.Qt.WindowStaysOnTopHint)
+        self.setWindowFlags(QtCore.Qt.WindowType.WindowStaysOnTopHint)
         self.setMinimumSize(600, 300) # Tinggi ditambah sedikit untuk menampung bottom bar
         self.recording = False
         self.current_options: Optional[UiOptions] = None
@@ -275,13 +319,18 @@ class CompactWidget(QtWidgets.QWidget):
         self.record_btn = QtWidgets.QPushButton(" Start Recording")
         self.record_btn.setObjectName("RecordBtn")
 
-        self.record_btn.setIcon(QtGui.QIcon("src/icon/play.svg")) # Ikon awal (belum merekam)
+        self.record_btn.setIcon(load_icon("play.svg")) # Ikon awal (belum merekam)
         self.record_btn.setIconSize(QtCore.QSize(18, 18))
 
         self.record_btn.setCheckable(True)
-        self.record_btn.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+        self.record_btn.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
         self.record_btn.setMinimumSize(150, 42)
+        self.record_btn.setSizePolicy(QtWidgets.QSizePolicy.Policy.Preferred, QtWidgets.QSizePolicy.Policy.Fixed)
         self.record_btn.clicked.connect(self.toggle_record)
+        # Aksesibilitas & UX: tooltip, shortcut keyboard, dan nama untuk screen reader
+        self.record_btn.setToolTip("Mulai / hentikan perekaman (Ctrl+R)")
+        self.record_btn.setShortcut(QtGui.QKeySequence("Ctrl+R"))
+        self.record_btn.setAccessibleName("Tombol Mulai/Hentikan Rekaman")
 
         # Container untuk VU Meter (Ubah menjadi Horizontal Layout)
         vu_layout = QtWidgets.QHBoxLayout()
@@ -290,37 +339,47 @@ class CompactWidget(QtWidgets.QWidget):
 
         # Indikator Mic
         self.mic_label = QtWidgets.QLabel("🎤 Mic")
+        self.mic_label.setToolTip("Level input mikrofon")
         self.mic_vu = QtWidgets.QProgressBar()
         self.mic_vu.setRange(0, 100)
         self.mic_vu.setFixedHeight(12)
         self.mic_vu.setFixedWidth(60) # Gunakan FixedWidth agar ukurannya konsisten dan tidak terlalu panjang
+        self.mic_vu.setToolTip("Level input mikrofon")
+        self.mic_vu.setAccessibleName("Level mikrofon")
 
         # Indikator Speaker
         self.spk_label = QtWidgets.QLabel("🔊 Spk")
+        self.spk_label.setToolTip("Level audio meeting/speaker")
         self.spk_vu = QtWidgets.QProgressBar()
         self.spk_vu.setRange(0, 100)
         self.spk_vu.setFixedHeight(12)
         self.spk_vu.setFixedWidth(60)
+        self.spk_vu.setToolTip("Level audio meeting/speaker")
+        self.spk_vu.setAccessibleName("Level speaker")
 
         # Susun menyamping (kiri ke kanan)
-        vu_layout.addWidget(self.mic_label, alignment=QtCore.Qt.AlignVCenter)
-        vu_layout.addWidget(self.mic_vu, alignment=QtCore.Qt.AlignVCenter)
+        vu_layout.addWidget(self.mic_label, alignment=QtCore.Qt.AlignmentFlag.AlignVCenter)
+        vu_layout.addWidget(self.mic_vu, alignment=QtCore.Qt.AlignmentFlag.AlignVCenter)
         
         vu_layout.addSpacing(16) # Memberikan jarak ekstra pemisah antara grup Mic dan grup Spk
         
-        vu_layout.addWidget(self.spk_label, alignment=QtCore.Qt.AlignVCenter)
-        vu_layout.addWidget(self.spk_vu, alignment=QtCore.Qt.AlignVCenter)
+        vu_layout.addWidget(self.spk_label, alignment=QtCore.Qt.AlignmentFlag.AlignVCenter)
+        vu_layout.addWidget(self.spk_vu, alignment=QtCore.Qt.AlignmentFlag.AlignVCenter)
 
         self.mute_btn = QtWidgets.QPushButton(" Mute Mic")
         self.mute_btn.setObjectName("MuteBtn")
 
-        self.mute_btn.setIcon(QtGui.QIcon("src/icon/mic.svg"))
+        self.mute_btn.setIcon(load_icon("mic.svg"))
         self.mute_btn.setIconSize(QtCore.QSize(18, 18))
 
         self.mute_btn.setCheckable(True)
-        self.mute_btn.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+        self.mute_btn.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
         self.mute_btn.setMinimumSize(110, 42)
+        self.mute_btn.setSizePolicy(QtWidgets.QSizePolicy.Policy.Preferred, QtWidgets.QSizePolicy.Policy.Fixed)
         self.mute_btn.clicked.connect(self.toggle_mute)
+        self.mute_btn.setToolTip("Bisukan / aktifkan mikrofon (Ctrl+M)")
+        self.mute_btn.setShortcut(QtGui.QKeySequence("Ctrl+M"))
+        self.mute_btn.setAccessibleName("Tombol Bisukan Mikrofon")
         self.muted = False
         
         # shadow untuk tombol record dan mute
@@ -344,6 +403,8 @@ class CompactWidget(QtWidgets.QWidget):
         self.preview = QtWidgets.QTextEdit()
         self.preview.setReadOnly(True)
         self.preview.setPlaceholderText("Live transcript will appear here...")
+        self.preview.setAccessibleName("Area transkrip langsung")
+        self.preview.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Expanding)
         center_layout.addWidget(self.preview)
 
         # ==========================================
@@ -357,36 +418,47 @@ class CompactWidget(QtWidgets.QWidget):
 
         self.history_btn = QtWidgets.QPushButton(" History")
         self.history_btn.setObjectName("SecondaryBtn")
-        self.history_btn.setIcon(QtGui.QIcon("src/icon/history.svg")) # Ikon SVG
+        self.history_btn.setIcon(load_icon("history.svg")) # Ikon SVG
         self.history_btn.setIconSize(QtCore.QSize(18, 18))
-        self.history_btn.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+        self.history_btn.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
         self.history_btn.setMinimumSize(90, 36)
         self.history_btn.clicked.connect(self.open_history)
+        self.history_btn.setToolTip("Buka riwayat transkrip dari file JSON (Ctrl+H)")
+        self.history_btn.setShortcut(QtGui.QKeySequence("Ctrl+H"))
+        self.history_btn.setAccessibleName("Tombol Buka Riwayat")
 
         self.resume_btn = QtWidgets.QPushButton(" Summarize")
         self.resume_btn.setObjectName("ActionBtn")
-        self.resume_btn.setIcon(QtGui.QIcon("src/icon/star.svg")) # Ikon SVG
+        self.resume_btn.setIcon(load_icon("star.svg")) # Ikon SVG
         self.resume_btn.setIconSize(QtCore.QSize(18, 18))
-        self.resume_btn.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+        self.resume_btn.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
         self.resume_btn.setMinimumSize(110, 36)
         self.resume_btn.clicked.connect(self.resume_summary)
         self.resume_btn.setEnabled(False)
+        self.resume_btn.setToolTip("Ringkas transkrip (memerlukan LLM API key di Settings)")
+        self.resume_btn.setAccessibleName("Tombol Ringkas Transkrip")
 
         self.export_btn = QtWidgets.QPushButton(" Export")
         self.export_btn.setObjectName("SecondaryBtn")
-        self.export_btn.setIcon(QtGui.QIcon("src/icon/download.svg")) # Ikon SVG
+        self.export_btn.setIcon(load_icon("download.svg")) # Ikon SVG
         self.export_btn.setIconSize(QtCore.QSize(18, 18))
-        self.export_btn.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+        self.export_btn.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
         self.export_btn.setMinimumSize(90, 36)
         self.export_btn.clicked.connect(self.export_transcript)
+        self.export_btn.setToolTip("Ekspor transkrip ke file .txt atau .md (Ctrl+E)")
+        self.export_btn.setShortcut(QtGui.QKeySequence("Ctrl+E"))
+        self.export_btn.setAccessibleName("Tombol Ekspor Transkrip")
 
         self.settings_btn = QtWidgets.QPushButton(" Settings")
         self.settings_btn.setObjectName("SecondaryBtn")
-        self.settings_btn.setIcon(QtGui.QIcon("src/icon/settings.svg")) # Ikon SVG
+        self.settings_btn.setIcon(load_icon("settings.svg")) # Ikon SVG
         self.settings_btn.setIconSize(QtCore.QSize(18, 18))
-        self.settings_btn.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+        self.settings_btn.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
         self.settings_btn.setMinimumSize(110, 36)
         self.settings_btn.clicked.connect(self.open_settings)
+        self.settings_btn.setToolTip("Buka pengaturan aplikasi (Ctrl+,)")
+        self.settings_btn.setShortcut(QtGui.QKeySequence("Ctrl+,"))
+        self.settings_btn.setAccessibleName("Tombol Buka Pengaturan")
 
         # SHADOW
         self._apply_shadow(self.history_btn)
@@ -426,6 +498,64 @@ class CompactWidget(QtWidgets.QWidget):
                 border-top: 1px solid {BORDER};
             }}
 
+            /* Dialog Settings & Summary - pastikan tetap tema terang, tidak ikut dark mode OS */
+            QDialog {{
+                background-color: {BG};
+                color: {TEXT};
+            }}
+
+            QTabWidget::pane {{
+                background-color: white;
+                border: 1px solid {BORDER};
+                border-radius: 6px;
+                top: -1px;
+            }}
+            QTabBar::tab {{
+                background-color: {SECONDARY};
+                color: {TEXT};
+                padding: 6px 14px;
+                border: 1px solid {BORDER};
+                border-bottom: none;
+                border-top-left-radius: 6px;
+                border-top-right-radius: 6px;
+            }}
+            QTabBar::tab:selected {{
+                background-color: white;
+                font-weight: 600;
+            }}
+            QTabBar::tab:hover {{
+                background-color: {SECONDARY_HOVER};
+            }}
+
+            /* Field input pada form Settings (sebelumnya tidak di-style -> ikut palet gelap OS) */
+            QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {{
+                background-color: white;
+                color: {TEXT};
+                border: 1px solid {BORDER};
+                border-radius: 4px;
+                padding: 4px 6px;
+                selection-background-color: {PRIMARY};
+            }}
+            QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus {{
+                border: 1px solid {PRIMARY};
+            }}
+            QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled {{
+                background-color: #E2E8F0;
+                color: #94A3B8;
+            }}
+            QComboBox QAbstractItemView {{
+                background-color: white;
+                color: {TEXT};
+                border: 1px solid {BORDER};
+                selection-background-color: {PRIMARY};
+                selection-color: {TEXT};
+            }}
+            QCheckBox {{
+                color: {TEXT};
+                font-weight: 500;
+                spacing: 6px;
+            }}
+
             QLabel {{
                 color: {TEXT};
                 font-weight: 600;
@@ -436,7 +566,7 @@ class CompactWidget(QtWidgets.QWidget):
             QPushButton {{
                 border-radius: 6px;
                 font-weight: bold;
-                font-size: 13px;
+                font-size: 12px;
                 border: 1px solid {BORDER};
             }}
             
@@ -537,7 +667,7 @@ class CompactWidget(QtWidgets.QWidget):
                 border: none;
                 border-radius: 6px;
                 font-weight: bold;
-                font-size: 13px;
+                font-size: 12px;
                 min-width: 110px;
                 min-height: 36px;
             }}
@@ -552,7 +682,7 @@ class CompactWidget(QtWidgets.QWidget):
                 border: 1px solid {BORDER};
                 border-radius: 6px;
                 font-weight: bold;
-                font-size: 13px;
+                font-size: 12px;
                 min-width: 90px;
                 min-height: 36px;
             }}
@@ -565,7 +695,7 @@ class CompactWidget(QtWidgets.QWidget):
 
     def open_settings(self):
         dlg = SettingsDialog(self)
-        if dlg.exec_() == QtWidgets.QDialog.Accepted:
+        if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
             self.current_options = dlg.to_options()
             try:
                 self._preferred_source = getattr(self.current_options, "source", "both") or "both"
@@ -584,12 +714,14 @@ class CompactWidget(QtWidgets.QWidget):
         if checked:
             # Saat sedang merekam (Tombol aktif)
             self.record_btn.setText(" Stop Recording") # Hapus emoji ⏹
-            self.record_btn.setIcon(QtGui.QIcon("src/icon/stop.svg")) # Ganti ke ikon stop
+            self.record_btn.setIcon(load_icon("stop.svg")) # Ganti ke ikon stop
+            self.record_btn.setToolTip("Hentikan perekaman (Ctrl+R)")
             self._start_live()
         else:
             # Saat berhenti merekam (Tombol kembali normal)
             self.record_btn.setText(" Start Recording") # Hapus emoji ⏺
-            self.record_btn.setIcon(QtGui.QIcon("src/icon/play.svg")) # Ganti ke ikon record
+            self.record_btn.setIcon(load_icon("play.svg")) # Ganti ke ikon record
+            self.record_btn.setToolTip("Mulai perekaman (Ctrl+R)")
             self._stop_live()
 
     def toggle_mute(self, checked: bool):
@@ -597,10 +729,12 @@ class CompactWidget(QtWidgets.QWidget):
         
         if self.muted:
             self.mute_btn.setText(" Muted")
-            self.mute_btn.setIcon(QtGui.QIcon("src/icon/micoff.svg")) 
+            self.mute_btn.setIcon(load_icon("micoff.svg")) 
+            self.mute_btn.setToolTip("Aktifkan kembali mikrofon (Ctrl+M)")
         else:
             self.mute_btn.setText(" Mute Mic")
-            self.mute_btn.setIcon(QtGui.QIcon("src/icon/mic.svg"))  
+            self.mute_btn.setIcon(load_icon("mic.svg"))  
+            self.mute_btn.setToolTip("Bisukan mikrofon (Ctrl+M)")
             
         # Restart stream jika sedang merekam
         if self.record_btn.isChecked():
@@ -673,7 +807,7 @@ class CompactWidget(QtWidgets.QWidget):
                 entries = data
             else:
                 entries = []
-            SummaryWindow({"entries": entries}, parent=self).exec_()
+            SummaryWindow({"entries": entries}, parent=self).exec()
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Error", f"Failed to open transcript: {exc}")
 
@@ -691,7 +825,7 @@ class CompactWidget(QtWidgets.QWidget):
                 return
             summary_text = "\n".join(sample)
             summary_note = "(Local heuristic summary — LLM backend integration not implemented)\n\n"
-            SummaryWindow({"entries": [{"text": summary_note + summary_text}]}, parent=self).exec_()
+            SummaryWindow({"entries": [{"text": summary_note + summary_text}]}, parent=self).exec()
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Error", f"Failed to produce summary: {exc}")
 
@@ -762,14 +896,65 @@ class CompactWidget(QtWidgets.QWidget):
             level = min(100, int(candidate / total * 100) + (5 if entries else 0))
             self.mic_vu.setValue(level)
             self.spk_vu.setValue(min(100, 100 - level))
+            # Tooltip dinamis agar pengguna bisa melihat angka persis, tidak hanya bar visual
+            self.mic_vu.setToolTip(f"Level mikrofon: {level}%")
+            self.spk_vu.setToolTip(f"Level speaker: {min(100, 100 - level)}%")
         except Exception:
             pass
-        
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # Menghitung ukuran font responsif berdasarkan lebar jendela, agar teks
+        # transkrip tetap nyaman dibaca baik di jendela sempit maupun lebar.
+        base_width = 600
+        base_font = 12
+        extra_width = max(0, self.width() - base_width)
+        new_size = base_font + int(extra_width / 50)
+        new_size = min(new_size, 21)  # Batasi ukuran maksimal font agar tidak terlalu raksasa
+
+        # Hindari pemanggilan setStyleSheet berulang saat ukurannya tidak berubah
+        # (setStyleSheet relatif berat & bisa memicu flicker saat resize di-drag terus-menerus).
+        if getattr(self, "_last_preview_font_size", None) == new_size:
+            return
+        self._last_preview_font_size = new_size
+        self.preview.setStyleSheet(f"font-size: {new_size}px;")
+
+
 def main():
+    # --- Dukungan High-DPI ---
+    # Di Qt6, High-DPI scaling sudah AKTIF SECARA OTOMATIS (berbeda dari Qt5 yang
+    # memerlukan AA_EnableHighDpiScaling/AA_UseHighDpiPixmaps secara eksplisit -
+    # atribut tersebut sudah dihapus di PyQt6 dan akan error bila dipanggil).
+    # Yang masih relevan diatur adalah kebijakan pembulatan faktor skala, agar UI
+    # tetap tajam & proporsional di layar dengan scaling non-integer (mis. 125%, 150%).
+    if hasattr(QtCore.Qt, "HighDpiScaleFactorRoundingPolicy"):
+        QtWidgets.QApplication.setHighDpiScaleFactorRoundingPolicy(
+            QtCore.Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+        )
+
     app = QtWidgets.QApplication(sys.argv)
+
+    # Paksa skema warna TERANG secara eksplisit. Sejak Qt 6.5, Qt secara otomatis
+    # mengikuti tema gelap/terang sistem operasi (mis. dark mode Windows) untuk
+    # palet default widget yang belum di-style secara eksplisit (QLineEdit, QComboBox,
+    # QSpinBox, dsb di dialog Settings). Tanpa baris ini, aplikasi bisa tiba-tiba
+    # terlihat gelap di komputer yang OS-nya diset dark mode, padahal palet warna
+    # aplikasi ini memang dirancang untuk tema terang.
+    if hasattr(app, "styleHints") and hasattr(QtCore.Qt, "ColorScheme"):
+        try:
+            app.styleHints().setColorScheme(QtCore.Qt.ColorScheme.Light)
+        except Exception:
+            pass
+
+    # Style dasar "Fusion" dipilih karena konsisten lintas platform (Windows/macOS/Linux)
+    # dan merender QSS custom (warna, border-radius, dsb.) jauh lebih akurat
+    # dibanding style native masing-masing OS. Warna & layout aplikasi tidak berubah,
+    # ini hanya mempengaruhi rendering dasar widget yang belum di-style eksplisit.
+    app.setStyle("Fusion")
+
     w = CompactWidget()
     w.show()
-    sys.exit(app.exec_())
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":
