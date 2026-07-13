@@ -507,8 +507,20 @@
       <label class="check-row"><input id="debugChunkArchive" type="checkbox" /> Debug chunk archive</label>
       <label class="check-row"><input id="resetTranscript" type="checkbox" checked /> Archive old transcript on
         start</label>
+
+      <!-- Connection Status Indicator -->
+      <div class="field" style="margin-top: 16px;">
+        <label>Connection Status</label>
+        <div
+          style="display: flex; align-items: center; gap: 8px; padding: 10px 9px; border: 1px solid var(--line); border-radius: 6px; background: #ffffff; min-height: 36px;">
+          <span id="connectionDot"
+            style="width: 10px; height: 10px; border-radius: 50%; background: #999; display: inline-block;"></span>
+          <span id="connectionText" style="font-size: 13px; color: var(--muted); flex: 1;">Initializing...</span>
+        </div>
+      </div>
+
       <div class="buttons">
-        <button id="startBtn" class="primary">Start</button>
+        <button id="startBtn" class="primary" disabled>Start</button>
         <button id="stopBtn" class="danger" disabled>Stop</button>
       </div>
       <div class="buttons">
@@ -645,7 +657,33 @@
       $("elapsed").textContent = session.elapsed_seconds ? `${Math.round(session.elapsed_seconds)}s` : "0s";
       $("updatedAt").textContent = transcript.updated_at ? `Updated ${new Date(transcript.updated_at).toLocaleTimeString()}` : "Not saved yet";
       $("commandText").textContent = session.command?.length ? session.command.join(" ") : "";
-      $("startBtn").disabled = !!session.running;
+      
+      // Update connection status indicator
+      const connectionStatus = session.connection_status || "DISCONNECTED";
+      const dot = $("connectionDot");
+      const text = $("connectionText");
+      
+      if (connectionStatus === "CONNECTED") {
+        dot.style.background = "#22c55e";
+        text.textContent = "Connected ✓";
+        text.style.color = "#16a34a";
+      } else if (connectionStatus === "CONNECTING") {
+        dot.style.background = "#f59e0b";
+        text.textContent = "Connecting...";
+        text.style.color = "#b45309";
+      } else if (connectionStatus === "ERROR") {
+        dot.style.background = "#ef4444";
+        text.textContent = "Connection Error";
+        text.style.color = "#b42318";
+      } else {
+        dot.style.background = "#999";
+        text.textContent = "Disconnected";
+        text.style.color = "#666";
+      }
+      
+      // Enable Start button hanya jika not running AND server healthy AND connected
+      const canStart = !session.running && server.healthy && connectionStatus === "CONNECTED";
+      $("startBtn").disabled = !canStart;
       $("stopBtn").disabled = !session.running;
     }
 

@@ -93,11 +93,24 @@ class LiveProcessState:
     exit_code: int | None = None
     stop_requested: bool = False
     last_error: str | None = None
+    connection_status: str = "DISCONNECTED"  # DISCONNECTED, CONNECTING, CONNECTED, ERROR
     lock: threading.RLock = field(default_factory=threading.RLock)
 
     def running(self) -> bool:
         with self.lock:
             return self.process is not None and self.process.poll() is None
+    
+    def get_connection_status(self) -> str:
+        """Get current connection status."""
+        with self.lock:
+            return self.connection_status
+    
+    def set_connection_status(self, status: str) -> None:
+        """Set connection status (CONNECTING, CONNECTED, ERROR, DISCONNECTED)."""
+        if status not in ("CONNECTING", "CONNECTED", "ERROR", "DISCONNECTED"):
+            raise ValueError(f"Invalid status: {status}")
+        with self.lock:
+            self.connection_status = status
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
@@ -105,6 +118,7 @@ class LiveProcessState:
             elapsed = None if self.started_at is None else round(time.time() - self.started_at, 1)
             return {
                 "running": running,
+                "connection_status": self.connection_status,
                 "pid": None if self.process is None else self.process.pid,
                 "elapsed_seconds": elapsed,
                 "command": self.command,
@@ -250,6 +264,7 @@ def start_live(options: UiOptions) -> dict[str, Any]:
         STATE.exit_code = None
         STATE.stop_requested = False
         STATE.last_error = None
+        STATE.connection_status = "CONNECTING"  # Set status ke CONNECTING saat proses dimulai
         STATE.log_lines.clear()
         STATE.append_log("UI started live client")
 
@@ -258,13 +273,23 @@ def start_live(options: UiOptions) -> dict[str, Any]:
     return STATE.snapshot()
 
 
-def stop_live(*, force: bool = False) -> dict[str, Any]:
-    """Stop client live secara graceful, atau terminate jika force=True."""
+def stop_live(*, force: bool = False, wait_timeout_seconds: float = 3.0) -> dict[str, Any]:
+    """Stop client live secara graceful, atau terminate jika force=True.
+    
+    Args:
+        force: Jika True, langsung terminate tanpa graceful shutdown
+        wait_timeout_seconds: Waktu maksimal menunggu proses bersih sebelum kelanjutan
+    
+    Returns:
+        Snapshot state proses saat ini
+    """
     with STATE.lock:
         process = STATE.process
         if process is None or process.poll() is not None:
+            STATE.connection_status = "DISCONNECTED"
             return STATE.snapshot()
         STATE.stop_requested = True
+        STATE.connection_status = "DISCONNECTED"
         STATE.append_log("UI stop requested")
 
     if force:
@@ -279,6 +304,21 @@ def stop_live(*, force: bool = False) -> dict[str, Any]:
     except Exception as exc:
         STATE.append_log(f"graceful stop failed, terminating process: {exc}")
         process.terminate()
+    
+    # Tunggu proses benar-benar selesai (maksimal wait_timeout_seconds detik)
+    # ini menghindari race condition ketika start_live dipanggil sebelum proses lama bersih
+    try:
+        process.wait(timeout=wait_timeout_seconds)
+        STATE.append_log(f"Process stopped gracefully (waited {wait_timeout_seconds}s)")
+    except subprocess.TimeoutExpired:
+        STATE.append_log(f"Process cleanup timeout after {wait_timeout_seconds}s, terminating forcefully")
+        process.terminate()
+        try:
+            process.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            STATE.append_log("Force terminate timed out, killing process")
+            process.kill()
+    
     return STATE.snapshot()
 
 
@@ -548,11 +588,29 @@ def _monitor_process(process: subprocess.Popen[str]) -> None:
     try:
         for line in process.stdout:
             STATE.append_log(line)
+            
+            # Deteksi pesan-pesan penting untuk update connection status
+            line_lower = line.lower()
+            
+            # Check untuk pesan server ready / connection established
+            if "server_ready" in line_lower or "connected" in line_lower or "websocket" in line_lower and "established" in line_lower:
+                STATE.set_connection_status("CONNECTED")
+                STATE.append_log("Connection status: CONNECTED")
+            
+            # Check untuk pesan error / connection failed
+            elif ("connection" in line_lower and "failed" in line_lower) or \
+                 ("error" in line_lower and ("connection" in line_lower or "websocket" in line_lower)) or \
+                 ("websocket" in line_lower and "error" in line_lower):
+                STATE.set_connection_status("ERROR")
+                STATE.append_log("Connection status: ERROR")
+                
     finally:
         exit_code = process.wait()
         with STATE.lock:
             STATE.exit_code = exit_code
+            STATE.connection_status = "DISCONNECTED"
             STATE.append_log(f"live client exited with code {exit_code}")
+
 
 
 def _safe_path(value: str) -> Path:

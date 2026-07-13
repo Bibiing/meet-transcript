@@ -25,17 +25,17 @@ jobs:
             artifact_name: MultiTranscriber-Mac
 
     steps:
-    # ── 1. Checkout ──────────────────────────────────────────────
+    # 1. Checkout 
     - name: Checkout Code
       uses: actions/checkout@v4
 
-    # ── 2. Python ────────────────────────────────────────────────
+    # 2. Python
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
         python-version: '3.11'
 
-    # ── 3. Sistem Audio (PortAudio) ──────────────────────────────
+    # 3. Sistem Audio (PortAudio)
     # sounddevice membutuhkan library PortAudio di level OS.
     # Di Windows, wheel sounddevice sudah membundel PortAudio DLL.
     # Di macOS, perlu install via Homebrew.
@@ -43,7 +43,7 @@ jobs:
       if: runner.os == 'macOS'
       run: brew install portaudio
 
-    # ── 4. Install UV ────────────────────────────────────────────
+    # 4. Install UV
     - name: Install UV (Unix)
       if: runner.os != 'Windows'
       run: |
@@ -57,7 +57,7 @@ jobs:
         irm https://astral.sh/uv/install.ps1 | iex
         Add-Content $env:GITHUB_PATH "$env:USERPROFILE\.local\bin"
 
-    # ── 5. Install Dependensi ────────────────────────────────────
+    # 5. Install Dependensi
     # Install secara selektif TANPA openai-whisper dan numba.
     # openai-whisper menarik PyTorch (~1.5GB) yang TIDAK dibutuhkan oleh
     # qt_client — client hanya mengirim audio via WebSocket ke server.
@@ -68,7 +68,7 @@ jobs:
         pip install PySide6 numpy sounddevice soundcard scipy websocket-client
         pip install nuitka ordered-set
 
-    # ── 6. Build dengan Nuitka ───────────────────────────────────
+    # 6. Build dengan Nuitka
     # --assume-yes-for-downloads: Otomatis download MinGW C compiler jika belum ada
     # --include-package=src: Pastikan semua modul src.* masuk ke bundle
     # --nofollow-import-to: Exclude package berat yang tidak dibutuhkan runtime client
@@ -120,7 +120,7 @@ jobs:
           src/qt_client.py
         mv qt_client.bin MultiTranscriber-Mac 2>/dev/null || mv qt_client MultiTranscriber-Mac
 
-    # ── 7. Upload Artifacts ──────────────────────────────────────
+    # 7. Upload Artifacts
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
@@ -128,7 +128,7 @@ jobs:
         path: ${{ matrix.artifact_name }}
         if-no-files-found: error
 
-  # ── 8. Release (hanya saat push tag v*) ────────────────────────
+  # 8. Release (hanya saat push tag v*)
   release:
     name: Create GitHub Release
     needs: build

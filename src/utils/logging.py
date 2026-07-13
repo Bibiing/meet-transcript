@@ -17,6 +17,7 @@ from typing import Any, TYPE_CHECKING
 if TYPE_CHECKING:
     from src.whisper.models import TranscriptionResult
 from src.utils.formatter import format_transcript_line, result_to_line
+from src.utils.mode_detector import is_production_build
 
 __all__ = [
     "configure_logging",
@@ -44,6 +45,10 @@ def configure_logging(
     level: str = "INFO",
     log_file: Path = Path("logs") / "transcriber.log",
 ) -> logging.Logger:
+    # Production mode: paksa log level ke WARNING untuk menghemat resources
+    if is_production_build():
+        level = "WARNING"
+    
     log_file.parent.mkdir(parents=True, exist_ok=True)
 
     root = logging.getLogger()              # mengambil logger root

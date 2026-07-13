@@ -16,6 +16,7 @@ from src.ui.server import (
     transcript_payload,
     UiOptions,
 )
+from src.utils.mode_detector import is_production_build, should_enable_debug_features
 
 
 PRIMARY = "#6AD8E5"
@@ -67,7 +68,9 @@ class SettingsDialog(QtWidgets.QDialog):
         self.setWindowIcon(load_icon("apps.png"))
         self.setModal(True)
         self.resize(520, 320)
-        self.setSizeGripEnabled(True)  # Memudahkan pengguna memperbesar dialog bila daftar Advanced panjang
+        self.setSizeGripEnabled(True)
+        self.is_production = is_production_build()
+        self.debug_enabled = should_enable_debug_features()
 
         self.tabs = QtWidgets.QTabWidget()
         self.general = QtWidgets.QWidget()
@@ -76,34 +79,24 @@ class SettingsDialog(QtWidgets.QDialog):
         self.tabs.addTab(self.general, "General")
         self.tabs.addTab(self.advanced, "Advanced")
 
-        # General layout
+        # General layout - tampilan utama yang sederhana
         g_layout = QtWidgets.QFormLayout()
-        self.host_input = QtWidgets.QLineEdit("localhost")
-        self.port_input = QtWidgets.QSpinBox()
-        self.port_input.setRange(1, 65535)
-        self.port_input.setValue(9090)
         self.mic_select = QtWidgets.QComboBox()
         self.spk_select = QtWidgets.QComboBox()
         self.model_select = QtWidgets.QComboBox()
         self.model_select.addItems(["tiny", "base", "small", "medium", "large"])
         self.lang_select = QtWidgets.QComboBox()
         self.lang_select.addItems(["id", "en"])
-        # LLM API key for resume/summary feature (stored in memory only)
         self.llm_api_key = QtWidgets.QLineEdit()
         self.llm_api_key.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
         self.llm_api_key.setPlaceholderText("OpenAI / LLM API key")
 
-        # Tooltip singkat agar pengguna paham fungsi tiap field tanpa dokumentasi terpisah
-        self.host_input.setToolTip("Alamat server transcription (default: localhost)")
-        self.port_input.setToolTip("Port server transcription (1-65535)")
         self.mic_select.setToolTip("Pilih perangkat mikrofon input")
         self.spk_select.setToolTip("Pilih perangkat output/speaker yang direkam")
         self.lang_select.setToolTip("Bahasa transkripsi")
         self.model_select.setToolTip("Model Whisper: makin besar makin akurat namun makin berat")
         self.llm_api_key.setToolTip("API key untuk fitur ringkasan (Summarize). Disimpan hanya di memori, tidak ditulis ke disk")
 
-        g_layout.addRow("Server host:", self.host_input)
-        g_layout.addRow("Server port:", self.port_input)
         g_layout.addRow("Microphone:", self.mic_select)
         g_layout.addRow("Speaker:", self.spk_select)
         g_layout.addRow("Language:", self.lang_select)
@@ -114,6 +107,16 @@ class SettingsDialog(QtWidgets.QDialog):
 
         # Advanced settings (technical)
         a_layout = QtWidgets.QFormLayout()
+
+        # Server host & port - dipindah ke Advanced
+        self.host_input = QtWidgets.QLineEdit("localhost")
+        self.port_input = QtWidgets.QSpinBox()
+        self.port_input.setRange(1, 65535)
+        self.port_input.setValue(9090)
+        self.host_input.setToolTip("Alamat server transcription (default: localhost)")
+        self.port_input.setToolTip("Port server transcription (1-65535)")
+        a_layout.addRow("Server host:", self.host_input)
+        a_layout.addRow("Server port:", self.port_input)
 
         # VAD and normalization
         self.mic_server_vad_cb = QtWidgets.QCheckBox()
@@ -146,21 +149,6 @@ class SettingsDialog(QtWidgets.QDialog):
         self.no_speech_thresh.setSingleStep(0.01)
         self.no_speech_thresh.setValue(0.75)
 
-        # Bukan pilihan (wajib)
-        # Reliability / reconnect
-        # self.auto_reconnect_cb = QtWidgets.QCheckBox()
-        # self.auto_reconnect_cb.setChecked(True)
-
-        # Local agreement / dynamic prompt
-        # self.local_agreement_cb = QtWidgets.QCheckBox()
-        # self.local_agreement_cb.setChecked(True)
-        # self.dynamic_prompt_cb = QtWidgets.QCheckBox()
-        # self.dynamic_prompt_cb.setChecked(True)
-
-        # Speech boundary
-        # self.speech_boundary_cb = QtWidgets.QCheckBox()
-        # self.speech_boundary_cb.setChecked(True)
-
         self.speech_boundary_silence = QtWidgets.QDoubleSpinBox()
         self.speech_boundary_silence.setRange(0.0, 10.0)
         self.speech_boundary_silence.setValue(0.8)
@@ -168,18 +156,18 @@ class SettingsDialog(QtWidgets.QDialog):
         self.speech_boundary_max_wait.setRange(0.0, 30.0)
         self.speech_boundary_max_wait.setValue(5.0)
 
-        # Debug/archive
+        # Debug/archive - hanya tampilkan di development
         self.debug_chunk_archive_cb = QtWidgets.QCheckBox()
         self.rolling_audio_archive_cb = QtWidgets.QCheckBox()
         self.rolling_audio_segment = QtWidgets.QSpinBox()
         self.rolling_audio_segment.setRange(1, 3600)
         self.rolling_audio_segment.setValue(60)
 
-        # Log level
+        # Log level - hanya tampilkan di development
         self.log_level = QtWidgets.QComboBox()
         self.log_level.addItems(["DEBUG", "INFO", "WARNING", "ERROR"])
 
-        # Tooltip untuk parameter teknis agar pengguna non-teknis tetap paham fungsinya
+        # Tooltip untuk parameter teknis
         self.mic_server_vad_cb.setToolTip("Aktifkan Voice Activity Detection di server untuk audio mikrofon")
         self.speaker_server_vad_cb.setToolTip("Aktifkan Voice Activity Detection di server untuk audio speaker")
         self.mic_target_rms.setToolTip("Target volume (RMS) mikrofon setelah normalisasi, dalam dB")
@@ -203,30 +191,28 @@ class SettingsDialog(QtWidgets.QDialog):
         a_layout.addRow("Speaker max gain (dB):", self.spk_max_gain)
         a_layout.addRow("VAD threshold:", self.vad_threshold)
         a_layout.addRow("No-speech threshold:", self.no_speech_thresh)
-        # a_layout.addRow("Auto reconnect:", self.auto_reconnect_cb)
-        # a_layout.addRow("Local agreement:", self.local_agreement_cb)
-        # a_layout.addRow("Dynamic prompt:", self.dynamic_prompt_cb)
-        # a_layout.addRow("Speech boundary detection:", self.speech_boundary_cb)
         a_layout.addRow("Speech boundary silence (s):", self.speech_boundary_silence)
         a_layout.addRow("Speech boundary max wait (s):", self.speech_boundary_max_wait)
-        a_layout.addRow("Debug chunk archive:", self.debug_chunk_archive_cb)
-        a_layout.addRow("Rolling audio archive:", self.rolling_audio_archive_cb)
-        a_layout.addRow("Rolling audio segment (s):", self.rolling_audio_segment)
-        a_layout.addRow("Log level:", self.log_level)
 
+        # Debug features hanya di development
+        if self.debug_enabled:
+            a_layout.addRow("Debug chunk archive:", self.debug_chunk_archive_cb)
+            a_layout.addRow("Rolling audio archive:", self.rolling_audio_archive_cb)
+            a_layout.addRow("Rolling audio segment (s):", self.rolling_audio_segment)
+            a_layout.addRow("Log level:", self.log_level)
+        
         self.advanced.setLayout(a_layout)
 
         btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
 
-        # Beri label dan ID khusus untuk di-styling nanti
         ok_btn = btns.button(QtWidgets.QDialogButtonBox.StandardButton.Ok)
         ok_btn.setText("Save Settings")
         ok_btn.setObjectName("SaveBtn")
         ok_btn.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
         ok_btn.setToolTip("Simpan pengaturan dan tutup dialog")
-        ok_btn.setDefault(True)  # Enter langsung menyimpan, sesuai konvensi dialog standar
+        ok_btn.setDefault(True)
 
         cancel_btn = btns.button(QtWidgets.QDialogButtonBox.StandardButton.Cancel)
         cancel_btn.setObjectName("CancelBtn")
@@ -288,9 +274,15 @@ class SettingsDialog(QtWidgets.QDialog):
         self.no_speech_thresh.setValue(opts.no_speech_thresh)
         self.speech_boundary_silence.setValue(opts.speech_boundary_silence_seconds)
         self.speech_boundary_max_wait.setValue(opts.speech_boundary_max_wait_seconds)
-        self.debug_chunk_archive_cb.setChecked(opts.debug_chunk_archive)
-        self.rolling_audio_archive_cb.setChecked(opts.rolling_audio_archive)
-        self.rolling_audio_segment.setValue(int(opts.rolling_audio_segment_seconds))
+        
+        # Debug features hanya ada di development mode
+        if self.debug_enabled:
+            self.debug_chunk_archive_cb.setChecked(opts.debug_chunk_archive)
+            self.rolling_audio_archive_cb.setChecked(opts.rolling_audio_archive)
+            self.rolling_audio_segment.setValue(int(opts.rolling_audio_segment_seconds))
+            idx = self.log_level.findText(opts.log_level)
+            if idx >= 0:
+                self.log_level.setCurrentIndex(idx)
 
     def to_options(self) -> UiOptions:
         opts = UiOptions()
@@ -311,9 +303,19 @@ class SettingsDialog(QtWidgets.QDialog):
         opts.no_speech_thresh = self.no_speech_thresh.value()
         opts.speech_boundary_silence_seconds = self.speech_boundary_silence.value()
         opts.speech_boundary_max_wait_seconds = self.speech_boundary_max_wait.value()
-        opts.debug_chunk_archive = self.debug_chunk_archive_cb.isChecked()
-        opts.rolling_audio_archive = self.rolling_audio_archive_cb.isChecked()
-        opts.rolling_audio_segment_seconds = float(self.rolling_audio_segment.value())
+        
+        # Debug dan log level hanya ada di development mode
+        if self.debug_enabled:
+            opts.debug_chunk_archive = self.debug_chunk_archive_cb.isChecked()
+            opts.rolling_audio_archive = self.rolling_audio_archive_cb.isChecked()
+            opts.rolling_audio_segment_seconds = float(self.rolling_audio_segment.value())
+            opts.log_level = str(self.log_level.currentText())
+        else:
+            # Production mode: selalu disable debug
+            opts.debug_chunk_archive = False
+            opts.rolling_audio_archive = False
+            opts.rolling_audio_segment_seconds = 60.0
+            opts.log_level = "WARNING"
         
         return opts
 
