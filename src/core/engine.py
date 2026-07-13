@@ -1,28 +1,17 @@
-"""Server web UI lokal untuk mengontrol client live transcriber.
-
-Server ini bukan server ASR. Ia hanya menyajikan HTML/JS lokal, endpoint status,
-daftar device audio, transcript log, dan menjalankan `python -m src.main --mode live`
-sebagai subprocess.
-"""
-
 from __future__ import annotations
 
-import argparse
-from collections import deque
-from dataclasses import dataclass, field
-from datetime import datetime
-from http import HTTPStatus
-from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
-from pathlib import Path
 import shutil
 import signal
-import socket
 import subprocess
 import sys
 import threading
 import time
+from collections import deque
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from src.capture.mic_stream import list_input_devices
@@ -32,14 +21,13 @@ from src.utils.os_detector import AudioBackend, get_audio_backend
 
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
-STATIC_DIR = Path(__file__).resolve().parent / "static"
 DEFAULT_TRANSCRIPT_LOG = ROOT_DIR / "audio" / "transcript_log.json"
 DEFAULT_LOG_FILE = ROOT_DIR / "logs" / "transcriber.log"
 
 
 @dataclass(slots=True)
 class UiOptions:
-    """Opsi start live session yang diterima dari form web UI."""
+    """Options for starting a live transcription subprocess."""
 
     host: str = "localhost"
     port: int = 9090
@@ -83,7 +71,7 @@ class UiOptions:
 
 @dataclass
 class LiveProcessState:
-    """State proses client live yang sedang dijalankan oleh web UI."""
+    """State for the live transcription subprocess."""
 
     process: subprocess.Popen[str] | None = None
     started_at: float | None = None
@@ -93,20 +81,18 @@ class LiveProcessState:
     exit_code: int | None = None
     stop_requested: bool = False
     last_error: str | None = None
-    connection_status: str = "DISCONNECTED"  # DISCONNECTED, CONNECTING, CONNECTED, ERROR
+    connection_status: str = "DISCONNECTED"
     lock: threading.RLock = field(default_factory=threading.RLock)
 
     def running(self) -> bool:
         with self.lock:
             return self.process is not None and self.process.poll() is None
-    
+
     def get_connection_status(self) -> str:
-        """Get current connection status."""
         with self.lock:
             return self.connection_status
-    
+
     def set_connection_status(self, status: str) -> None:
-        """Set connection status (CONNECTING, CONNECTED, ERROR, DISCONNECTED)."""
         if status not in ("CONNECTING", "CONNECTED", "ERROR", "DISCONNECTED"):
             raise ValueError(f"Invalid status: {status}")
         with self.lock:
@@ -144,8 +130,6 @@ STATE = LiveProcessState()
 
 
 def build_live_command(options: UiOptions) -> list[str]:
-    """Bangun argv yang dipakai UI untuk menjalankan CLI client."""
-
     command = [
         sys.executable,
         "-m",
@@ -227,7 +211,6 @@ def build_live_command(options: UiOptions) -> list[str]:
 
 
 def start_live(options: UiOptions) -> dict[str, Any]:
-    """Start subprocess client live dan mulai thread monitor stdout."""
     with STATE.lock:
         if STATE.process is not None and STATE.process.poll() is None:
             raise RuntimeError("live session is already running")
@@ -264,25 +247,16 @@ def start_live(options: UiOptions) -> dict[str, Any]:
         STATE.exit_code = None
         STATE.stop_requested = False
         STATE.last_error = None
-        STATE.connection_status = "CONNECTING"  # Set status ke CONNECTING saat proses dimulai
+        STATE.connection_status = "CONNECTING"
         STATE.log_lines.clear()
         STATE.append_log("UI started live client")
 
-    thread = threading.Thread(target=_monitor_process, args=(process,), name="ui-live-monitor", daemon=True)
+    thread = threading.Thread(target=_monitor_process, args=(process,), name="core-live-monitor", daemon=True)
     thread.start()
     return STATE.snapshot()
 
 
 def stop_live(*, force: bool = False, wait_timeout_seconds: float = 3.0) -> dict[str, Any]:
-    """Stop client live secara graceful, atau terminate jika force=True.
-    
-    Args:
-        force: Jika True, langsung terminate tanpa graceful shutdown
-        wait_timeout_seconds: Waktu maksimal menunggu proses bersih sebelum kelanjutan
-    
-    Returns:
-        Snapshot state proses saat ini
-    """
     with STATE.lock:
         process = STATE.process
         if process is None or process.poll() is not None:
@@ -304,9 +278,7 @@ def stop_live(*, force: bool = False, wait_timeout_seconds: float = 3.0) -> dict
     except Exception as exc:
         STATE.append_log(f"graceful stop failed, terminating process: {exc}")
         process.terminate()
-    
-    # Tunggu proses benar-benar selesai (maksimal wait_timeout_seconds detik)
-    # ini menghindari race condition ketika start_live dipanggil sebelum proses lama bersih
+
     try:
         process.wait(timeout=wait_timeout_seconds)
         STATE.append_log(f"Process stopped gracefully (waited {wait_timeout_seconds}s)")
@@ -318,7 +290,7 @@ def stop_live(*, force: bool = False, wait_timeout_seconds: float = 3.0) -> dict
         except subprocess.TimeoutExpired:
             STATE.append_log("Force terminate timed out, killing process")
             process.kill()
-    
+
     return STATE.snapshot()
 
 
@@ -382,17 +354,7 @@ def transcript_payload(path: Path = DEFAULT_TRANSCRIPT_LOG) -> dict[str, Any]:
     }
 
 
-def server_health(host: str = "localhost", port: int = 9090) -> dict[str, Any]:
-    address = f"{host}:{port}"
-    try:
-        with socket.create_connection((host, port), timeout=1.2):
-            return {"healthy": True, "url": address, "status": "tcp_open", "error": None}
-    except OSError as exc:
-        return {"healthy": False, "url": address, "status": None, "error": str(exc)}
-
-
 def audio_devices_payload() -> dict[str, Any]:
-    """Payload daftar mic/speaker untuk dropdown UI."""
     backend = get_audio_backend()
     result: dict[str, Any] = {
         "mic": [],
@@ -465,154 +427,6 @@ def _speaker_capture_status(backend: AudioBackend) -> dict[str, Any]:
     }
 
 
-class UiRequestHandler(SimpleHTTPRequestHandler):
-    """HTTP handler kecil untuk static UI dan API kontrol client."""
-
-    server_version = "PLNTranscriberUI/1.0"
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, directory=str(STATIC_DIR), **kwargs)
-
-    def do_GET(self) -> None:  # noqa: N802
-        if self.path == "/api/status":
-            self._json(
-                {
-                    "session": STATE.snapshot(),
-                    "server": server_health(),
-                    "transcript": transcript_payload(STATE.transcript_log),
-                    "logs": STATE.logs(120),
-                }
-            )
-            return
-        if self.path == "/api/transcript":
-            self._json(transcript_payload(STATE.transcript_log))
-            return
-        if self.path == "/api/logs":
-            self._json({"lines": STATE.logs(500)})
-            return
-        if self.path == "/api/audio-devices":
-            self._json(audio_devices_payload())
-            return
-        super().do_GET()
-
-    def do_POST(self) -> None:  # noqa: N802
-        try:
-            if self.path == "/api/start":
-                self._json(start_live(_parse_options(self._read_json())))
-                return
-            if self.path == "/api/stop":
-                self._json(stop_live())
-                return
-            if self.path == "/api/force-stop":
-                self._json(stop_live(force=True))
-                return
-            if self.path == "/api/archive-transcript":
-                archived = archive_transcript(STATE.transcript_log)
-                self._json({"archived": None if archived is None else str(archived)})
-                return
-            self.send_error(HTTPStatus.NOT_FOUND, "unknown endpoint")
-        except Exception as exc:
-            self._json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-
-    def log_message(self, format: str, *args: Any) -> None:
-        return
-
-    def _read_json(self) -> dict[str, Any]:
-        length = int(self.headers.get("Content-Length", "0") or "0")
-        if length <= 0:
-            return {}
-        body = self.rfile.read(length).decode("utf-8")
-        payload = json.loads(body)
-        if not isinstance(payload, dict):
-            raise ValueError("request body must be a JSON object")
-        return payload
-
-    def _json(self, payload: dict[str, Any], *, status: HTTPStatus = HTTPStatus.OK) -> None:
-        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        try:
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
-        except ConnectionError:
-            pass  # Klien (browser) sudah menutup koneksi, kita abaikan saja error ini
-
-
-def _parse_options(payload: dict[str, Any]) -> UiOptions:
-    transcript_log = _safe_path(str(payload.get("transcriptLog") or DEFAULT_TRANSCRIPT_LOG))
-    return UiOptions(
-        host=str(payload.get("host") or "localhost"),
-        port=_int(payload.get("port"), 9090),
-        source=_choice(str(payload.get("source") or "both"), {"mic", "speaker", "both"}, "both"),
-        model=str(payload.get("model") or "small"),
-        language=str(payload.get("language") or "id"),
-        chunk_seconds=_float(payload.get("chunkSeconds"), 0.5),
-        mic_device=_device_value(payload.get("micDevice")),
-        speaker_device=_device_value(payload.get("speakerDevice")),
-        mic_server_vad=bool(payload.get("micServerVad", payload.get("micClientVad", True))),
-        speaker_server_vad=bool(payload.get("speakerServerVad", payload.get("speakerClientVad", False))),
-        mic_target_rms_db=_float(payload.get("micTargetRmsDb"), -20.0),
-        mic_max_normalization_gain_db=_float(payload.get("micMaxNormalizationGainDb"), 18.0),
-        speaker_target_rms_db=_float(payload.get("speakerTargetRmsDb"), -23.0),
-        speaker_max_normalization_gain_db=_float(payload.get("speakerMaxNormalizationGainDb"), 18.0),
-        vad_threshold=_float(payload.get("vadThreshold"), 0.55),
-        no_speech_thresh=_float(payload.get("noSpeechThresh"), 0.75),
-        ready_timeout=_float(payload.get("readyTimeout"), 300.0),
-        final_drain_seconds=_float(payload.get("finalDrainSeconds"), 10.0),
-        auto_reconnect=bool(payload.get("autoReconnect", True)),
-        reconnect_initial_backoff_seconds=_float(payload.get("reconnectInitialBackoffSeconds"), 1.0),
-        reconnect_max_backoff_seconds=_float(payload.get("reconnectMaxBackoffSeconds"), 30.0),
-        reconnect_buffer_seconds=_float(payload.get("reconnectBufferSeconds"), 30.0),
-        local_agreement=bool(payload.get("localAgreement", True)),
-        local_agreement_window_seconds=_float(payload.get("localAgreementWindowSeconds"), 20.0),
-        local_agreement_hop_seconds=_float(payload.get("localAgreementHopSeconds"), 3.0),
-        dynamic_prompt=bool(payload.get("dynamicPrompt", True)),
-        speech_boundary_detection=bool(payload.get("speechBoundaryDetection", True)),
-        speech_boundary_silence_seconds=_float(payload.get("speechBoundarySilenceSeconds"), 0.8),
-        speech_boundary_max_wait_seconds=_float(payload.get("speechBoundaryMaxWaitSeconds"), 5.0),
-        debug_chunk_archive=bool(payload.get("debugChunkArchive", False)),
-        rolling_audio_archive=bool(payload.get("rollingAudioArchive", False)),
-        rolling_audio_segment_seconds=_float(payload.get("rollingAudioSegmentSeconds"), 60.0),
-        log_level=_choice(str(payload.get("logLevel") or "INFO").upper(), {"DEBUG", "INFO", "WARNING", "ERROR"}, "INFO"),
-        process_log_hot_path_detail=bool(payload.get("processLogHotPathDetail", False)),
-        process_log_summary_interval_seconds=_float(payload.get("processLogSummaryIntervalSeconds"), 5.0),
-        hide_partials=bool(payload.get("hidePartials", True)),
-        reset_transcript=bool(payload.get("resetTranscript", False)),
-        transcript_log=transcript_log,
-    )
-
-
-def _monitor_process(process: subprocess.Popen[str]) -> None:
-    assert process.stdout is not None
-    try:
-        for line in process.stdout:
-            STATE.append_log(line)
-            
-            # Deteksi pesan-pesan penting untuk update connection status
-            line_lower = line.lower()
-            
-            # Check untuk pesan server ready / connection established
-            if "server_ready" in line_lower or "connected" in line_lower or "websocket" in line_lower and "established" in line_lower:
-                STATE.set_connection_status("CONNECTED")
-                STATE.append_log("Connection status: CONNECTED")
-            
-            # Check untuk pesan error / connection failed
-            elif ("connection" in line_lower and "failed" in line_lower) or \
-                 ("error" in line_lower and ("connection" in line_lower or "websocket" in line_lower)) or \
-                 ("websocket" in line_lower and "error" in line_lower):
-                STATE.set_connection_status("ERROR")
-                STATE.append_log("Connection status: ERROR")
-                
-    finally:
-        exit_code = process.wait()
-        with STATE.lock:
-            STATE.exit_code = exit_code
-            STATE.connection_status = "DISCONNECTED"
-            STATE.append_log(f"live client exited with code {exit_code}")
-
-
-
 def _safe_path(value: str) -> Path:
     path = Path(value)
     if not path.is_absolute():
@@ -654,26 +468,3 @@ def _num(value: float) -> str:
     if float(value).is_integer():
         return str(int(value))
     return str(value)
-
-
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Local web UI for PLN Meeting Transcriber")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8787)
-    args = parser.parse_args(argv)
-
-    server = ThreadingHTTPServer((args.host, args.port), UiRequestHandler)
-    print(f"PLN Transcriber UI: http://{args.host}:{args.port}")
-    print("Tekan Ctrl+C untuk berhenti.")
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        stop_live(force=True)
-        server.server_close()
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

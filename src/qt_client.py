@@ -9,7 +9,7 @@ import json
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from src.ui.server import (
+from src.core.engine import (
     audio_devices_payload,
     start_live,
     stop_live,

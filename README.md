@@ -7,9 +7,9 @@ PCM16, lalu mengirim dua stream terpisah ke server.
 
 Output live diberi label:
 
-| Source | Label |
-| --- | --- |
-| `mic` | `Me` |
+| Source    | Label     |
+| --------- | --------- |
+| `mic`     | `Me`      |
 | `speaker` | `Meeting` |
 
 ## Workspace Architecture
@@ -17,15 +17,16 @@ Output live diberi label:
 Workspace dipisahkan menjadi client application code, runtime artifacts, dan
 server ASR vendor:
 
-| Path | Tanggung jawab |
-| --- | --- |
-| `src/main.py` | CLI composition root: parsing argumen, memilih mode, dan menghubungkan layer. |
-| `src/capture/` | Adapter input audio untuk mic, Windows loopback, macOS system audio, dan WAV sink. |
-| `src/engine/` | Domain pipeline audio: preprocessing, VAD, local Whisper, WhisperLive client/session, transcript merge. |
-| `src/runtime/` | Adapter konfigurasi runtime seperti `.env` dan environment variables. |
-| `src/ui/` | Local web UI dan static dashboard untuk menjalankan CLI live mode. |
-| `tests/` | Unit/integration tests untuk client code. |
-| `WhisperLive/` | Server ASR Docker/vendor; jangan dijalankan sebagai client root. |
+| Path                 | Tanggung jawab                                                                     |
+| -------------------- | ---------------------------------------------------------------------------------- |
+| `src/main.py`        | CLI composition root: parsing argumen, memilih mode, dan menghubungkan layer.      |
+| `src/capture/`       | Adapter input audio untuk mic, Windows loopback, macOS system audio, dan WAV sink. |
+| `src/preprocessing/` | Audio preprocessing pipeline dan transformasi menjadi PCM16 mono.                  |
+| `src/utils/`         | Utility helpers, environment loading, dan logging support.                         |
+| `src/whisper/`       | WhisperLive client/session layer dan transcription orchestration.                  |
+| `src/core/`          | Desktop core engine untuk manajemen subprocess live session.                       |
+| `tests/`             | Unit/integration tests untuk client code.                                          |
+| `WhisperLive/`       | Server ASR Docker/vendor; jangan dijalankan sebagai client root.                   |
 
 `audio/`, `logs/`, dan `tmp/` adalah output runtime dan di-ignore oleh Git.
 Gunakan `.env.example` sebagai template; file `.env` lokal tidak disimpan di
@@ -102,15 +103,15 @@ Jika VM CPU kecil dan model `small` terlalu lambat, gunakan
 
 Default server:
 
-| Item | Default |
-| --- | --- |
-| WebSocket | `localhost:9090` |
-| Backend | `faster_whisper` |
-| Model client | `small` |
-| Bahasa | `id` |
-| VAD threshold | `0.55` |
-| Max clients | `4` |
-| Max connection time | `600s` |
+| Item                | Default          |
+| ------------------- | ---------------- |
+| WebSocket           | `localhost:9090` |
+| Backend             | `faster_whisper` |
+| Model client        | `small`          |
+| Bahasa              | `id`             |
+| VAD threshold       | `0.55`           |
+| Max clients         | `4`              |
+| Max connection time | `600s`           |
 
 Server menjalankan anti-hallucination filter secara default. Untuk debugging:
 
@@ -166,17 +167,15 @@ Untuk deployment server di Azure VM, lihat bagian **Deployment Azure VM** di
 terbuka di Azure NSG dan firewall OS, lalu arahkan client lokal ke
 `--server-host 20.189.120.244 --server-port 9090`.
 
-### 4. Jalankan UI lokal
+### 4. Jalankan aplikasi desktop
 
-Jika server WhisperLive Docker sudah selalu berjalan, gunakan dashboard lokal
-untuk start/stop client, melihat status server, transcript, dan log:
+Jika server WhisperLive Docker sudah berjalan, jalankan aplikasi desktop untuk
+mengontrol client live transcription secara langsung:
 
 ```powershell
 cd D:\PLN
-uv run python -m src.ui.server
+uv run python -m src.qt_client
 ```
-
-Buka:
 
 ```text
 http://127.0.0.1:8787
@@ -285,29 +284,29 @@ uv run python -m src.main --record --preprocess --transcribe --seconds 30
 
 ### Mode eksekusi
 
-| Parameter            | Keterangan |
-|----------------------|------------|
-| `--live`             | Capture mic/speaker dan stream ke WhisperLive server. |
-| `--replay-file`      | Stream file WAV ke WhisperLive untuk smoke test. |
-| `--record`           | Rekam audio ke WAV (batch mode). |
-| `--preprocess`       | Preprocessing WAV yang sudah direkam (batch mode). |
-| `--transcribe`       | Transkripsi WAV lokal untuk debugging/offline analysis. |
+| Parameter       | Keterangan                                              |
+| --------------- | ------------------------------------------------------- |
+| `--live`        | Capture mic/speaker dan stream ke WhisperLive server.   |
+| `--replay-file` | Stream file WAV ke WhisperLive untuk smoke test.        |
+| `--record`      | Rekam audio ke WAV (batch mode).                        |
+| `--preprocess`  | Preprocessing WAV yang sudah direkam (batch mode).      |
+| `--transcribe`  | Transkripsi WAV lokal untuk debugging/offline analysis. |
 
 ### Parameter capture (berlaku untuk `--live` dan `--record`)
 
-| Parameter              | Default          | Keterangan |
-|------------------------|------------------|------------|
-| `--source`             | `both`           | Sumber audio: `mic`, `speaker`, atau `both`. |
-| `--sample-rate`        | bawaan perangkat | Override sample rate. Biarkan kosong untuk auto-detect. |
-| `--block-size`         | `1024`           | Ukuran blok audio per callback (frame). |
-| `--queue-size`         | `64`             | Maks blok audio yang diantrekan per stream. |
-| `--mic-channels`       | `1`              | Channel mikrofon (mono = 1). |
-| `--mic-device`         | default OS       | Index/nama input microphone. Pakai ini untuk memilih mic headset atau mic laptop. |
-| `--speaker-device`     | default speaker  | Index/nama speaker loopback. Pakai ini untuk memilih output headset atau speaker laptop yang sedang dipakai meeting. |
-| `--mic-client-vad` / `--no-mic-client-vad` | on | VAD ringan di client untuk mic. Matikan sementara jika suara mic terbukti hilang di `logs/process.log`. |
-| `--speaker-client-vad` / `--no-speaker-client-vad` | off | VAD ringan di client untuk speaker/system audio. Default off karena volume loopback aplikasi meeting/YouTube sering rendah dan berisiko membuang ucapan sebelum ASR. |
-| `--output-dir`         | `audio`          | Direktori output WAV (hanya batch mode). |
-| `--seconds`            | `3.0`            | Durasi rekaman (hanya `--record`). |
+| Parameter                                          | Default          | Keterangan                                                                                                                                                           |
+| -------------------------------------------------- | ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--source`                                         | `both`           | Sumber audio: `mic`, `speaker`, atau `both`.                                                                                                                         |
+| `--sample-rate`                                    | bawaan perangkat | Override sample rate. Biarkan kosong untuk auto-detect.                                                                                                              |
+| `--block-size`                                     | `1024`           | Ukuran blok audio per callback (frame).                                                                                                                              |
+| `--queue-size`                                     | `64`             | Maks blok audio yang diantrekan per stream.                                                                                                                          |
+| `--mic-channels`                                   | `1`              | Channel mikrofon (mono = 1).                                                                                                                                         |
+| `--mic-device`                                     | default OS       | Index/nama input microphone. Pakai ini untuk memilih mic headset atau mic laptop.                                                                                    |
+| `--speaker-device`                                 | default speaker  | Index/nama speaker loopback. Pakai ini untuk memilih output headset atau speaker laptop yang sedang dipakai meeting.                                                 |
+| `--mic-client-vad` / `--no-mic-client-vad`         | on               | VAD ringan di client untuk mic. Matikan sementara jika suara mic terbukti hilang di `logs/process.log`.                                                              |
+| `--speaker-client-vad` / `--no-speaker-client-vad` | off              | VAD ringan di client untuk speaker/system audio. Default off karena volume loopback aplikasi meeting/YouTube sering rendah dan berisiko membuang ucapan sebelum ASR. |
+| `--output-dir`                                     | `audio`          | Direktori output WAV (hanya batch mode).                                                                                                                             |
+| `--seconds`                                        | `3.0`            | Durasi rekaman (hanya `--record`).                                                                                                                                   |
 
 Contoh memilih headset:
 
@@ -324,68 +323,68 @@ terpisah.
 
 ### Parameter WhisperLive
 
-| Parameter | Default | Keterangan |
-| --- | --- | --- |
-| `--server-host` | `localhost` | Host server WhisperLive. |
-| `--server-port` | `9090` | Port WebSocket server. |
-| `--server-wss` | off | Gunakan `wss://`. |
-| `--server-api-key` | kosong | API key jika server memakai auth. |
-| `--server-ready-timeout` | `300` | Batas tunggu client sampai server mengirim `SERVER_READY`. Naikkan pada first run/model warmup. |
-| `--whisper-model` | `small` untuk live/replay | Model Faster-Whisper. Hindari model `.en` untuk meeting Indonesia-Inggris. |
-| `--whisper-language` | `id` | Bahasa utama meeting. |
-| `--vad-threshold` | `0.55` | VAD server. Naikkan jika silence masih menghasilkan teks, turunkan jika kata pendek terpotong. |
-| `--server-vad` / `--no-server-vad` | off | VAD Faster-Whisper di server. Default off karena audio sudah dipreprocess/VAD di client dan transcript final lebih penting dari caption realtime. |
-| `--whisperlive-no-speech-thresh` | `0.75` | Filter `no_speech_prob` segment di WhisperLive. Lebih longgar agar kandidat transcript tidak habis dibuang. |
-| `--live-chunk-seconds` | `0.5` | Durasi kirim audio dari client. 500 ms menekan overhead paket tanpa membuat transcript terasa lambat. |
-| `--audio-format` | `int16` | Format payload audio ke WhisperLive. PCM16 lebih hemat bandwidth dibanding `float32`. |
-| `--auto-reconnect` / `--no-auto-reconnect` | on | Reconnect otomatis jika WebSocket putus. Saat aktif, sesi tidak langsung berhenti ketika server/network transient error. |
-| `--reconnect-initial-backoff-seconds` | `1` | Delay awal sebelum reconnect ulang setelah disconnect. |
-| `--reconnect-max-backoff-seconds` | `30` | Batas maksimum exponential backoff reconnect. |
-| `--reconnect-buffer-seconds` | `30` | Durasi maksimum buffer chunk audio lokal per source saat reconnect. Jika buffer penuh, chunk tertua dibuang agar audio terbaru tetap diprioritaskan. |
-| `--local-agreement` / `--no-local-agreement` | on | Server memakai sliding window dan hanya mengunci teks yang stabil di dua hipotesis berurutan. |
-| `--local-agreement-window-seconds` | `20` | Durasi maksimum buffer konteks server. Cukup untuk konteks meeting tanpa membuat inferensi terlalu berat. |
-| `--local-agreement-hop-seconds` | `3` | Interval minimum antar transkripsi window jika ada audio baru. Lebih kecil = lebih realtime, lebih berat. |
-| `--dynamic-prompt` / `--no-dynamic-prompt` | on | Transcript final terbaru dikirim balik sebagai konteks decode Whisper. |
-| `--speech-boundary-detection` / `--no-speech-boundary-detection` | on | Tunda ASR sampai tidak ada chunk speech baru, dengan max-wait fallback. |
-| `--speech-boundary-silence-seconds` | `0.8` | Durasi tanpa chunk speech baru sebelum ASR dianggap berada di akhir ucapan. |
-| `--speech-boundary-max-wait-seconds` | `5` | Batas tunggu saat pembicaraan terus berlangsung agar ASR tetap berjalan. |
-| `--hide-partials` / `--no-hide-partials` | on | Sembunyikan partial mentah yang belum lolos Local Agreement. |
-| `--debug-chunk-archive` / `--no-debug-chunk-archive` | off | Simpan setiap chunk sebagai WAV hanya untuk debugging. Default off agar disk I/O rendah. |
-| `--chunk-archive-dir` | `audio/chunks` | Direktori chunk debug saat `--debug-chunk-archive` aktif. |
-| `--initial-prompt` | prompt EYD/PUEBI konservatif | Instruksi decode Bahasa Indonesia: gunakan ejaan baku hanya untuk kata yang jelas dan jangan menambah isi. |
-| `--hotwords` | kosong | Istilah bantu decode. Default kosong karena hotwords dapat bocor menjadi transcript saat audio lemah/noisy. Aktifkan hanya untuk sesi/domain yang benar-benar membutuhkan glossary. |
+| Parameter                                                        | Default                      | Keterangan                                                                                                                                                                          |
+| ---------------------------------------------------------------- | ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--server-host`                                                  | `localhost`                  | Host server WhisperLive.                                                                                                                                                            |
+| `--server-port`                                                  | `9090`                       | Port WebSocket server.                                                                                                                                                              |
+| `--server-wss`                                                   | off                          | Gunakan `wss://`.                                                                                                                                                                   |
+| `--server-api-key`                                               | kosong                       | API key jika server memakai auth.                                                                                                                                                   |
+| `--server-ready-timeout`                                         | `300`                        | Batas tunggu client sampai server mengirim `SERVER_READY`. Naikkan pada first run/model warmup.                                                                                     |
+| `--whisper-model`                                                | `small` untuk live/replay    | Model Faster-Whisper. Hindari model `.en` untuk meeting Indonesia-Inggris.                                                                                                          |
+| `--whisper-language`                                             | `id`                         | Bahasa utama meeting.                                                                                                                                                               |
+| `--vad-threshold`                                                | `0.55`                       | VAD server. Naikkan jika silence masih menghasilkan teks, turunkan jika kata pendek terpotong.                                                                                      |
+| `--server-vad` / `--no-server-vad`                               | off                          | VAD Faster-Whisper di server. Default off karena audio sudah dipreprocess/VAD di client dan transcript final lebih penting dari caption realtime.                                   |
+| `--whisperlive-no-speech-thresh`                                 | `0.75`                       | Filter `no_speech_prob` segment di WhisperLive. Lebih longgar agar kandidat transcript tidak habis dibuang.                                                                         |
+| `--live-chunk-seconds`                                           | `0.5`                        | Durasi kirim audio dari client. 500 ms menekan overhead paket tanpa membuat transcript terasa lambat.                                                                               |
+| `--audio-format`                                                 | `int16`                      | Format payload audio ke WhisperLive. PCM16 lebih hemat bandwidth dibanding `float32`.                                                                                               |
+| `--auto-reconnect` / `--no-auto-reconnect`                       | on                           | Reconnect otomatis jika WebSocket putus. Saat aktif, sesi tidak langsung berhenti ketika server/network transient error.                                                            |
+| `--reconnect-initial-backoff-seconds`                            | `1`                          | Delay awal sebelum reconnect ulang setelah disconnect.                                                                                                                              |
+| `--reconnect-max-backoff-seconds`                                | `30`                         | Batas maksimum exponential backoff reconnect.                                                                                                                                       |
+| `--reconnect-buffer-seconds`                                     | `30`                         | Durasi maksimum buffer chunk audio lokal per source saat reconnect. Jika buffer penuh, chunk tertua dibuang agar audio terbaru tetap diprioritaskan.                                |
+| `--local-agreement` / `--no-local-agreement`                     | on                           | Server memakai sliding window dan hanya mengunci teks yang stabil di dua hipotesis berurutan.                                                                                       |
+| `--local-agreement-window-seconds`                               | `20`                         | Durasi maksimum buffer konteks server. Cukup untuk konteks meeting tanpa membuat inferensi terlalu berat.                                                                           |
+| `--local-agreement-hop-seconds`                                  | `3`                          | Interval minimum antar transkripsi window jika ada audio baru. Lebih kecil = lebih realtime, lebih berat.                                                                           |
+| `--dynamic-prompt` / `--no-dynamic-prompt`                       | on                           | Transcript final terbaru dikirim balik sebagai konteks decode Whisper.                                                                                                              |
+| `--speech-boundary-detection` / `--no-speech-boundary-detection` | on                           | Tunda ASR sampai tidak ada chunk speech baru, dengan max-wait fallback.                                                                                                             |
+| `--speech-boundary-silence-seconds`                              | `0.8`                        | Durasi tanpa chunk speech baru sebelum ASR dianggap berada di akhir ucapan.                                                                                                         |
+| `--speech-boundary-max-wait-seconds`                             | `5`                          | Batas tunggu saat pembicaraan terus berlangsung agar ASR tetap berjalan.                                                                                                            |
+| `--hide-partials` / `--no-hide-partials`                         | on                           | Sembunyikan partial mentah yang belum lolos Local Agreement.                                                                                                                        |
+| `--debug-chunk-archive` / `--no-debug-chunk-archive`             | off                          | Simpan setiap chunk sebagai WAV hanya untuk debugging. Default off agar disk I/O rendah.                                                                                            |
+| `--chunk-archive-dir`                                            | `audio/chunks`               | Direktori chunk debug saat `--debug-chunk-archive` aktif.                                                                                                                           |
+| `--initial-prompt`                                               | prompt EYD/PUEBI konservatif | Instruksi decode Bahasa Indonesia: gunakan ejaan baku hanya untuk kata yang jelas dan jangan menambah isi.                                                                          |
+| `--hotwords`                                                     | kosong                       | Istilah bantu decode. Default kosong karena hotwords dapat bocor menjadi transcript saat audio lemah/noisy. Aktifkan hanya untuk sesi/domain yang benar-benar membutuhkan glossary. |
 
 ### Parameter lokal/batch
 
-| Parameter | Default | Keterangan |
-| --- | --- | --- |
-| `--asr-backend local` | off | Pakai OpenAI Whisper lokal untuk debugging tanpa server. |
-| `--whisper-device` | auto | Override device lokal: `cpu` atau `cuda`. |
-| `--whisper-fp16` / `--no-whisper-fp16` | auto | Paksa FP16 aktif/nonaktif untuk mode lokal. |
-| `--whisper-min-logprob` | `-1.0` | Quality gate lokal. |
-| `--whisper-max-no-speech` | `0.60` | Quality gate lokal. |
-| `--whisper-max-compression` | `2.2` | Quality gate lokal. |
-| `--transcript-output` | `audio/transcript.phase4.json` | File JSON output batch lokal. |
+| Parameter                              | Default                        | Keterangan                                               |
+| -------------------------------------- | ------------------------------ | -------------------------------------------------------- |
+| `--asr-backend local`                  | off                            | Pakai OpenAI Whisper lokal untuk debugging tanpa server. |
+| `--whisper-device`                     | auto                           | Override device lokal: `cpu` atau `cuda`.                |
+| `--whisper-fp16` / `--no-whisper-fp16` | auto                           | Paksa FP16 aktif/nonaktif untuk mode lokal.              |
+| `--whisper-min-logprob`                | `-1.0`                         | Quality gate lokal.                                      |
+| `--whisper-max-no-speech`              | `0.60`                         | Quality gate lokal.                                      |
+| `--whisper-max-compression`            | `2.2`                          | Quality gate lokal.                                      |
+| `--transcript-output`                  | `audio/transcript.phase4.json` | File JSON output batch lokal.                            |
 
 ### Parameter logging & backup
 
-| Parameter                  | Default                      | Keterangan |
-|----------------------------|------------------------------|------------|
-| `--transcript-log`         | `audio/transcript_log.json`  | Backup transkrip real-time, diperbarui setiap hasil baru. |
-| `--resume-transcript-log`  | off                          | Append ke log yang sudah ada (default: mulai sesi baru). |
-| `--log-level`              | `INFO`                       | Verbositas log: `DEBUG`, `INFO`, `WARNING`, `ERROR`. |
-| `--log-file`               | `logs/transcriber.log`       | Path file log diagnostik. |
+| Parameter                 | Default                     | Keterangan                                                |
+| ------------------------- | --------------------------- | --------------------------------------------------------- |
+| `--transcript-log`        | `audio/transcript_log.json` | Backup transkrip real-time, diperbarui setiap hasil baru. |
+| `--resume-transcript-log` | off                         | Append ke log yang sudah ada (default: mulai sesi baru).  |
+| `--log-level`             | `INFO`                      | Verbositas log: `DEBUG`, `INFO`, `WARNING`, `ERROR`.      |
+| `--log-file`              | `logs/transcriber.log`      | Path file log diagnostik.                                 |
 
 ## Lokasi Output
 
-| Mode | File default | Catatan |
-| --- | --- | --- |
-| Live CLI / UI | `audio/transcript_log.json` | JSON append-style. Entry `stability=candidate` adalah live hypothesis/review; entry `stability=stable` adalah hasil completed Local Agreement. |
-| Live chunk archive debug | `audio/chunks/<session>/<source>/*.wav` | Hanya dibuat saat `--debug-chunk-archive` aktif. Default produksi tidak menulis ribuan file kecil. |
-| Batch phase 4 | `audio/transcript.phase4.json` | Output lengkap mode `--transcribe`. |
-| Diagnostik client | `logs/transcriber.log` | Detail koneksi, chunk audio, VAD/preprocess, dan status WhisperLive. |
-| Process log client | `logs/process.log` | JSONL event per tahap: capture start, backend/device, chunk created, VAD pass/drop, queue, WebSocket, SERVER_READY, chunk sent, END_OF_AUDIO, transcript received. |
-| Process log server | `logs/whisperlive/process.log` | JSONL event dari container: client connected, options, audio received, buffer size, boundary wait/process, ASR start/end, local agreement, TVE score/pending/drop/emit, send to client. |
+| Mode                     | File default                            | Catatan                                                                                                                                                                                 |
+| ------------------------ | --------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Live CLI / UI            | `audio/transcript_log.json`             | JSON append-style. Entry `stability=candidate` adalah live hypothesis/review; entry `stability=stable` adalah hasil completed Local Agreement.                                          |
+| Live chunk archive debug | `audio/chunks/<session>/<source>/*.wav` | Hanya dibuat saat `--debug-chunk-archive` aktif. Default produksi tidak menulis ribuan file kecil.                                                                                      |
+| Batch phase 4            | `audio/transcript.phase4.json`          | Output lengkap mode `--transcribe`.                                                                                                                                                     |
+| Diagnostik client        | `logs/transcriber.log`                  | Detail koneksi, chunk audio, VAD/preprocess, dan status WhisperLive.                                                                                                                    |
+| Process log client       | `logs/process.log`                      | JSONL event per tahap: capture start, backend/device, chunk created, VAD pass/drop, queue, WebSocket, SERVER_READY, chunk sent, END_OF_AUDIO, transcript received.                      |
+| Process log server       | `logs/whisperlive/process.log`          | JSONL event dari container: client connected, options, audio received, buffer size, boundary wait/process, ASR start/end, local agreement, TVE score/pending/drop/emit, send to client. |
 
 Gunakan `--transcript-log audio\nama_file.json` untuk menyimpan live transcript
 ke file berbeda.
@@ -462,17 +461,17 @@ meminta model mengarang kata yang tidak terdengar. Ubah
 `WHISPERLIVE_INITIAL_PROMPT` dan `WHISPERLIVE_HOTWORDS` di `.env` jika glossary
 domain perlu ditambah.
 
-| Masalah | Tindakan |
-| --- | --- |
-| Suara terlalu kecil | Dekatkan mic, naikkan input gain Windows, atau gunakan headset. Noise yang dinormalisasi bisa ikut terdengar kuat oleh ASR. |
-| Banyak teks saat hening | Naikkan `--vad-threshold` ke `0.60`-`0.65` atau `--whisperlive-no-speech-thresh` ke `0.50`. |
-| Kata pendek terpotong | Turunkan `--vad-threshold` ke `0.50`. |
-| Tidak ada transcript tetapi chunk terkirim | Pastikan `--no-server-vad` aktif. Log `VAD filter removed ...` berarti VAD server membuang audio yang sudah dikirim client. |
-| Transcript terlambat keluar saat orang bicara panjang | Turunkan `--speech-boundary-max-wait-seconds` ke `3`-`4`. |
-| Potongan kalimat masih terlalu fragmental | Naikkan `--speech-boundary-silence-seconds` ke `1.0`-`1.2`. |
-| Semua transcript masuk `[Me]` | Pakai headset agar speaker meeting tidak bocor ke mic, atau jalankan `--source speaker` untuk isolasi suara meeting. |
-| Akurasi `small` kurang | Coba `medium` sebagai kompromi, lalu `large-v3-turbo` jika GPU cukup. |
-| Review keputusan penting | Simpan log JSON, cek `logs/transcriber.log`, dan verifikasi bagian ambigu dengan rekaman/sumber asli. |
+| Masalah                                               | Tindakan                                                                                                                    |
+| ----------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| Suara terlalu kecil                                   | Dekatkan mic, naikkan input gain Windows, atau gunakan headset. Noise yang dinormalisasi bisa ikut terdengar kuat oleh ASR. |
+| Banyak teks saat hening                               | Naikkan `--vad-threshold` ke `0.60`-`0.65` atau `--whisperlive-no-speech-thresh` ke `0.50`.                                 |
+| Kata pendek terpotong                                 | Turunkan `--vad-threshold` ke `0.50`.                                                                                       |
+| Tidak ada transcript tetapi chunk terkirim            | Pastikan `--no-server-vad` aktif. Log `VAD filter removed ...` berarti VAD server membuang audio yang sudah dikirim client. |
+| Transcript terlambat keluar saat orang bicara panjang | Turunkan `--speech-boundary-max-wait-seconds` ke `3`-`4`.                                                                   |
+| Potongan kalimat masih terlalu fragmental             | Naikkan `--speech-boundary-silence-seconds` ke `1.0`-`1.2`.                                                                 |
+| Semua transcript masuk `[Me]`                         | Pakai headset agar speaker meeting tidak bocor ke mic, atau jalankan `--source speaker` untuk isolasi suara meeting.        |
+| Akurasi `small` kurang                                | Coba `medium` sebagai kompromi, lalu `large-v3-turbo` jika GPU cukup.                                                       |
+| Review keputusan penting                              | Simpan log JSON, cek `logs/transcriber.log`, dan verifikasi bagian ambigu dengan rekaman/sumber asli.                       |
 
 LLM lokal cocok untuk post-processing ringan: merapikan tanda baca, kapitalisasi,
 dan membuat ringkasan dari transcript yang sudah ada. Jangan gunakan LLM lokal
@@ -485,21 +484,21 @@ dan risiko kebocoran data meeting.
 
 ## Performa & Ekspektasi
 
-| Profile | Model | Device | Catatan |
-| --- | --- | --- | --- |
-| Balanced | `small` | CPU/GPU | Default live/replay. Dipreload saat server start agar koneksi client cepat. |
-| Quality | `large-v3` | GPU | Akurasi lebih tinggi, resource lebih besar. |
-| Higher quality | `medium` / `large-v3-turbo` | GPU | Gunakan jika akurasi `small` kurang dan latency masih diterima. |
+| Profile        | Model                       | Device  | Catatan                                                                     |
+| -------------- | --------------------------- | ------- | --------------------------------------------------------------------------- |
+| Balanced       | `small`                     | CPU/GPU | Default live/replay. Dipreload saat server start agar koneksi client cepat. |
+| Quality        | `large-v3`                  | GPU     | Akurasi lebih tinggi, resource lebih besar.                                 |
+| Higher quality | `medium` / `large-v3-turbo` | GPU     | Gunakan jika akurasi `small` kurang dan latency masih diterima.             |
 
 Target awal:
 
-| Metrik | Target |
-| --- | ---: |
-| End-to-end latency | 2-5 detik |
-| Empty/silence transcript | mendekati 0 |
-| Low-reliability segment emitted | mendekati 0 |
-| Queue backlog | tidak terus naik |
-| Dropped frames | < 1% |
+| Metrik                          |           Target |
+| ------------------------------- | ---------------: |
+| End-to-end latency              |        2-5 detik |
+| Empty/silence transcript        |      mendekati 0 |
+| Low-reliability segment emitted |      mendekati 0 |
+| Queue backlog                   | tidak terus naik |
+| Dropped frames                  |             < 1% |
 
 ---
 
@@ -547,17 +546,18 @@ WhisperLive server
 
 ## Platform Backend
 
-| OS      | Backend capture speaker |
-|---------|------------------------|
+| OS      | Backend capture speaker       |
+| ------- | ----------------------------- |
 | Windows | WASAPI Loopback (`soundcard`) |
-| macOS   | ScreenCaptureKit |
-| Linux   | sounddevice (mic only) |
+| macOS   | ScreenCaptureKit              |
+| Linux   | sounddevice (mic only)        |
 
 ---
 
 ## Troubleshooting
 
 ### `couldn't find env file`
+
 Path `--env-file` selalu relatif terhadap folder tempat command dijalankan.
 
 ```powershell
@@ -576,6 +576,7 @@ Copy-Item .env.example .env
 ```
 
 ### `ModuleNotFoundError: No module named 'src'`
+
 Client harus dijalankan dari root project:
 
 ```powershell
@@ -586,6 +587,7 @@ uv run python -m src.main --live
 Jika terminal sedang berada di `D:\PLN\WhisperLive`, jalankan `cd ..` terlebih dahulu.
 
 ### `WhisperLive stream ... was not ready`
+
 Server sedang download/load model default saat startup atau GPU sedang warmup.
 Default client menunggu `300` detik. Untuk first run model besar, command ini
 lebih aman:
@@ -601,6 +603,7 @@ docker compose -f WhisperLive\docker-compose.yml logs --tail 80 whisperlive
 ```
 
 ### Live sudah aktif lalu muncul `Connection timed out`
+
 Jika banner live sudah tampil dan server log menunjukkan `Processing audio`, ini
 bukan timeout model. Artinya client tidak menerima transcript selama beberapa
 detik, biasanya karena audio diam atau VAD membuang chunk, lalu receiver lama
@@ -609,6 +612,7 @@ receive setelah handshake, jadi sesi tidak terputus saat server belum mengirim
 segment.
 
 ### Docker build `TLS handshake timeout`
+
 Ini masalah koneksi Docker ke Docker Hub saat menarik base image. Jika image
 lokal sudah pernah berhasil dibuat, jalankan tanpa `--no-cache`:
 
@@ -620,10 +624,12 @@ docker compose --env-file ..\.env up --build
 Jika tetap perlu rebuild bersih, ulangi saat koneksi Docker Hub stabil.
 
 ### `[SPEAKER] preprocess skipped: no speech chunk passed VAD`
+
 Ini **normal** jika tidak ada meeting atau audio yang sedang diputar saat recording.
 Saat online meeting aktif, suara peserta lain akan tertangkap secara otomatis.
 
 ### Client gagal connect ke server
+
 Pastikan server Docker sudah jalan dan port `9090` terbuka:
 
 ```powershell
@@ -632,6 +638,7 @@ docker compose -f WhisperLive\docker-compose.yml logs --tail 80 whisperlive
 ```
 
 ### Transkripsi tidak muncul / semua di-reject
+
 - Pastikan server sudah selesai load model.
 - Pastikan meeting/audio memang terdengar di perangkat output.
 - Pastikan bahasa sudah benar: `--whisper-language id`

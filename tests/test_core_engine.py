@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from src.ui.server import UiOptions, archive_transcript, audio_devices_payload, build_live_command, transcript_payload
+from src.core.engine import UiOptions, archive_transcript, audio_devices_payload, build_live_command, transcript_payload
 from src.utils.os_detector import AudioBackend
 
 
@@ -143,8 +143,8 @@ def test_archive_transcript_moves_existing_file(tmp_path: Path) -> None:
 
 
 def test_audio_devices_payload_marks_linux_speaker_as_deferred(monkeypatch) -> None:
-    monkeypatch.setattr("src.ui.server.get_audio_backend", lambda: AudioBackend.SOUNDDEVICE_INPUT)
-    monkeypatch.setattr("src.ui.server.list_input_devices", lambda include_system_aliases=False, concise=False: [])
+    monkeypatch.setattr("src.core.engine.get_audio_backend", lambda: AudioBackend.SOUNDDEVICE_INPUT)
+    monkeypatch.setattr("src.core.engine.list_input_devices", lambda include_system_aliases=False, concise=False: [])
 
     payload = audio_devices_payload()
 
