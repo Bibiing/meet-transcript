@@ -6,7 +6,7 @@ on:
       - main
       - master
     tags:
-      - 'v*' # Memicu build otomatis saat membuat tag versi baru, misal v1.0.0
+      - 'v*'
   pull_request:
     branches:
       - main
@@ -18,74 +18,122 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Melakukan build paralel untuk Windows (menghasilkan .exe) dan macOS (menghasilkan biner Unix/macOS)
-        os: [windows-latest, macos-latest]
+        include:
+          - os: windows-latest
+            artifact_name: MultiTranscriber-Windows.exe
+          - os: macos-latest
+            artifact_name: MultiTranscriber-Mac
 
     steps:
-    # 1. Checkout source code dari repositori Git
+    # ── 1. Checkout ──────────────────────────────────────────────
     - name: Checkout Code
       uses: actions/checkout@v4
 
-    # 2. Setup environment Python
+    # ── 2. Python ────────────────────────────────────────────────
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
         python-version: '3.11'
-        cache: 'pip' # Mempercepat build selanjutnya dengan caching pip dependencies
 
-    # 3. Install compiler C (hanya untuk macOS, Windows sudah terpasang MSVC/gcc secara default di GitHub Runner)
-    - name: Install macOS Compiler Tools
-      if: matrix.os == 'macos-latest'
-      run: |
-        xcode-select --install || true
+    # ── 3. Sistem Audio (PortAudio) ──────────────────────────────
+    # sounddevice membutuhkan library PortAudio di level OS.
+    # Di Windows, wheel sounddevice sudah membundel PortAudio DLL.
+    # Di macOS, perlu install via Homebrew.
+    - name: Install PortAudio (macOS)
+      if: runner.os == 'macOS'
+      run: brew install portaudio
 
-    # 4. Install UV (Modern package manager untuk Python)
-    - name: Install UV
+    # ── 4. Install UV ────────────────────────────────────────────
+    - name: Install UV (Unix)
+      if: runner.os != 'Windows'
       run: |
         curl -LsSf https://astral.sh/uv/install.sh | sh
         echo "$HOME/.local/bin" >> $GITHUB_PATH
 
-    # 5. Install seluruh dependensi proyek & compiler Nuitka
+    - name: Install UV (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        irm https://astral.sh/uv/install.ps1 | iex
+        Add-Content $env:GITHUB_PATH "$env:USERPROFILE\.local\bin"
+
+    # ── 5. Install Dependensi ────────────────────────────────────
+    # Install secara selektif TANPA openai-whisper dan numba.
+    # openai-whisper menarik PyTorch (~1.5GB) yang TIDAK dibutuhkan oleh
+    # qt_client — client hanya mengirim audio via WebSocket ke server.
+    # numba adalah transitive dep dari whisper, juga tidak dibutuhkan.
     - name: Install Dependencies
+      shell: bash
       run: |
-        uv pip install --system .
-        uv pip install --system nuitka ordered-set
+        pip install PyQt6 numpy sounddevice soundcard scipy websocket-client
+        pip install nuitka ordered-set
 
-    # 6. Kompilasi menggunakan Nuitka (Windows)
+    # ── 6. Build dengan Nuitka ───────────────────────────────────
+    # --assume-yes-for-downloads: Otomatis download MinGW C compiler jika belum ada
+    # --include-package=src: Pastikan semua modul src.* masuk ke bundle
+    # --nofollow-import-to: Exclude package berat yang tidak dibutuhkan runtime client
     - name: Build with Nuitka (Windows)
-      if: matrix.os == 'windows-latest'
+      if: runner.os == 'Windows'
+      shell: cmd
       run: |
-        uv run python -m nuitka --standalone --onefile --plugin-enable=pyqt6 --include-data-dir=src/icon=src/icon --windows-icon-from-ico=src/icon/app_logo.png --disable-console --remove-output src/qt_client.py
-        # Ganti nama biner agar mudah dikenali
-        mv qt_client.exe MultiTranscriber-Windows.exe
+        python -m nuitka ^
+          --standalone ^
+          --onefile ^
+          --plugin-enable=pyqt6 ^
+          --include-data-dir=src/icon=src/icon ^
+          --include-package=src ^
+          --nofollow-import-to=whisper,numba,torch,torchaudio ^
+          --disable-console ^
+          --remove-output ^
+          --assume-yes-for-downloads ^
+          src/qt_client.py
+        move qt_client.exe MultiTranscriber-Windows.exe
 
-    # 7. Kompilasi menggunakan Nuitka (macOS)
     - name: Build with Nuitka (macOS)
-      if: matrix.os == 'macos-latest'
+      if: runner.os == 'macOS'
       run: |
-        uv run python -m nuitka --standalone --onefile --plugin-enable=pyqt6 --include-data-dir=src/icon=src/icon --disable-console --remove-output src/qt_client.py
-        # Di mac, output Nuitka onefile berupa biner tunggal. Ganti nama biner agar mudah dikenali.
-        mv qt_client MultiTranscriber-Mac
+        python -m nuitka \
+          --standalone \
+          --onefile \
+          --plugin-enable=pyqt6 \
+          --include-data-dir=src/icon=src/icon \
+          --include-package=src \
+          --nofollow-import-to=whisper,numba,torch,torchaudio \
+          --disable-console \
+          --remove-output \
+          --assume-yes-for-downloads \
+          src/qt_client.py
+        mv qt_client.bin MultiTranscriber-Mac 2>/dev/null || mv qt_client MultiTranscriber-Mac
 
-    # 8. Upload hasil build sebagai Artifacts di GitHub Action Run (bisa diunduh langsung)
-    - name: Upload Artifacts
+    # ── 7. Upload Artifacts ──────────────────────────────────────
+    - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: MultiTranscriber-${{ matrix.os }}
-        path: |
-          MultiTranscriber-Windows.exe
-          MultiTranscriber-Mac
+        name: ${{ matrix.artifact_name }}
+        path: ${{ matrix.artifact_name }}
         if-no-files-found: error
 
-    # 9. Jika dipicu oleh push tag rilis (v1.0.0, dll), otomatis buat Draft Release dan upload biner ke halaman Release
-    - name: Create Release and Upload Assets
-      if: startsWith(github.ref, 'refs/tags/v')
+  # ── 8. Release (hanya saat push tag v*) ────────────────────────
+  release:
+    name: Create GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - name: Download all build artifacts
+      uses: actions/download-artifact@v4
+      with:
+        merge-multiple: true
+
+    - name: Create Draft Release
       uses: softprops/action-gh-release@v2
       with:
         files: |
           MultiTranscriber-Windows.exe
           MultiTranscriber-Mac
-        draft: true # Dibuat sebagai Draft agar Anda bisa menulis catatan rilis (changelog) terlebih dahulu
+        draft: true
         prerelease: false
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
