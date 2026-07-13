@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Optional
 import json
 
-from PyQt6 import QtCore, QtGui, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 
 from src.ui.server import (
     audio_devices_payload,
@@ -42,7 +42,18 @@ def load_icon(filename: str) -> QtGui.QIcon:
     Mengembalikan QIcon kosong (bukan crash) jika file tidak ditemukan,
     sehingga tombol tetap berfungsi dengan label teks meski ikon hilang.
     """
+    # 1. Cek di folder icon relatif terhadap file ini (Nuitka temp extraction dir)
     path = ICON_DIR / filename
+    
+    # 2. Fallback: cari di direktori tempat file executable berada
+    if not path.exists():
+        exe_dir = Path(sys.argv[0]).resolve().parent
+        path = exe_dir / "src" / "icon" / filename
+        
+    # 3. Fallback: cari di Current Working Directory (CWD)
+    if not path.exists():
+        path = Path("src") / "icon" / filename
+
     if not path.exists():
         return QtGui.QIcon()
     return QtGui.QIcon(str(path))

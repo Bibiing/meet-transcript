@@ -65,7 +65,7 @@ jobs:
     - name: Install Dependencies
       shell: bash
       run: |
-        pip install PyQt6 numpy sounddevice soundcard scipy websocket-client
+        pip install PySide6 numpy sounddevice soundcard scipy websocket-client
         pip install nuitka ordered-set
 
     # ── 6. Build dengan Nuitka ───────────────────────────────────
@@ -79,9 +79,11 @@ jobs:
         python -m nuitka ^
           --standalone ^
           --onefile ^
-          --plugin-enable=pyqt6 ^
+          --plugin-enable=pyside6 ^
           --include-data-dir=src/icon=src/icon ^
           --include-package=src ^
+          --include-package-data=sounddevice ^
+          --include-package-data=soundcard ^
           --nofollow-import-to=whisper,numba,torch,torchaudio ^
           --disable-console ^
           --remove-output ^
@@ -92,12 +94,26 @@ jobs:
     - name: Build with Nuitka (macOS)
       if: runner.os == 'macOS'
       run: |
+        # Cari dan salin libportaudio.dylib lokal agar bisa ikut di-bundle
+        PORTAUDIO_PATH=$(find /opt/homebrew /usr/local -name "libportaudio.dylib" 2>/dev/null | head -n 1)
+        EXTRA_ARGS=""
+        if [ -n "$PORTAUDIO_PATH" ]; then
+          echo "Found libportaudio.dylib at $PORTAUDIO_PATH, copying for bundling..."
+          cp "$PORTAUDIO_PATH" ./libportaudio.dylib
+          EXTRA_ARGS="--include-data-file=libportaudio.dylib=libportaudio.dylib"
+        else
+          echo "WARNING: libportaudio.dylib not found!"
+        fi
+
         python -m nuitka \
           --standalone \
           --onefile \
-          --plugin-enable=pyqt6 \
+          --plugin-enable=pyside6 \
           --include-data-dir=src/icon=src/icon \
           --include-package=src \
+          $EXTRA_ARGS \
+          --include-package-data=sounddevice \
+          --include-package-data=soundcard \
           --nofollow-import-to=whisper,numba,torch,torchaudio \
           --disable-console \
           --remove-output \
