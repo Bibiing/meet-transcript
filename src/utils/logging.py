@@ -347,6 +347,19 @@ def _safe_value(value: Any) -> Any:
             return value[:_TEXT_LIMIT] + "...[truncated]"
         return value
     # Jika nilai adalah Path, ubah menjadi string.
+
+# karena dapat menerima tipe data apa saja, fungsi ini untuk mengubah nilai arbitrary (nilai yang bisa berupa tipe data apa saja, termasuk tipe data yang tidak bisa langsung di-serialize ke JSON, seperti objek custom, Path, atau float NaN/Infinity.) menjadi bentuk JSON-safe dan batasi teks panjang.
+def _safe_value(value: Any) -> Any:
+    # Jika nilai adalah float dan tidak finite (NaN, Infinity, -Infinity), ubah menjadi string.
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
+    # Jika nilai adalah None, bool, int, float, atau str, kembalikan nilai tersebut.
+    if value is None or isinstance(value, (bool, int, float, str)):
+        # Jika nilai adalah string dan panjangnya melebihi batas, potong dan tambahkan indikator truncation.
+        if isinstance(value, str) and len(value) > _TEXT_LIMIT:
+            return value[:_TEXT_LIMIT] + "...[truncated]"
+        return value
+    # Jika nilai adalah Path, ubah menjadi string.
     if isinstance(value, Path):
         return str(value)
     # Jika nilai adalah dict, ubah setiap key menjadi string dan rekursif memanggil _safe_value untuk setiap item.
@@ -384,6 +397,7 @@ class TranscriptLog:
         stability: str | None = None,
         reliability_score: float | None = None,
         reliability_action: str | None = None,
+        client_reliability_score: float | None = None,
     ) -> dict[str, object]:
         line = result_to_line(result) # ubah result menjadi TranscriptLine untuk memformat display
         
@@ -412,6 +426,9 @@ class TranscriptLog:
             entry["reliability_score"] = reliability_score
         if reliability_action is not None:
             entry["reliability_action"] = reliability_action
+        # skor gabungan sisi klien (multi-sinyal: server score + token-rate + repetition)
+        if client_reliability_score is not None:
+            entry["client_reliability_score"] = client_reliability_score
 
         self.entries.append(entry)
         self._append_line(entry)

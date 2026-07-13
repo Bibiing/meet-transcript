@@ -22,6 +22,60 @@ LogCallback = Callable[[str], None]
 MergedEntryCallback = Callable[["MergedTranscriptEntry"], None]
 
 
+def _compute_client_reliability(event: "WhisperLiveTranscriptEvent") -> float:
+    """Hitung reliability score sisi klien yang lebih kaya dari sekadar meneruskan skor server.
+
+    Menggabungkan tiga sinyal:
+    1. Skor server (bobot 60%) — angka yang dikirim WhisperLive server.
+    2. Token-per-second check (bobot 20%) — terlalu banyak atau terlalu sedikit
+       mengindikasikan hallucination atau audio terlalu singkat.
+    3. Repetition ratio (bobot 20%) — teks yang sangat repetitif menandakan
+       hallucination (misalnya "ha ha ha" atau "bertanggatan bertanggatan").
+
+    Nilai antara 0.0 (buruk) dan 1.0 (baik).
+    """
+    server_score: float = event.reliability_score if event.reliability_score is not None else 0.7
+    text = event.result.text.strip()
+    duration = max(event.result.duration_seconds, 0.01)
+
+    # --- Sinyal 2: token-per-second ---
+    tokens = text.split()
+    token_count = len(tokens)
+    tps = token_count / duration  # token per detik
+
+    # Rentang wajar: 1–6 token/detik untuk bahasa Indonesia
+    if tps < 0.5 or tps > 10.0:
+        tps_score = 0.3
+    elif tps < 1.0 or tps > 7.0:
+        tps_score = 0.65
+    else:
+        tps_score = 1.0
+
+    # --- Sinyal 3: repetition ratio ---
+    rep_score = 1.0
+    if token_count >= 4:
+        unique_tokens = len(set(t.lower() for t in tokens))
+        repetition_ratio = 1.0 - (unique_tokens / token_count)
+        # repetisi > 40% = kemungkinan hallucination
+        if repetition_ratio > 0.6:
+            rep_score = 0.2
+        elif repetition_ratio > 0.4:
+            rep_score = 0.5
+        elif repetition_ratio > 0.25:
+            rep_score = 0.75
+
+    # Cek bigram repetition (frasa yang sama berulang)
+    if token_count >= 6:
+        bigrams = [f"{tokens[i]} {tokens[i+1]}" for i in range(len(tokens) - 1)]
+        unique_bigrams = len(set(b.lower() for b in bigrams))
+        bigram_rep = 1.0 - (unique_bigrams / len(bigrams))
+        if bigram_rep > 0.5:
+            rep_score = min(rep_score, 0.3)
+
+    combined = (server_score * 0.60) + (tps_score * 0.20) + (rep_score * 0.20)
+    return round(max(0.0, min(1.0, combined)), 4)
+
+
 class _ChunkArchive:
     """Menyimpan setiap chunk audio ke dalam file WAV untuk debugging."""
     def __init__(self, root_dir: Path) -> None:

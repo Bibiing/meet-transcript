@@ -50,9 +50,10 @@ def load_icon(filename: str) -> QtGui.QIcon:
 
 
 class SettingsDialog(QtWidgets.QDialog):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, options: Optional[UiOptions] = None):
         super().__init__(parent)
         self.setWindowTitle("Settings")
+        self.setWindowIcon(load_icon("apps.png"))
         self.setModal(True)
         self.resize(520, 320)
         self.setSizeGripEnabled(True)  # Memudahkan pengguna memperbesar dialog bila daftar Advanced panjang
@@ -227,6 +228,9 @@ class SettingsDialog(QtWidgets.QDialog):
         self.setLayout(main)
 
         self.reload_devices()
+        
+        if options:
+            self.load_options(options)
 
     def reload_devices(self):
         try:
@@ -241,17 +245,65 @@ class SettingsDialog(QtWidgets.QDialog):
             # best-effort; ignore errors
             pass
 
+    def load_options(self, opts: UiOptions):
+        self.host_input.setText(opts.host)
+        self.port_input.setValue(opts.port)
+        
+        # Set mic/speaker based on data ID if present
+        if opts.mic_device is not None:
+            idx = self.mic_select.findData(opts.mic_device)
+            if idx >= 0:
+                self.mic_select.setCurrentIndex(idx)
+        if opts.speaker_device is not None:
+            idx = self.spk_select.findData(opts.speaker_device)
+            if idx >= 0:
+                self.spk_select.setCurrentIndex(idx)
+                
+        idx = self.lang_select.findText(opts.language)
+        if idx >= 0:
+            self.lang_select.setCurrentIndex(idx)
+            
+        idx = self.model_select.findText(opts.model)
+        if idx >= 0:
+            self.model_select.setCurrentIndex(idx)
+            
+        self.mic_server_vad_cb.setChecked(opts.mic_server_vad)
+        self.speaker_server_vad_cb.setChecked(opts.speaker_server_vad)
+        self.mic_target_rms.setValue(opts.mic_target_rms_db)
+        self.mic_max_gain.setValue(opts.mic_max_normalization_gain_db)
+        self.spk_target_rms.setValue(opts.speaker_target_rms_db)
+        self.spk_max_gain.setValue(opts.speaker_max_normalization_gain_db)
+        self.vad_threshold.setValue(opts.vad_threshold)
+        self.no_speech_thresh.setValue(opts.no_speech_thresh)
+        self.speech_boundary_silence.setValue(opts.speech_boundary_silence_seconds)
+        self.speech_boundary_max_wait.setValue(opts.speech_boundary_max_wait_seconds)
+        self.debug_chunk_archive_cb.setChecked(opts.debug_chunk_archive)
+        self.rolling_audio_archive_cb.setChecked(opts.rolling_audio_archive)
+        self.rolling_audio_segment.setValue(int(opts.rolling_audio_segment_seconds))
+
     def to_options(self) -> UiOptions:
         opts = UiOptions()
         opts.host = self.host_input.text().strip() or "localhost"
         opts.port = int(self.port_input.value())
-        mic = self.mic_select.currentData()
-        spk = self.spk_select.currentData()
-        opts.mic_device = mic
-        opts.speaker_device = spk
+        opts.mic_device = self.mic_select.currentData()
+        opts.speaker_device = self.spk_select.currentData()
         opts.language = str(self.lang_select.currentText())
-        # model & LLM key
         opts.model = str(self.model_select.currentText())
+        
+        opts.mic_server_vad = self.mic_server_vad_cb.isChecked()
+        opts.speaker_server_vad = self.speaker_server_vad_cb.isChecked()
+        opts.mic_target_rms_db = self.mic_target_rms.value()
+        opts.mic_max_normalization_gain_db = self.mic_max_gain.value()
+        opts.speaker_target_rms_db = self.spk_target_rms.value()
+        opts.speaker_max_normalization_gain_db = self.spk_max_gain.value()
+        opts.vad_threshold = self.vad_threshold.value()
+        opts.no_speech_thresh = self.no_speech_thresh.value()
+        opts.speech_boundary_silence_seconds = self.speech_boundary_silence.value()
+        opts.speech_boundary_max_wait_seconds = self.speech_boundary_max_wait.value()
+        opts.debug_chunk_archive = self.debug_chunk_archive_cb.isChecked()
+        opts.rolling_audio_archive = self.rolling_audio_archive_cb.isChecked()
+        opts.rolling_audio_segment_seconds = float(self.rolling_audio_segment.value())
+        
         return opts
 
 
@@ -259,6 +311,7 @@ class SummaryWindow(QtWidgets.QDialog):
     def __init__(self, transcript: dict, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Transcript Summary")
+        self.setWindowIcon(load_icon("apps.png"))
         self.resize(700, 500)
         layout = QtWidgets.QVBoxLayout()
         self.text = QtWidgets.QPlainTextEdit()
@@ -287,6 +340,7 @@ class CompactWidget(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("PLN Meeting Transcriber")
+        self.setWindowIcon(load_icon("apps.png"))
         self.setWindowFlags(QtCore.Qt.WindowType.WindowStaysOnTopHint)
         self.setMinimumSize(600, 300) # Tinggi ditambah sedikit untuk menampung bottom bar
         self.recording = False
@@ -466,6 +520,12 @@ class CompactWidget(QtWidgets.QWidget):
         self._apply_shadow(self.export_btn)
         self._apply_shadow(self.settings_btn)
         
+        # Status badge: menampilkan jumlah stable dan candidate
+        # self.stability_label = QtWidgets.QLabel("✓ 0 stable  ~ 0 candidate")
+        # self.stability_label.setObjectName("StabilityBadge")
+        # self.stability_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignVCenter | QtCore.Qt.AlignmentFlag.AlignRight)
+        # self.stability_label.setToolTip("Jumlah segmen transkripsi: ✓ final (stable) vs ~ hipotesis (candidate)")
+
         # layout bawah
         bottom_layout.addWidget(self.history_btn)
         bottom_layout.addWidget(self.resume_btn)
@@ -694,7 +754,13 @@ class CompactWidget(QtWidgets.QWidget):
         """)
 
     def open_settings(self):
-        dlg = SettingsDialog(self)
+        opts = self.current_options or UiOptions()
+        dlg = SettingsDialog(self, options=opts)
+        
+        # Populate the LLM API key field if previously set
+        if getattr(self, 'llm_api_key', None):
+            dlg.llm_api_key.setText(self.llm_api_key)
+            
         if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
             self.current_options = dlg.to_options()
             try:
@@ -704,11 +770,6 @@ class CompactWidget(QtWidgets.QWidget):
             
             self.llm_api_key = dlg.llm_api_key.text().strip() or None
             self.resume_btn.setEnabled(bool(self.llm_api_key))
-
-            try:
-                self.current_options.model = str(dlg.model_select.currentText())
-            except Exception:
-                pass
 
     def toggle_record(self, checked: bool):
         if checked:
@@ -860,33 +921,50 @@ class CompactWidget(QtWidgets.QWidget):
         try:
             data = transcript_payload()
             entries = data.get("entries", [])
-            last = entries[-4:]
-            display_html = [] # Kita gunakan list penyimpan format HTML
+
+            # Hitung jumlah stable dan candidate dari audit_entries (semua entri)
+            audit_entries = data.get("audit_entries", entries)
+            stable_count = sum(1 for e in audit_entries if str(e.get("stability") or "") == "stable")
+            candidate_count = sum(1 for e in audit_entries if str(e.get("stability") or "") == "candidate")
             
-            for e in last:
+            display_html = []
+            
+            for e in entries:
                 stability = e.get("stability") or ("stable" if e.get("completed", True) else "candidate")
                 text = e.get("text", "")
                 source = str(e.get("source") or "other")
+                client_score = e.get("client_reliability_score")
                 
-                # Format label dengan Bold dan Warna berbeda
+                # Format label dengan Bold dan Warna berbeda per source
                 if source == "mic":
-                    # Warna Biru untuk Mic (Me)
                     label_html = '<b style="color: #2563EB;">[Me]</b>'
                 elif source == "speaker":
-                    # Warna Hijau untuk Speaker
                     label_html = '<b style="color: #059669;">[Speaker]</b>'
                 else:
-                    # Warna Abu-abu jika sumber tidak diketahui
                     label_html = f'<b style="color: #64748B;">[{source}]</b>'
 
-                # Menyusun baris transkrip
-                if stability == "stable":
-                    display_html.append(f"{label_html} {text}")
-                else:
-                    display_html.append(f"{label_html} {text} <i style='color: #94A3B8;'>(candidate)</i>")
-            
-            # Gunakan setHtml dan gabungkan list menggunakan tag <br> untuk baris baru
+                # Menyusun baris transkrip (revert to stable rendering for clean production UI)
+                display_html.append(f"{label_html} {text}")
+
+            # Amankan posisi scroll jika pengguna sedang scroll ke atas
+            scrollbar = self.preview.verticalScrollBar()
+            was_at_bottom = scrollbar.value() >= scrollbar.maximum() - 10 if scrollbar else True
+
+            # Render HTML
             self.preview.setHtml("<br>".join(display_html))
+            
+            if was_at_bottom and scrollbar:
+                scrollbar.setValue(scrollbar.maximum())
+
+            # Update badge stable/candidate (commented out)
+            # badge_text = f"✓ {stable_count} stable  ~ {candidate_count} candidate"
+            # self.stability_label.setText(badge_text)
+            # if stable_count == 0 and candidate_count == 0:
+            #     self.stability_label.setStyleSheet("color: #94A3B8; font-size: 11px;")
+            # elif candidate_count > stable_count * 2:
+            #     self.stability_label.setStyleSheet("color: #F59E0B; font-size: 11px; font-weight: bold;")
+            # else:
+            #     self.stability_label.setStyleSheet("color: #059669; font-size: 11px;")
 
             # VU meters logic (Tetap sama seperti sebelumnya)
             quality = data.get("quality", {})
@@ -933,6 +1011,17 @@ def main():
         )
 
     app = QtWidgets.QApplication(sys.argv)
+
+    # Menetapkan ikon aplikasi secara global agar muncul di Taskbar & semua Window
+    app_icon = load_icon("apps.png")
+    app.setWindowIcon(app_icon)
+
+    # Khusus Windows: Supaya taskbar Windows tidak mengelompokkan aplikasi ke dalam grup generic 'Python'
+    # dan menampilkan logo custom kita secara konsisten pada taskbar.
+    if sys.platform == "win32":
+        import ctypes
+        myappid = "pln.meeting.transcriber.client.1.0"
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
 
     # Paksa skema warna TERANG secara eksplisit. Sejak Qt 6.5, Qt secara otomatis
     # mengikuti tema gelap/terang sistem operasi (mis. dark mode Windows) untuk

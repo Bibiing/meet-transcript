@@ -10,6 +10,63 @@ from pathlib import Path
 from time import monotonic, perf_counter
 from typing import Literal
 
+
+def _text_similarity(a: str, b: str) -> float:
+    """Hitung kemiripan dua string secara cepat menggunakan bigram Jaccard.
+
+    Dipilih karena O(n) dan tidak memerlukan dependensi eksternal.
+    Nilai 1.0 = identik, 0.0 = tidak ada bigram yang sama.
+    """
+    def _bigrams(s: str) -> set[str]:
+        s = " ".join(s.lower().split())
+        return {s[i:i + 2] for i in range(len(s) - 1)} if len(s) >= 2 else set()
+
+    ba, bb = _bigrams(a), _bigrams(b)
+    if not ba and not bb:
+        return 1.0
+    if not ba or not bb:
+        return 0.0
+    return len(ba & bb) / len(ba | bb)
+
+
+@dataclass
+class _CandidateDeduplicator:
+    """De-duplikasi kandidat transcript berdasarkan kemiripan teks.
+
+    Menggantikan time-bucket dedup lama yang menghasilkan banyak
+    duplikat saat sliding-window bergeser sedikit demi sedikit.
+
+    Kandidat baru hanya disimpan jika kemiripannya dengan kandidat
+    terakhir dari source yang sama (dalam window waktu tertentu) di
+    bawah ambang ``similarity_threshold``.
+    """
+
+    similarity_threshold: float = 0.85
+    window_seconds: float = 15.0
+    max_cache: int = 2_000
+
+    # per-source: list of (timestamp, normalized_text)
+    _recent: dict[str, deque[tuple[float, str]]] = field(default_factory=dict)
+
+    def is_duplicate(self, source: str, text: str, now: float) -> bool:
+        """Kembalikan True jika teks ini terlalu mirip dengan kandidat yang sudah tersimpan."""
+        normalized = " ".join(text.lower().split())[:200]
+        bucket = self._recent.setdefault(source, deque())
+
+        # hapus entri yang sudah di luar window waktu
+        while bucket and (now - bucket[0][0]) > self.window_seconds:
+            bucket.popleft()
+
+        for _, prev_text in bucket:
+            if _text_similarity(normalized, prev_text) >= self.similarity_threshold:
+                return True
+
+        bucket.append((now, normalized))
+        # batasi ukuran cache agar tidak tumbuh tanpa batas
+        while len(bucket) > self.max_cache:
+            bucket.popleft()
+        return False
+
 from src.preprocessing.core import PreprocessedAudioChunk
 from src.whisper.merger import MEETING_SOURCE_LABELS, TranscriptMerger
 from src.whisper.client_base import (
@@ -43,6 +100,7 @@ from src.whisper.session_utils import (
     _events_from_segments,
     _emit_merged_entry,
     _format_timestamp,
+    _compute_client_reliability,
 )
 
 _log = logging.getLogger(__name__)
@@ -123,8 +181,7 @@ def run_whisperlive_session(
     transcript_merger = TranscriptMerger(max_emitted_keys=cfg.merger_emitted_cache_max_entries)
     transcript_lock = threading.Lock()
     
-    candidate_transcript_keys: set[tuple[str, int, str]] = set()
-    candidate_transcript_order: deque[tuple[str, int, str]] = deque()
+    candidate_deduplicator = _CandidateDeduplicator(max_cache=cfg.candidate_cache_max_entries)
     active_sources = _requested_sources(cfg.source) # mengambil source yang aktif (mic, speaker, atau keduanya)
     partial_preview = _PartialTranscriptPreview() if cfg.show_partials else None
     chunk_archive = _ChunkArchive(cfg.chunk_archive_dir) if cfg.chunk_archive_dir is not None else None
@@ -203,15 +260,7 @@ def run_whisperlive_session(
         resume_transcript_log=cfg.resume_transcript_log,
     )
 
-    def _remember_candidate_key(key: tuple[str, int, str]) -> bool:
-        if key in candidate_transcript_keys:
-            return False
-        candidate_transcript_keys.add(key)
-        candidate_transcript_order.append(key)
-        while len(candidate_transcript_order) > max(1, cfg.candidate_cache_max_entries):
-            oldest = candidate_transcript_order.popleft()
-            candidate_transcript_keys.discard(oldest)
-        return True
+    # _remember_candidate_key digantikan oleh _CandidateDeduplicator di atas
 
     def handle_status(source: str, message: dict) -> None:
         # Status WebSocket dipisah dari transcript supaya UI bisa menampilkan
@@ -341,14 +390,15 @@ def run_whisperlive_session(
         for event in _events_from_segments(source, cfg.profile.model, cfg.profile.language, segments):
             quality_tracker.observe_event(event)
             if not event.completed and transcript_log is not None and event.result.text.strip():
-                # Candidate disimpan sekali per window agar transcript audit
-                # tidak kosong ketika TVE menahan hasil sebagai belum final.
-                candidate_key = (
-                    event.result.source,
-                    int(event.result.start_seconds // 3),
-                    " ".join(event.result.text.lower().split())[:180],
-                )
-                if _remember_candidate_key(candidate_key):
+                # Kandidat disimpan hanya jika teksnya cukup berbeda dari kandidat
+                # sebelumnya (kemiripan bigram Jaccard < similarity_threshold).
+                # Ini menggantikan time-bucket lama yang menyebabkan duplikat masif
+                # saat sliding-window bergeser sedikit-sedikit.
+                now = perf_counter()
+                if not candidate_deduplicator.is_duplicate(
+                    event.result.source, event.result.text, now
+                ):
+                    client_score = _compute_client_reliability(event)
                     label = MEETING_SOURCE_LABELS.get(event.result.source, event.result.source.upper())
                     display = (
                         f"[{_format_timestamp(event.result.start_seconds)} - "
@@ -363,11 +413,13 @@ def run_whisperlive_session(
                         stability="candidate",
                         reliability_score=event.reliability_score,
                         reliability_action=event.reliability_action,
+                        client_reliability_score=client_score,
                     )
                     log_process_event(
                         "client.candidate_saved",
                         source=source,
                         score=event.reliability_score,
+                        client_score=client_score,
                         action=event.reliability_action,
                         start_seconds=round(event.result.start_seconds, 3),
                         end_seconds=round(event.result.end_seconds, 3),
