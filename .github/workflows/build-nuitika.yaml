@@ -82,10 +82,10 @@ jobs:
           --plugin-enable=pyside6 ^
           --include-data-dir=src/icon=src/icon ^
           --include-package=src ^
-          --include-package-data=sounddevice ^
-          --include-package-data=soundcard ^
+          --include-module=sounddevice ^
+          --include-module=soundcard ^
           --nofollow-import-to=whisper,numba,torch,torchaudio ^
-          --disable-console ^
+          --windows-console-mode=disable ^
           --remove-output ^
           --assume-yes-for-downloads ^
           src/qt_client.py
@@ -112,10 +112,9 @@ jobs:
           --include-data-dir=src/icon=src/icon \
           --include-package=src \
           $EXTRA_ARGS \
-          --include-package-data=sounddevice \
-          --include-package-data=soundcard \
+          --include-module=sounddevice \
+          --include-module=soundcard \
           --nofollow-import-to=whisper,numba,torch,torchaudio \
-          --disable-console \
           --remove-output \
           --assume-yes-for-downloads \
           src/qt_client.py
