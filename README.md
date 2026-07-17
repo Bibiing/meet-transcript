@@ -97,9 +97,10 @@ Lalu jalankan:
 docker compose --env-file .env -f WhisperLive/docker-compose.cpu.yml up -d --build
 ```
 
-Jika VM CPU kecil dan model `small` terlalu lambat, gunakan
-`WHISPERLIVE_DEFAULT_MODEL=base`. Detail Azure VM CPU/GPU ada di
-`docs/PLAN.md`.
+Default proyek adalah `medium` (GPU). Untuk deployment **CPU**, `medium` tidak
+realistis untuk real-time — turunkan secara sengaja ke `small` (contoh di atas),
+atau `base` bila VM CPU kecil masih terlalu lambat. Detail Azure VM CPU/GPU ada
+di `docs/PLAN.md`.
 
 Default server:
 
@@ -162,6 +163,27 @@ uv run python -m src.main --live --vad-threshold 0.50
 
 Tekan **Ctrl+C** untuk menghentikan sesi.
 
+#### Client-Side VAD (admission control, opsional)
+
+Client-Side VAD menyaring audio hening di sisi klien sebelum dikirim ke server
+(mengurangi beban decoding server, ADR-001). **Default OFF** — perilaku default
+mengirim seluruh audio. Aktifkan lewat `.env` atau CLI:
+
+```powershell
+# Aktifkan via CLI
+uv run python -m src.main --live --client-vad
+
+# Atau via .env (kill-switch operasional tanpa rebuild)
+# PLN_CLIENT_VAD_ENABLED=1
+# PLN_CLIENT_VAD_THRESHOLD=0.5        # ambang probabilitas ucapan (default 0.5)
+# PLN_CLIENT_VAD_HANGOVER_CHUNKS=2    # tahan aktif setelah ucapan berhenti (~1s @ chunk 0.5s)
+```
+
+Catatan:
+- Membutuhkan `onnxruntime` (terpasang oleh `uv sync`) dan model `src/assets/silero_vad.onnx`. Bila salah satu tidak ada, VAD otomatis *passthrough* (nonaktif, tidak crash).
+- Jumlah chunk yang dibuang tampil sebagai `VAD-drop` pada ringkasan akhir sesi.
+- Jika kata pendek terpotong, naikkan `PLN_CLIENT_VAD_HANGOVER_CHUNKS` ke `3` atau turunkan `PLN_CLIENT_VAD_THRESHOLD` ke `0.4`.
+
 Untuk deployment server di Azure VM, lihat bagian **Deployment Azure VM** di
 `docs/PLAN.md`. Ringkasnya: jalankan Docker Compose di VM, pastikan port `9090`
 terbuka di Azure NSG dan firewall OS, lalu arahkan client lokal ke
@@ -196,7 +218,7 @@ cd D:\PLN
 uv run python -m src.main --replay-file audio\sample.wav --replay-source mic
 ```
 
-Saat server Docker start, Faster-Whisper model default `small` di-preload dalam
+Saat server Docker start, Faster-Whisper model default `medium` di-preload dalam
 shared single-model mode. First run tetap bisa perlu beberapa menit untuk
 download model ke volume cache, tetapi setelah server healthy client tidak perlu
 menunggu load model per koneksi. Jika replay timeout saat menunggu `SERVER_READY`,
@@ -270,7 +292,7 @@ Menghasilkan `audio/mic.preprocessed.wav` dan `audio/speaker.preprocessed.wav`
 uv run python -m src.main --transcribe
 ```
 
-Hasil disimpan di `audio/transcript.phase4.json` dan ditampilkan di terminal.
+Hasil disimpan di `audio/transcript.json` dan ditampilkan di terminal.
 
 ### Batch Sekaligus
 
@@ -330,7 +352,7 @@ terpisah.
 | `--server-wss`                                                   | off                          | Gunakan `wss://`.                                                                                                                                                                   |
 | `--server-api-key`                                               | kosong                       | API key jika server memakai auth.                                                                                                                                                   |
 | `--server-ready-timeout`                                         | `300`                        | Batas tunggu client sampai server mengirim `SERVER_READY`. Naikkan pada first run/model warmup.                                                                                     |
-| `--whisper-model`                                                | `small` untuk live/replay    | Model Faster-Whisper. Hindari model `.en` untuk meeting Indonesia-Inggris.                                                                                                          |
+| `--whisper-model`                                                | `medium` untuk live/replay   | Model Faster-Whisper (default proyek; butuh GPU untuk real-time — turunkan ke `small`/`base` pada CPU). Hindari model `.en` untuk meeting Indonesia-Inggris.                        |
 | `--whisper-language`                                             | `id`                         | Bahasa utama meeting.                                                                                                                                                               |
 | `--vad-threshold`                                                | `0.55`                       | VAD server. Naikkan jika silence masih menghasilkan teks, turunkan jika kata pendek terpotong.                                                                                      |
 | `--server-vad` / `--no-server-vad`                               | off                          | VAD Faster-Whisper di server. Default off karena audio sudah dipreprocess/VAD di client dan transcript final lebih penting dari caption realtime.                                   |
@@ -364,7 +386,7 @@ terpisah.
 | `--whisper-min-logprob`                | `-1.0`                         | Quality gate lokal.                                      |
 | `--whisper-max-no-speech`              | `0.60`                         | Quality gate lokal.                                      |
 | `--whisper-max-compression`            | `2.2`                          | Quality gate lokal.                                      |
-| `--transcript-output`                  | `audio/transcript.phase4.json` | File JSON output batch lokal.                            |
+| `--transcript-output`                  | `audio/transcript.json` | File JSON output batch lokal.                            |
 
 ### Parameter logging & backup
 
@@ -381,7 +403,7 @@ terpisah.
 | ------------------------ | --------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Live CLI / UI            | `audio/transcript_log.json`             | JSON append-style. Entry `stability=candidate` adalah live hypothesis/review; entry `stability=stable` adalah hasil completed Local Agreement.                                          |
 | Live chunk archive debug | `audio/chunks/<session>/<source>/*.wav` | Hanya dibuat saat `--debug-chunk-archive` aktif. Default produksi tidak menulis ribuan file kecil.                                                                                      |
-| Batch phase 4            | `audio/transcript.phase4.json`          | Output lengkap mode `--transcribe`.                                                                                                                                                     |
+| Batch            | `audio/transcript.json`          | Output lengkap mode `--transcribe`.                                                                                                                                                     |
 | Diagnostik client        | `logs/transcriber.log`                  | Detail koneksi, chunk audio, VAD/preprocess, dan status WhisperLive.                                                                                                                    |
 | Process log client       | `logs/process.log`                      | JSONL event per tahap: capture start, backend/device, chunk created, VAD pass/drop, queue, WebSocket, SERVER_READY, chunk sent, END_OF_AUDIO, transcript received.                      |
 | Process log server       | `logs/whisperlive/process.log`          | JSONL event dari container: client connected, options, audio received, buffer size, boundary wait/process, ASR start/end, local agreement, TVE score/pending/drop/emit, send to client. |
@@ -436,7 +458,7 @@ lebih stabil baru dikirim.
 
 Flow produksi yang disarankan:
 
-1. Server start lebih dulu dan preload `WHISPERLIVE_DEFAULT_MODEL=small`.
+1. Server start lebih dulu dan preload `WHISPERLIVE_DEFAULT_MODEL=medium`.
 2. Client start hanya setelah handshake `SERVER_READY`, lalu mulai capture mic
    dan speaker sebagai dua WebSocket stream terpisah.
 3. Client menyimpan live transcript final yang sudah stabil ke
@@ -539,7 +561,7 @@ WhisperLive server
 ```
 --record     → mic.wav + speaker.wav
 --preprocess → mic.preprocessed.wav + speaker.preprocessed.wav (VAD + normalisasi)
---transcribe → transcript.phase4.json + terminal output
+--transcribe → transcript.json + terminal output
 ```
 
 ---

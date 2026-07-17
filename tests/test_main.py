@@ -4,7 +4,23 @@ from pathlib import Path
 
 from src.capture.recorder import CaptureResult
 from src.preprocessing.file_processing import PreprocessResult
-from src.main import main
+from src.main import main, parse_args
+
+
+def test_client_vad_args_default_off() -> None:
+    args = parse_args(["--mode", "live"])
+    assert args.client_vad is False
+    assert args.client_vad_threshold == 0.5
+    assert args.client_vad_hangover_chunks == 2
+
+
+def test_client_vad_args_override() -> None:
+    args = parse_args(
+        ["--mode", "live", "--client-vad", "--client-vad-threshold", "0.7", "--client-vad-hangover-chunks", "3"]
+    )
+    assert args.client_vad is True
+    assert args.client_vad_threshold == 0.7
+    assert args.client_vad_hangover_chunks == 3
 
 
 def test_main_status_run(capsys) -> None:
@@ -73,7 +89,7 @@ def test_main_preprocess_mode_prints_results(monkeypatch, capsys) -> None:
     assert "[MIC] preprocessed=" in output
 
 
-def test_main_preprocess_prints_vad_drop_as_skip(monkeypatch, capsys) -> None:
+def test_main_preprocess_prints_warning_for_skipped_result(monkeypatch, capsys) -> None:
     def fake_preprocess_audio_dir(input_dir, output_dir):
         return [
             PreprocessResult(
@@ -82,7 +98,7 @@ def test_main_preprocess_prints_vad_drop_as_skip(monkeypatch, capsys) -> None:
                 output_path=None,
                 chunk_count=0,
                 duration_seconds=0.0,
-                warning="no speech chunk passed VAD",
+                warning="no chunk produced by preprocessing",
             )
         ]
 
@@ -92,7 +108,7 @@ def test_main_preprocess_prints_vad_drop_as_skip(monkeypatch, capsys) -> None:
 
     output = capsys.readouterr().out
     assert exit_code == 2
-    assert "[SPEAKER] preprocess skipped: no speech chunk passed VAD" in output
+    assert "[SPEAKER] preprocess warning: no chunk produced by preprocessing" in output
 
 
 def test_main_replay_file_mode_uses_replay_config(monkeypatch, capsys, tmp_path: Path) -> None:

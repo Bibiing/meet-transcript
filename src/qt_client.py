@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 import threading
 import time
@@ -11,9 +12,13 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from src.core.engine import (
     audio_devices_payload,
+    audio_levels,
+    connection_status,
+    set_mute,
     start_live,
     stop_live,
     transcript_payload,
+    DEFAULT_TRANSCRIPT_LOG,
     UiOptions,
 )
 from src.utils.mode_detector import is_production_build, should_enable_debug_features
@@ -123,6 +128,8 @@ class SettingsDialog(QtWidgets.QDialog):
         self.mic_server_vad_cb.setChecked(True)
         self.speaker_server_vad_cb = QtWidgets.QCheckBox()
         self.speaker_server_vad_cb.setChecked(False)
+        self.mic_webrtc_ns_cb = QtWidgets.QCheckBox("Enable Mic Noise Suppression (WebRTC APM) [Experimental]")
+        self.mic_webrtc_ns_cb.setChecked(False)
 
         self.mic_target_rms = QtWidgets.QDoubleSpinBox()
         self.mic_target_rms.setRange(-60.0, 0.0)
@@ -170,6 +177,10 @@ class SettingsDialog(QtWidgets.QDialog):
         # Tooltip untuk parameter teknis
         self.mic_server_vad_cb.setToolTip("Aktifkan Voice Activity Detection di server untuk audio mikrofon")
         self.speaker_server_vad_cb.setToolTip("Aktifkan Voice Activity Detection di server untuk audio speaker")
+        self.mic_webrtc_ns_cb.setToolTip(
+            "Dapat meredam desis latar belakang (hum/hiss) pada mikrofon, namun berpotensi mengubah karakteristik suara. "
+            "Lakukan tes performa jika akurasi transkripsi menurun."
+        )
         self.mic_target_rms.setToolTip("Target volume (RMS) mikrofon setelah normalisasi, dalam dB")
         self.mic_max_gain.setToolTip("Batas maksimal penguatan (gain) yang diterapkan pada mikrofon")
         self.spk_target_rms.setToolTip("Target volume (RMS) speaker setelah normalisasi, dalam dB")
@@ -185,6 +196,7 @@ class SettingsDialog(QtWidgets.QDialog):
 
         a_layout.addRow("Mic server VAD:", self.mic_server_vad_cb)
         a_layout.addRow("Speaker server VAD:", self.speaker_server_vad_cb)
+        a_layout.addRow(self.mic_webrtc_ns_cb)
         a_layout.addRow("Mic target RMS (dB):", self.mic_target_rms)
         a_layout.addRow("Mic max gain (dB):", self.mic_max_gain)
         a_layout.addRow("Speaker target RMS (dB):", self.spk_target_rms)
@@ -243,8 +255,10 @@ class SettingsDialog(QtWidgets.QDialog):
             pass
 
     def load_options(self, opts: UiOptions):
-        self.host_input.setText(opts.host)
-        self.port_input.setValue(opts.port)
+        if opts.host is not None:
+            self.host_input.setText(opts.host)
+        if opts.port is not None:
+            self.port_input.setValue(opts.port)
         
         # Set mic/speaker based on data ID if present
         if opts.mic_device is not None:
@@ -266,6 +280,7 @@ class SettingsDialog(QtWidgets.QDialog):
             
         self.mic_server_vad_cb.setChecked(opts.mic_server_vad)
         self.speaker_server_vad_cb.setChecked(opts.speaker_server_vad)
+        self.mic_webrtc_ns_cb.setChecked(opts.mic_webrtc_ns)
         self.mic_target_rms.setValue(opts.mic_target_rms_db)
         self.mic_max_gain.setValue(opts.mic_max_normalization_gain_db)
         self.spk_target_rms.setValue(opts.speaker_target_rms_db)
@@ -295,6 +310,7 @@ class SettingsDialog(QtWidgets.QDialog):
         
         opts.mic_server_vad = self.mic_server_vad_cb.isChecked()
         opts.speaker_server_vad = self.speaker_server_vad_cb.isChecked()
+        opts.mic_webrtc_ns = self.mic_webrtc_ns_cb.isChecked()
         opts.mic_target_rms_db = self.mic_target_rms.value()
         opts.mic_max_normalization_gain_db = self.mic_max_gain.value()
         opts.speaker_target_rms_db = self.spk_target_rms.value()
@@ -350,6 +366,10 @@ class SummaryWindow(QtWidgets.QDialog):
 
 
 class CompactWidget(QtWidgets.QWidget):
+    # Sinyal error dari worker thread (start/stop) -> ditangani di main thread.
+    # (msg, revert_recording): revert=True mengembalikan tombol ke keadaan "Start".
+    error_occurred = QtCore.Signal(str, bool)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("PLN Meeting Transcriber")
@@ -359,11 +379,16 @@ class CompactWidget(QtWidgets.QWidget):
         self.recording = False
         self.current_options: Optional[UiOptions] = None
         self.llm_api_key: Optional[str] = None
+        # F3: mtime transcript terakhir agar refresh tidak re-parse/re-render bila tak berubah.
+        self._last_transcript_mtime: float | None = None
 
         self.setObjectName("MainWindow")
 
         self._build_ui()
         self._apply_styles()
+
+        # F4: error dari thread latar disurunkan ke UI (QueuedConnection lintas-thread).
+        self.error_occurred.connect(self._on_error)
 
         self.timer = QtCore.QTimer(self)
         self.timer.setInterval(500)
@@ -398,6 +423,12 @@ class CompactWidget(QtWidgets.QWidget):
         self.record_btn.setToolTip("Mulai / hentikan perekaman (Ctrl+R)")
         self.record_btn.setShortcut(QtGui.QKeySequence("Ctrl+R"))
         self.record_btn.setAccessibleName("Tombol Mulai/Hentikan Rekaman")
+
+        # F1: indikator status koneksi server (dipelihara engine dari sinyal subprocess).
+        self.conn_label = QtWidgets.QLabel("● Disconnected")
+        self.conn_label.setStyleSheet("color: #94A3B8; font-weight: 600;")
+        self.conn_label.setToolTip("Status koneksi server")
+        self.conn_label.setAccessibleName("Status koneksi server")
 
         # Container untuk VU Meter (Ubah menjadi Horizontal Layout)
         vu_layout = QtWidgets.QHBoxLayout()
@@ -455,6 +486,7 @@ class CompactWidget(QtWidgets.QWidget):
 
         # layout atas
         top_layout.addWidget(self.record_btn)
+        top_layout.addWidget(self.conn_label, alignment=QtCore.Qt.AlignmentFlag.AlignVCenter)
         top_layout.addLayout(vu_layout)
         top_layout.addStretch(1)
         top_layout.addWidget(self.mute_btn)
@@ -785,18 +817,61 @@ class CompactWidget(QtWidgets.QWidget):
             self.resume_btn.setEnabled(bool(self.llm_api_key))
 
     def toggle_record(self, checked: bool):
+        self._apply_record_button_state(recording=checked)
         if checked:
-            # Saat sedang merekam (Tombol aktif)
-            self.record_btn.setText(" Stop Recording") # Hapus emoji ⏹
-            self.record_btn.setIcon(load_icon("stop.svg")) # Ganti ke ikon stop
-            self.record_btn.setToolTip("Hentikan perekaman (Ctrl+R)")
             self._start_live()
         else:
-            # Saat berhenti merekam (Tombol kembali normal)
-            self.record_btn.setText(" Start Recording") # Hapus emoji ⏺
-            self.record_btn.setIcon(load_icon("play.svg")) # Ganti ke ikon record
-            self.record_btn.setToolTip("Mulai perekaman (Ctrl+R)")
             self._stop_live()
+
+    def _apply_record_button_state(self, recording: bool) -> None:
+        if recording:
+            self.record_btn.setText(" Stop Recording")
+            self.record_btn.setIcon(load_icon("stop.svg"))
+            self.record_btn.setToolTip("Hentikan perekaman (Ctrl+R)")
+        else:
+            self.record_btn.setText(" Start Recording")
+            self.record_btn.setIcon(load_icon("play.svg"))
+            self.record_btn.setToolTip("Mulai perekaman (Ctrl+R)")
+
+    def _on_error(self, message: str, revert_recording: bool) -> None:
+        # F4: berjalan di main thread (via Signal). Tampilkan error + pulihkan tombol
+        # agar UI tidak menampilkan "Stop Recording" padahal sesi gagal berjalan.
+        if revert_recording:
+            self.record_btn.setChecked(False)
+            self._apply_record_button_state(recording=False)
+        QtWidgets.QMessageBox.warning(self, "Error", message)
+
+    def _update_connection_indicator(self) -> None:
+        # F1: konsumsi status koneksi yang dipelihara engine.
+        status = connection_status()
+        color, text = {
+            "CONNECTED": ("#059669", "Connected"),
+            "CONNECTING": ("#F59E0B", "Connecting…"),
+            "ERROR": ("#E84D5B", "Error"),
+            "DISCONNECTED": ("#94A3B8", "Disconnected"),
+        }.get(status, ("#94A3B8", status))
+        self.conn_label.setText(f"● {text}")
+        self.conn_label.setStyleSheet(f"color: {color}; font-weight: 600;")
+        self.conn_label.setToolTip(f"Status koneksi server: {status}")
+
+    @staticmethod
+    def _db_to_pct(rms_db: Optional[float]) -> int:
+        # Petakan level RMS -60..0 dB -> 0..100%. None (tak ada level) -> 0.
+        if rms_db is None:
+            return 0
+        pct = (rms_db + 60.0) / 60.0 * 100.0
+        return max(0, min(100, int(pct)))
+
+    def _update_audio_meters(self) -> None:
+        # Indikator Mic/Speaker dari level audio NYATA (RMS input subprocess),
+        # bukan proxy stabilitas transkrip. Kosong saat tidak merekam -> 0%.
+        levels = audio_levels()
+        mic_pct = self._db_to_pct(levels.get("mic"))
+        spk_pct = self._db_to_pct(levels.get("speaker"))
+        self.mic_vu.setValue(mic_pct)
+        self.spk_vu.setValue(spk_pct)
+        self.mic_vu.setToolTip(f"Level mikrofon: {mic_pct}%")
+        self.spk_vu.setToolTip(f"Level speaker: {spk_pct}%")
 
     def toggle_mute(self, checked: bool):
         self.muted = bool(checked)
@@ -810,25 +885,19 @@ class CompactWidget(QtWidgets.QWidget):
             self.mute_btn.setIcon(load_icon("mic.svg"))  
             self.mute_btn.setToolTip("Bisukan mikrofon (Ctrl+M)")
             
-        # Restart stream jika sedang merekam
+        # True mute: terapkan ke sesi yang sedang berjalan tanpa restart koneksi.
         if self.record_btn.isChecked():
-            self._restart_with_options()
+            self._apply_mute()
 
-    def _restart_with_options(self):
-        opts = self.current_options or UiOptions()
-        preferred = getattr(self, "_preferred_source", getattr(opts, "source", "both") or "both")
-        opts.source = "speaker" if self.muted else preferred
+    def _apply_mute(self):
+        muted = self.muted
 
         def _runner():
             try:
-                stop_live()
-            except Exception:
-                pass
-            time.sleep(0.15)
-            try:
-                start_live(opts)
+                if not set_mute("mic", muted):
+                    self.error_occurred.emit("Gagal menerapkan mute: sesi live tidak aktif.", False)
             except Exception as exc:
-                print("restart_with_options failed:", exc)
+                self.error_occurred.emit(f"Gagal menerapkan mute: {exc}", False)
 
         threading.Thread(target=_runner, daemon=True).start()
 
@@ -836,14 +905,17 @@ class CompactWidget(QtWidgets.QWidget):
         opts = self.current_options or UiOptions()
         opts.host = getattr(opts, "host", "localhost")
         opts.port = getattr(opts, "port", 9090)
-        if self.muted:
-            opts.source = "speaker"
 
         def _runner():
             try:
                 start_live(opts)
             except Exception as exc:
-                print("start_live failed:", exc)
+                self.error_occurred.emit(f"Gagal memulai sesi: {exc}", True)
+                return
+            # Sesi dimulai dalam keadaan mute: terapkan lewat kanal kontrol, bukan
+            # dengan mengubah source (yang dulu memaksa restart).
+            if self.muted:
+                set_mute("mic", True)
 
         threading.Thread(target=_runner, daemon=True).start()
 
@@ -852,7 +924,7 @@ class CompactWidget(QtWidgets.QWidget):
             try:
                 stop_live()
             except Exception as exc:
-                print("stop_live failed:", exc)
+                self.error_occurred.emit(f"Gagal menghentikan sesi: {exc}", False)
 
         threading.Thread(target=_runner, daemon=True).start()
     
@@ -931,6 +1003,23 @@ class CompactWidget(QtWidgets.QWidget):
             QtWidgets.QMessageBox.warning(self, "Error", f"Failed to export: {exc}")
 
     def refresh(self):
+        # F1: status koneksi + indikator level audio diperbarui tiap tick (murah),
+        # lepas dari transcript (level bergerak lebih cepat dari file transkrip).
+        try:
+            self._update_connection_indicator()
+            self._update_audio_meters()
+        except Exception:
+            pass
+
+        # F3: lewati re-read/re-render transcript bila file tidak berubah sejak tick lalu.
+        try:
+            mtime = os.path.getmtime(DEFAULT_TRANSCRIPT_LOG) if os.path.exists(DEFAULT_TRANSCRIPT_LOG) else None
+        except OSError:
+            mtime = None
+        if mtime is not None and mtime == self._last_transcript_mtime:
+            return
+        self._last_transcript_mtime = mtime
+
         try:
             data = transcript_payload()
             entries = data.get("entries", [])
@@ -969,6 +1058,9 @@ class CompactWidget(QtWidgets.QWidget):
             if was_at_bottom and scrollbar:
                 scrollbar.setValue(scrollbar.maximum())
 
+            # Indikator Mic/Speaker kini digerakkan level audio nyata di
+            # _update_audio_meters() (tiap tick), bukan dari rasio transkrip.
+
             # Update badge stable/candidate (commented out)
             # badge_text = f"✓ {stable_count} stable  ~ {candidate_count} candidate"
             # self.stability_label.setText(badge_text)
@@ -979,17 +1071,6 @@ class CompactWidget(QtWidgets.QWidget):
             # else:
             #     self.stability_label.setStyleSheet("color: #059669; font-size: 11px;")
 
-            # VU meters logic (Tetap sama seperti sebelumnya)
-            quality = data.get("quality", {})
-            stable = quality.get("stable", 0)
-            candidate = quality.get("candidate", 0)
-            total = stable + candidate or 1
-            level = min(100, int(candidate / total * 100) + (5 if entries else 0))
-            self.mic_vu.setValue(level)
-            self.spk_vu.setValue(min(100, 100 - level))
-            # Tooltip dinamis agar pengguna bisa melihat angka persis, tidak hanya bar visual
-            self.mic_vu.setToolTip(f"Level mikrofon: {level}%")
-            self.spk_vu.setToolTip(f"Level speaker: {min(100, 100 - level)}%")
         except Exception:
             pass
 

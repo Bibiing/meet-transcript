@@ -141,7 +141,11 @@ class ServeClientBase(object):
                 time.sleep(0.05)
                 continue
 
-            if self.clip_audio:
+            # clip_audio adalah katup backlog untuk jalur NON-local-agreement (ia menggeser
+            # jangkar timestamp_offset ke live edge saat tak ada segmen valid). Pada local
+            # agreement, stabilizer mengelola finalisasi & kemajuan jangkar sendiri; membiarkan
+            # clip menggeser jangkar akan merusak agreement (prefix jadi misalign). Gerbangi.
+            if self.clip_audio and not self.local_agreement:
                 self.clip_audio_if_no_valid_segment()
 
             input_bytes, duration = self.get_audio_chunk_for_processing()
@@ -385,14 +389,17 @@ class ServeClientBase(object):
         """
         with self.lock:
             samples_take = max(0, (self.timestamp_offset - self.frames_offset) * self.RATE)
-            if self.local_agreement:
-                total_samples = self.frames_np.shape[0]
-                max_window_samples = int(self.local_agreement_window_seconds * self.RATE)
-                if total_samples - samples_take > max_window_samples:
-                    samples_take = total_samples - max_window_samples
-                    self.timestamp_offset = self.frames_offset + (samples_take / self.RATE)
             self.processing_offset = self.frames_offset + (samples_take / self.RATE)
             input_bytes = self.frames_np[int(samples_take):].copy()
+            if self.local_agreement:
+                # Jangkar decode = titik terkonfirmasi (timestamp_offset), STABIL antar-decode
+                # agar local agreement dapat mencocokkan prefix hipotesis. Batas biaya decode
+                # diterapkan pada PANJANG window ke depan, BUKAN dengan menggeser jangkar ke
+                # live edge (yang membuang audio belum terkonfirmasi dan mematikan agreement).
+                # timestamp_offset hanya maju via konfirmasi (update_segments_with_local_agreement).
+                max_window_samples = int(self.local_agreement_window_seconds * self.RATE)
+                if input_bytes.shape[0] > max_window_samples:
+                    input_bytes = input_bytes[:max_window_samples]
         duration = input_bytes.shape[0] / self.RATE
         return input_bytes, duration
 

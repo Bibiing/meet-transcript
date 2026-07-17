@@ -129,6 +129,92 @@ def test_reader_thread_drops_chunk_when_queue_full() -> None:
     assert stats.chunks_dropped >= 1
 
 
+class _FakeVAD:
+    def __init__(self, speech: bool) -> None:
+        self.speech = speech
+        self.calls = 0
+
+    def is_speech(self, chunk: PreprocessedAudioChunk) -> bool:
+        self.calls += 1
+        return self.speech
+
+
+def test_reader_thread_drops_non_speech_chunks_via_client_vad() -> None:
+    frames = [_make_frame(source="mic", duration_seconds=0.5, sample_rate=16_000) for _ in range(8)]
+    stream = FakeMicStream(frames)
+    chunk_queue: queue.Queue[PreprocessedAudioChunk] = queue.Queue()
+    stop_event = threading.Event()
+    stats = WhisperLiveSessionStats()
+    vad = _FakeVAD(speech=False)
+
+    preprocessor = AudioPreprocessor(PreprocessConfig(chunk_seconds=4.0))
+    t = threading.Thread(
+        target=_reader_thread,
+        args=(stream, preprocessor, chunk_queue, 4.0, stop_event, stats, vad),
+    )
+    t.start()
+    assert _wait_for(lambda: stats.client_vad_dropped >= 1)
+    stop_event.set()
+    t.join(timeout=2.0)
+
+    # Chunk non-speech tidak masuk queue; dihitung sebagai client_vad_dropped.
+    assert chunk_queue.empty()
+    assert stats.client_vad_dropped >= 1
+    assert vad.calls >= 1
+
+
+def test_reader_thread_keeps_speech_chunks_via_client_vad() -> None:
+    frames = [_make_frame(source="mic", duration_seconds=0.5, sample_rate=16_000) for _ in range(8)]
+    stream = FakeMicStream(frames)
+    chunk_queue: queue.Queue[PreprocessedAudioChunk] = queue.Queue()
+    stop_event = threading.Event()
+    stats = WhisperLiveSessionStats()
+    vad = _FakeVAD(speech=True)
+
+    preprocessor = AudioPreprocessor(PreprocessConfig(chunk_seconds=4.0))
+    t = threading.Thread(
+        target=_reader_thread,
+        args=(stream, preprocessor, chunk_queue, 4.0, stop_event, stats, vad),
+    )
+    t.start()
+    assert _wait_for_queue(chunk_queue)
+    stop_event.set()
+    t.join(timeout=2.0)
+
+    assert stats.client_vad_dropped == 0
+    chunk = chunk_queue.get_nowait()
+    assert chunk.source == "mic"
+
+
+def test_session_mute_registry_is_per_source() -> None:
+    from src.whisper.session import _is_source_muted, _set_source_muted
+
+    try:
+        assert _is_source_muted("mic") is False
+        _set_source_muted("mic", True)
+        assert _is_source_muted("mic") is True
+        # Mute satu source tidak memengaruhi source lain.
+        assert _is_source_muted("speaker") is False
+        _set_source_muted("mic", False)
+        assert _is_source_muted("mic") is False
+    finally:
+        _set_source_muted("mic", False)
+        _set_source_muted("speaker", False)
+
+
+def test_build_client_vad_filter_respects_kill_switch() -> None:
+    from src.whisper.capture import _build_client_vad_filter
+
+    assert _build_client_vad_filter(WhisperLiveSessionConfig()) is None
+
+    vad = _build_client_vad_filter(
+        WhisperLiveSessionConfig(client_vad_enabled=True, client_vad_threshold=0.7, client_vad_hangover_chunks=3)
+    )
+    assert vad is not None
+    assert vad.threshold == 0.7
+    assert vad.hangover_chunks == 3
+
+
 def test_build_capture_streams_creates_mic_reader(monkeypatch: pytest.MonkeyPatch) -> None:
     created = {}
 

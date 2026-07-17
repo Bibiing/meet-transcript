@@ -62,11 +62,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # Voice Activity Detection (VAD)
     parser.add_argument("--mic-server-vad", action=argparse.BooleanOptionalAction, default=env_bool("PLN_MIC_SERVER_VAD", True), help="enable server-side VAD for microphone chunks")
     parser.add_argument("--speaker-server-vad", action=argparse.BooleanOptionalAction, default=env_bool("PLN_SPEAKER_SERVER_VAD", False), help="enable server-side VAD for speaker/system-audio chunks")
+    parser.add_argument("--mic-noise-reduction", action=argparse.BooleanOptionalAction, default=env_bool("PLN_MIC_NOISE_REDUCTION", False), help="enable noise gate for microphone preprocessing")
     parser.add_argument("--mic-target-rms-db", type=float, default=env_float("PLN_MIC_TARGET_RMS_DB", -20.0), help="microphone target RMS dB after normalization")
     parser.add_argument("--mic-max-normalization-gain-db", type=float, default=env_float("PLN_MIC_MAX_GAIN_DB", 18.0), help="maximum microphone normalization gain in dB")
     parser.add_argument("--speaker-target-rms-db", type=float, default=env_float("PLN_SPEAKER_TARGET_RMS_DB", -23.0), help="speaker target RMS dB after normalization")
     parser.add_argument("--speaker-max-normalization-gain-db", type=float, default=env_float("PLN_SPEAKER_MAX_GAIN_DB", 18.0), help="maximum speaker normalization gain in dB")
     parser.add_argument("--vad-threshold", type=float, default=env_float("WHISPERLIVE_VAD_THRESHOLD", 0.55), help="WhisperLive server VAD threshold")
+
+    # Client-side VAD (admission control, ADR-001) — kill-switch default OFF (belum diverifikasi)
+    parser.add_argument("--client-vad", action=argparse.BooleanOptionalAction, default=env_bool("PLN_CLIENT_VAD_ENABLED", False), help="enable client-side VAD to drop silent chunks before sending (admission control)")
+    parser.add_argument("--client-vad-threshold", type=float, default=env_float("PLN_CLIENT_VAD_THRESHOLD", 0.5), help="client-side VAD speech probability threshold")
+    parser.add_argument("--client-vad-hangover-chunks", type=int, default=env_int("PLN_CLIENT_VAD_HANGOVER_CHUNKS", 2), help="chunks kept active after speech ends (client VAD hangover)")
     
     # Konfigurasi Whisper / OpenAI ASR Model
     parser.add_argument("--whisper-model", default=None, help="Whisper model name")
@@ -201,7 +207,7 @@ def main(argv: list[str] | None = None) -> int:
         case "live":
             log_transcript = args.transcript_log or (args.output_dir / "transcript_log.json")
 
-            live_model = args.whisper_model or env_model or "small"
+            live_model = args.whisper_model or env_model or "medium"
 
             # ASR whisper server live
             profile = WhisperLiveProfile(
@@ -239,6 +245,10 @@ def main(argv: list[str] | None = None) -> int:
                 speaker_device=_device_arg(args.speaker_device),
                 mic_server_vad=args.mic_server_vad,
                 speaker_server_vad=args.speaker_server_vad,
+                client_vad_enabled=args.client_vad,
+                client_vad_threshold=args.client_vad_threshold,
+                client_vad_hangover_chunks=args.client_vad_hangover_chunks,
+                mic_noise_reduction=args.mic_noise_reduction,
                 mic_target_rms_db=args.mic_target_rms_db,
                 mic_max_normalization_gain_db=args.mic_max_normalization_gain_db,
                 speaker_target_rms_db=args.speaker_target_rms_db,
@@ -276,7 +286,7 @@ def main(argv: list[str] | None = None) -> int:
         
         case "replay-file":
             # Replay untuk test whisper langsung dari file.
-            replay_model = args.whisper_model or env_model or "small"
+            replay_model = args.whisper_model or env_model or "medium"
             profile = WhisperLiveProfile(
                 language=args.whisper_language,
                 task=args.whisper_task,
@@ -366,16 +376,6 @@ def _print_preprocess_results(results: list[PreprocessResult]) -> None:
     for result in results:
         label = result.source.upper()
         if result.output_path is None:
-            if result.warning == "no speech chunk passed VAD":
-                if result.source == "speaker":
-                    print(
-                        f"[{label}] preprocess skipped: {result.warning}\n"
-                        f"  -> Speaker capture kosong. Ini NORMAL jika tidak ada meeting/audio yang diputar.\n"
-                        f"  -> Saat online meeting aktif, suara peserta lain akan tertangkap otomatis."
-                    )
-                else:
-                    print(f"[{label}] preprocess skipped: {result.warning}")
-                continue
             print(f"[{label}] preprocess warning: {result.warning}")
             continue
         print(

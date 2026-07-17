@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import queue
 import signal
+import sys
 import threading
 from collections import deque
 from dataclasses import dataclass, field, replace
@@ -86,6 +87,7 @@ from src.whisper.client_reconnect import (
     ReconnectPolicy,
     _BufferedReconnectClient,
 )
+from src.utils.status_ipc import format_level_line, format_status_line, parse_command_line
 from src.whisper.capture import _build_capture_streams
 from src.whisper.session_utils import (
     TranscriptCallback,
@@ -104,6 +106,90 @@ from src.whisper.session_utils import (
 )
 
 _log = logging.getLogger(__name__)
+
+_status_emit_lock = threading.Lock()
+
+
+def _emit_connection_signal(source: str, status: str) -> None:
+    """Kirim status koneksi terstruktur ke stdout untuk diparse parent (BUG-002).
+
+    Terpisah dari prosa human-readable: parent tidak lagi menebak status dari
+    substring yang menabrak teks transcript. Ditulis satu baris utuh di bawah
+    lock agar tidak terpotong output thread source lain.
+    """
+    line = format_status_line(source, status)
+    with _status_emit_lock:
+        sys.stdout.write(line)
+        sys.stdout.flush()
+
+
+# True mute: source yang di-mute tidak dikirim ke server, tetapi koneksi dan
+# state ASR server (termasuk local-agreement) tetap hidup — tidak ada restart.
+# Drift waktu akibat chunk yang ditahan dikompensasi SentTimeline, sama seperti
+# jalur drop VAD.
+_mute_lock = threading.Lock()
+_muted_sources: set[str] = set()
+
+
+def _is_source_muted(source: str) -> bool:
+    with _mute_lock:
+        return source in _muted_sources
+
+
+def _set_source_muted(source: str, muted: bool) -> None:
+    with _mute_lock:
+        if muted:
+            _muted_sources.add(source)
+        else:
+            _muted_sources.discard(source)
+
+
+def _command_reader_thread(stop_event: threading.Event) -> None:
+    """Baca perintah kontrol dari stdin (kanal masuk parent -> subprocess).
+
+    Baris non-perintah diabaikan; kegagalan apa pun hanya menghentikan pembaca
+    tanpa memengaruhi sesi (graceful degradation: mute berhenti bekerja, sesi
+    tetap jalan).
+    """
+    try:
+        for line in sys.stdin:
+            if stop_event.is_set():
+                return
+            parsed = parse_command_line(line)
+            if parsed is None:
+                continue
+            cmd, payload = parsed
+            if cmd != "set_mute":
+                continue
+            source = payload.get("source")
+            muted = payload.get("muted")
+            if isinstance(source, str) and isinstance(muted, bool):
+                _set_source_muted(source, muted)
+                log_process_event("client.mute_changed", source=source, muted=muted)
+    except Exception as exc:  # stdin ditutup/tak terbaca
+        _log.debug("command reader stopped: %s", exc)
+
+
+_LEVEL_EMIT_INTERVAL_SECONDS = 0.15
+_level_last_emit: dict[str, float] = {}
+
+
+def _emit_level_signal(source: str, rms_db: float) -> None:
+    """Kirim level audio (RMS dB) per source ke stdout untuk indikator GUI real-time.
+
+    Di-throttle agar tidak membanjiri stdout saat chunk kecil, dan -inf (hening
+    mutlak) di-clamp ke -90 dB agar payload JSON tetap terhingga. Dipanggil dari
+    loop utama (satu thread) sehingga _level_last_emit tidak perlu lock.
+    """
+    now = perf_counter()
+    if now - _level_last_emit.get(source, 0.0) < _LEVEL_EMIT_INTERVAL_SECONDS:
+        return
+    _level_last_emit[source] = now
+    db = -90.0 if rms_db == float("-inf") else max(-90.0, rms_db)
+    line = format_level_line(source, round(db, 1))
+    with _status_emit_lock:
+        sys.stdout.write(line)
+        sys.stdout.flush()
 
 
 from src.whisper.models import WhisperLiveSessionConfig, WhisperLiveSessionStats
@@ -266,6 +352,9 @@ def run_whisperlive_session(
         # Status WebSocket dipisah dari transcript supaya UI bisa menampilkan
         # koneksi, SERVER_READY, END_OF_AUDIO, dan error secara jelas.
         status = str(message.get("status") or message.get("message") or "UNKNOWN")
+        # Sinyal terstruktur untuk parent (kode mentah; pemetaan ke state UI
+        # adalah policy milik parent). Prosa di bawah tetap untuk pembacaan manusia.
+        _emit_connection_signal(source, status)
         label = source.upper()
         if status == "CLIENT_CONNECTING":
             log_process_event("client.ws_connect", source=source, details=message)
@@ -385,9 +474,14 @@ def run_whisperlive_session(
             len(segments),
             sum(1 for segment in segments if segment.get("completed")),
         )
+        timeline_mapper = None
+        if clients and source in clients:
+            timeline_mapper = clients[source].sent_timeline.map_to_real
+
         if partial_preview is not None:
-            partial_preview.show(source, segments)
-        for event in _events_from_segments(source, cfg.profile.model, cfg.profile.language, segments):
+            partial_preview.show(source, segments, timeline_mapper)
+
+        for event in _events_from_segments(source, cfg.profile.model, cfg.profile.language, segments, timeline_mapper):
             quality_tracker.observe_event(event)
             if not event.completed and transcript_log is not None and event.result.text.strip():
                 # Kandidat disimpan hanya jika teksnya cukup berbeda dari kandidat
@@ -471,8 +565,9 @@ def run_whisperlive_session(
     }
 
     try:
-        _connect_clients_parallel(clients, allow_initial_failure=cfg.auto_reconnect) # menghubungkan semua client ke server WhisperLive secara paralel, jika gagal, akan mencoba reconnect sesuai policy yang ditentukan
-
+        # Capture dimulai SEBELUM connect agar audio yang diucapkan selama menunggu
+        # SERVER_READY tidak hilang. Chunk terkumpul di chunk_queue (FIFO, thread-safe)
+        # selama transisi, lalu dikuras berurutan oleh loop utama begitu koneksi siap.
         capture_streams, reader_threads = _build_capture_streams(cfg, chunk_queue, _stop, stats) # stream audio untuk setiap source (mic/speaker) dan thread untuk membaca audio dari stream dan memasukkannya ke dalam queue chunk audio
         
         # tidak ada stream audio yang tersedia, maka akan menampilkan error dan mengembalikan stats
@@ -508,31 +603,54 @@ def run_whisperlive_session(
         for thread in reader_threads:
             thread.start()
 
+        # Kanal kontrol masuk (true mute). Hanya saat stdin berupa pipe dari parent;
+        # pada penggunaan CLI interaktif (TTY) tidak diaktifkan agar tidak menyerap input.
+        if sys.stdin is not None and not sys.stdin.isatty():
+            threading.Thread(
+                target=_command_reader_thread,
+                args=(_stop,),
+                name="whisperlive-command-reader",
+                daemon=True,
+            ).start()
+
         session_start = monotonic() # mencatat waktu mulai sesi untuk menghitung durasi sesi
 
-        # menampilkan informasi sesi live WhisperLive ke stdout atau callback log
-        _print("=" * 60)
-        _print("Live transcription aktif via WhisperLive. Tekan Ctrl+C untuk berhenti.")
-        _print(
-            f"Server: {cfg.server_host}:{cfg.server_port}  |  "
-            f"Model: {cfg.profile.model}  |  VAD: {cfg.profile.vad_threshold:.2f}"
-        )
-        _print(
-            "Server VAD: "
-            + ", ".join(f"{source.upper()}={_server_vad_for_source(cfg, source)}" for source in active_sources)
-        )
-        _print(
-            "Debug metadata: source-specific preprocessing, replay-ready chunks, and per-source server VAD decisions."
-        )
-        _print(f"Sumber: {', '.join(source.upper() for source in active_sources)}")
-        _print("=" * 60)
-
         try:
+            # Connect berjalan setelah capture aktif: audio selama transisi ke
+            # SERVER_READY sudah tertahan di chunk_queue (dan reconnect buffer),
+            # sehingga tidak ada kata pertama yang hilang. Connect di dalam try ini
+            # agar kegagalan tetap membersihkan capture lewat finally.
+            _connect_clients_parallel(clients, allow_initial_failure=cfg.auto_reconnect)
+
+            # menampilkan informasi sesi live WhisperLive ke stdout atau callback log
+            _print("=" * 60)
+            _print("Live transcription aktif via WhisperLive. Tekan Ctrl+C untuk berhenti.")
+            _print(
+                f"Server: {cfg.server_host}:{cfg.server_port}  |  "
+                f"Model: {cfg.profile.model}  |  VAD: {cfg.profile.vad_threshold:.2f}"
+            )
+            _print(
+                "Server VAD: "
+                + ", ".join(f"{source.upper()}={_server_vad_for_source(cfg, source)}" for source in active_sources)
+            )
+            _print(
+                "Debug metadata: source-specific preprocessing, replay-ready chunks, and per-source server VAD decisions."
+            )
+            _print(f"Sumber: {', '.join(source.upper() for source in active_sources)}")
+            _print("=" * 60)
+
             while not _stop.is_set():
                 # Loop utama hanya mengambil chunk yang sudah lolos preprocessing dan mengirimnya ke koneksi WebSocket sesuai source.
                 try:
                     chunk = chunk_queue.get(timeout=0.5)
                 except queue.Empty:
+                    continue
+                # Level audio nyata (RMS input pra-normalisasi) untuk indikator GUI.
+                # Tetap dikirim saat mute agar pengguna melihat mic-nya menangkap suara.
+                _emit_level_signal(chunk.source, chunk.input_rms_db)
+                # True mute: tahan chunk source ini — koneksi & state ASR tetap hidup.
+                if _is_source_muted(chunk.source):
+                    stats.add_mute_dropped()
                     continue
                 client = clients.get(chunk.source)
                 if client is None:
@@ -642,6 +760,7 @@ def run_whisperlive_session(
                 f"Chunks terkirim: {stats.chunks_sent}  |  "
                 f"Buffered: {stats.chunks_buffered}  |  "
                 f"Dropped: {stats.chunks_dropped}  |  "
+                f"VAD-drop: {stats.client_vad_dropped}  |  "
                 f"Reconnect: {stats.reconnect_successes}/{stats.reconnect_attempts}  |  "
                 f"Results: {stats.results_received}"
             )
@@ -677,6 +796,7 @@ def run_whisperlive_session(
                 chunks_sent=stats.chunks_sent,
                 chunks_buffered=stats.chunks_buffered,
                 chunks_dropped=stats.chunks_dropped,
+                client_vad_dropped=stats.client_vad_dropped,
                 reconnect_attempts=stats.reconnect_attempts,
                 reconnect_successes=stats.reconnect_successes,
                 results_received=stats.results_received,

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+
+import logging
 from math import gcd
 from typing import Any, Iterable
+import collections
 
 import numpy as np
 from scipy import signal
@@ -14,6 +16,10 @@ from src.capture.models import AudioFrame
 # ASR (Automatic Speech Recognition) adalah proses mengubah sinyal audio menjadi teks. Untuk ASR, kualitas audio sangat penting agar model dapat mengenali ucapan dengan akurat. (Whisper)
 
 from src.preprocessing.models import PreprocessConfig, PreprocessedAudioChunk
+
+_log = logging.getLogger(__name__)
+
+
 # mengubah audio yang ditangkap menjadi chunk mono 16 kHz untuk ASR.
 class AudioPreprocessor:
 
@@ -24,6 +30,15 @@ class AudioPreprocessor:
         self.config = config or PreprocessConfig()
         self._validate_config()
         self.last_decisions: list[dict[str, Any]] = []
+        self._prev_gate_gain: collections.defaultdict[str, float] = collections.defaultdict(lambda: 1.0)
+        self._filter_zi: dict[str, np.ndarray] = {}
+        self._sos = signal.butter(
+            self.config.highpass_order,
+            self.config.highpass_cutoff_hz,
+            btype="highpass",
+            fs=self.config.target_sample_rate,
+            output="sos",
+        )
 
     # menggabungkan frame audio
     # jadi intinya fungsi ini menggabungkan frame audio yang ditangkap menjadi satu chunk audio untuk diproses lebih lanjut, agar chunk audio yang dikirim ke ars tidak terlalu pendek, sehingga bisa diproses dengan baik oleh ars. 
@@ -66,17 +81,21 @@ class AudioPreprocessor:
         source: str,
         start_seconds: float = 0.0,
     ) -> list[PreprocessedAudioChunk]:
-        """Run cast, mono, resample, high-pass, normalization, and clip."""
+        """Run cast, mono, resample, noise gate, high-pass, normalization, and clip.
+        
+        Untuk respons gating yang dinamis, fungsi ini sebaiknya dipanggil
+        dengan buffer pendek secara kontinu (misal 500ms - 2.5s), bukan blok
+        durasi panjang, karena noise gate dihitung rata-rata per-pemanggilan.
+        """
 
         self.last_decisions = []
         audio = _as_float32_matrix(samples, channels)
         mono = _stereo_to_mono(audio)
         resampled = _resample(mono, sample_rate, self.config.target_sample_rate)
-        filtered = _highpass_filter(
-            resampled,
-            sample_rate=self.config.target_sample_rate,
-            cutoff_hz=self.config.highpass_cutoff_hz,
-            order=self.config.highpass_order,
+        denoised = self._apply_noise_gate(resampled, source=source)
+        filtered = self._apply_highpass_filter(
+            denoised,
+            source=source,
         )
 
         chunks: list[PreprocessedAudioChunk] = []
@@ -99,33 +118,14 @@ class AudioPreprocessor:
                 )
                 continue
             input_rms_db = _rms_db(chunk)
-            if self._should_drop_legacy_silence(chunk, input_rms_db):
-                self._record_decision(
-                    source=source,
-                    start_seconds=chunk_start,
-                    duration_seconds=duration_seconds,
-                    passed=False,
-                    reason="below_min_rms",
-                    input_rms_db=input_rms_db,
-                    noise_reduction_enabled=self.config.noise_reduction_enabled,
-                    client_vad_enabled=self.config.client_vad_enabled,
-                )
-                continue
             normalized = _normalize_rms(
                 chunk,
                 target_db=self.config.target_rms_db,
                 max_gain_db=self.config.max_normalization_gain_db,
             )
-            denoised = _apply_noise_reduction(
-                normalized,
-                enabled=self.config.noise_reduction_enabled,
-                strength=self.config.noise_reduction_strength,
-            )
-            clipped = np.clip(denoised, -self.config.clip_limit, self.config.clip_limit).astype(np.float32)
+            clipped = np.clip(normalized, -self.config.clip_limit, self.config.clip_limit).astype(np.float32)
             rms_db = _rms_db(clipped)
             decision_reason = "accepted"
-            if not self.config.client_vad_enabled:
-                decision_reason = "vad_disabled_accepted"
             self._record_decision(
                 source=source,
                 start_seconds=chunk_start,
@@ -135,7 +135,6 @@ class AudioPreprocessor:
                 input_rms_db=input_rms_db,
                 output_rms_db=rms_db,
                 noise_reduction_enabled=self.config.noise_reduction_enabled,
-                client_vad_enabled=self.config.client_vad_enabled,
             )
             chunks.append(
                 PreprocessedAudioChunk(
@@ -151,6 +150,39 @@ class AudioPreprocessor:
 
         return chunks
 
+    def _apply_noise_gate(self, samples: np.ndarray, source: str) -> np.ndarray:
+        if not self.config.noise_reduction_enabled or samples.size == 0:
+            self._prev_gate_gain[source] = 1.0
+            return samples.astype(np.float32, copy=True)
+            
+        audio = np.asarray(samples, dtype=np.float32)
+        if audio.ndim != 1:
+            raise ValueError("Noise reduction expects mono 1D samples")
+            
+        # Asumsi: input audio berada dalam rentang float32 [-1.0, 1.0]
+        # Menghitung RMS energi dari chunk saat ini
+        rms = float(np.sqrt(np.mean(np.square(audio))))
+        
+        # Menentukan target gain (Downward Expander dengan floor)
+        threshold = self.config.noise_gate_threshold_rms
+        if rms >= threshold:
+            target_gain = 1.0
+        elif rms < threshold / 10:
+            # Silence mutlak jika sangat jauh di bawah threshold
+            target_gain = 0.0
+        else:
+            # Proportional attenuation (Downward Expander)
+            target_gain = rms / threshold
+
+        # Mencegah artifact pumping/klik di boundary chunk dengan membuat envelope gain
+        # yang bertransisi secara linier dari gain chunk sebelumnya ke target gain
+        gain_envelope = np.linspace(self._prev_gate_gain[source], target_gain, audio.size, dtype=np.float32)
+        
+        # Simpan state untuk chunk berikutnya
+        self._prev_gate_gain[source] = target_gain
+        
+        return audio * gain_envelope
+
     def _record_decision(
         self,
         *,
@@ -162,7 +194,6 @@ class AudioPreprocessor:
         input_rms_db: float | None = None,
         output_rms_db: float | None = None,
         noise_reduction_enabled: bool | None = None,
-        client_vad_enabled: bool | None = None,
     ) -> None:
         decision: dict[str, Any] = {
             "source": source,
@@ -177,18 +208,11 @@ class AudioPreprocessor:
             decision["output_rms_db"] = round(output_rms_db, 2)
         if noise_reduction_enabled is not None:
             decision["noise_reduction_enabled"] = noise_reduction_enabled
-        if client_vad_enabled is not None:
-            decision["client_vad_enabled"] = client_vad_enabled
         self.last_decisions.append(decision)
 
-    def _should_drop_legacy_silence(self, chunk: np.ndarray, input_rms_db: float) -> bool:
-        if chunk.size == 0:
-            return True
-        if self.config.min_input_rms_db is None:
-            return bool(np.allclose(chunk, 0.0, atol=1e-8))
-        return input_rms_db < self.config.min_input_rms_db
-
     def _validate_config(self) -> None:
+        if self.config.noise_gate_threshold_rms <= 0:
+            raise ValueError("noise_gate_threshold_rms must be positive")
         if self.config.target_sample_rate <= 0:
             raise ValueError("target_sample_rate must be positive")
         if self.config.chunk_seconds <= 0:
@@ -206,6 +230,19 @@ class AudioPreprocessor:
             raise ValueError("clip_limit must be within (0, 1]")
         if self.config.max_normalization_gain_db < 0:
             raise ValueError("max_normalization_gain_db must be non-negative")
+
+    def _apply_highpass_filter(self, samples: np.ndarray, *, source: str) -> np.ndarray:
+        if samples.size == 0:
+            return samples.astype(np.float32)
+        
+        # Gunakan state awal jika ada
+        zi = self._filter_zi.get(source)
+        if zi is None:
+            zi = signal.sosfilt_zi(self._sos) * samples[0]
+            
+        filtered, zf = signal.sosfilt(self._sos, samples, zi=zi)
+        self._filter_zi[source] = zf
+        return filtered.astype(np.float32)
 
 
 def _as_float32_matrix(samples: np.ndarray, channels: int) -> np.ndarray:
@@ -237,16 +274,6 @@ def _resample(samples: np.ndarray, source_rate: int, target_rate: int) -> np.nda
     return signal.resample_poly(samples, up=up, down=down).astype(np.float32)
 
 
-def _highpass_filter(samples: np.ndarray, *, sample_rate: int, cutoff_hz: float, order: int) -> np.ndarray:
-    if samples.size == 0:
-        return samples.astype(np.float32)
-
-    sos = signal.butter(order, cutoff_hz, btype="highpass", fs=sample_rate, output="sos")
-    # sosfiltfilt gives better phase behavior, but needs enough samples.
-    min_len_for_filtfilt = 3 * (2 * len(sos) + 1)
-    if samples.shape[0] > min_len_for_filtfilt:
-        return signal.sosfiltfilt(sos, samples).astype(np.float32)
-    return signal.sosfilt(sos, samples).astype(np.float32)
 
 
 def _normalize_rms(samples: np.ndarray, *, target_db: float, max_gain_db: float) -> np.ndarray:
@@ -257,17 +284,6 @@ def _normalize_rms(samples: np.ndarray, *, target_db: float, max_gain_db: float)
     gain = min(target / rms, 10 ** (max_gain_db / 20))
     return (samples * gain).astype(np.float32)
 
-
-def _apply_noise_reduction(samples: np.ndarray, *, enabled: bool, strength: float) -> np.ndarray:
-    if not enabled or samples.size == 0:
-        return samples.astype(np.float32, copy=True)
-    strength = float(np.clip(strength, 0.0, 1.0))
-    if strength <= 0.0:
-        return samples.astype(np.float32, copy=True)
-    noise_floor = np.median(np.abs(samples)) * 0.5
-    adjusted = samples.copy()
-    adjusted[np.abs(adjusted) < noise_floor] *= 1.0 - strength
-    return adjusted.astype(np.float32)
 
 
 def _rms_db(samples: np.ndarray) -> float:

@@ -15,7 +15,7 @@ from src.whisper.session import _connection_config_for_source
 def test_whisperlive_profile_defaults_match_live_contract() -> None:
     profile = WhisperLiveProfile()
 
-    assert profile.model == "small"
+    assert profile.model == "medium"
     assert profile.language == "id"
     assert profile.task == "transcribe"
     assert profile.local_agreement is True
@@ -35,13 +35,13 @@ def test_whisperlive_session_config_defaults_to_dual_source() -> None:
     assert config.process_log_summary_interval_seconds == 5.0
     assert config.candidate_cache_max_entries == 2_000
     assert config.merger_emitted_cache_max_entries == 5_000
-    assert config.mic_min_input_rms_db == -38.0
+
     assert config.speaker_target_rms_db == -23.0
     assert config.speaker_max_normalization_gain_db == 18.0
     assert config.rolling_audio_archive_dir is None
     assert config.rolling_audio_segment_seconds == 60.0
     assert config.resume_transcript_log is False
-    assert config.profile.model == "small"
+    assert config.profile.model == "medium"
 
 
 def test_whisperlive_replay_config_defaults_to_mic_source(tmp_path) -> None:

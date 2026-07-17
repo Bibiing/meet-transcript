@@ -16,7 +16,7 @@ services:
       WHISPERLIVE_INITIAL_PROMPT: "${WHISPERLIVE_INITIAL_PROMPT:-}"
       WHISPERLIVE_HOTWORDS: "${WHISPERLIVE_HOTWORDS:-}"
       WHISPERLIVE_FORCE_SERVER_PROMPT: "${WHISPERLIVE_FORCE_SERVER_PROMPT:-true}"
-      WHISPERLIVE_DEFAULT_MODEL: "${WHISPERLIVE_DEFAULT_MODEL:-small}"
+      WHISPERLIVE_DEFAULT_MODEL: "${WHISPERLIVE_DEFAULT_MODEL:-medium}"
       WHISPERLIVE_PROCESS_LOG: "${WHISPERLIVE_PROCESS_LOG:-/app/logs/process.log}"
     gpus: all
     command:
@@ -27,7 +27,7 @@ services:
       - --backend
       - faster_whisper
       - --default_model
-      - "${WHISPERLIVE_DEFAULT_MODEL:-small}"
+      - "${WHISPERLIVE_DEFAULT_MODEL:-medium}"
       - --max_clients
       - "${WHISPERLIVE_MAX_CLIENTS:-4}"
       - --max_connection_time

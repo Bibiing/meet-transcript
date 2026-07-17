@@ -20,3 +20,5 @@ vendor/whisper.cpp/models/ggml-*.bin
 docs/
 config.toml
 draft/
+temp_server.py
+CLAUDE.md

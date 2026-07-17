@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 import wave
 
@@ -20,19 +19,18 @@ def preprocess_audio_dir(
     output_dir: Path = Path("audio"),
 ) -> list[PreprocessResult]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    processor = AudioPreprocessor(PreprocessConfig())
     return [
         preprocess_wav_file(
             input_dir / "mic.wav",
             output_dir / "mic.preprocessed.wav",
             source="mic",
-            preprocessor=processor,
+            preprocessor=None,
         ),
         preprocess_wav_file(
             input_dir / "speaker.wav",
             output_dir / "speaker.preprocessed.wav",
             source="speaker",
-            preprocessor=processor,
+            preprocessor=None,
         ),
     ]
 
@@ -54,7 +52,18 @@ def preprocess_wav_file(
             warning="input WAV does not exist",
         )
 
-    frame = _read_wav_as_frame(input_path, source=source)                   # membaca file WAV menjadi AudioFrame
+    try:
+        frame = _read_wav_as_frame(input_path, source=source)                   # membaca file WAV menjadi AudioFrame
+    except Exception as exc:
+        return PreprocessResult(
+            source=source,
+            input_path=input_path,
+            output_path=None,
+            chunk_count=0,
+            duration_seconds=0.0,
+            warning=f"failed to read WAV file: {exc}",
+        )
+
     processor = preprocessor or AudioPreprocessor(PreprocessConfig())  
     chunks = processor.preprocess_frames([frame])                           # berisi daftar PreprocessedAudioChunk hasil format conversion
 

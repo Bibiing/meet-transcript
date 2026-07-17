@@ -568,5 +568,47 @@ class TestWordTimestamps(unittest.TestCase):
         self.assertNotIn("words", last)
 
 
+class TestLocalAgreementAnchorInvariant(unittest.TestCase):
+    """Regresi (audit findings): saat local_agreement aktif, window cap HANYA membatasi
+    panjang window decode, TIDAK menggeser jangkar (timestamp_offset). Anchor yang bergeser
+    membuat prefix hipotesis misalign sehingga local agreement tidak pernah memfinalkan."""
+
+    def _client(self):
+        return ConcreteServeClient(
+            client_uid="anchor",
+            websocket=MagicMock(),
+            local_agreement=True,
+            local_agreement_window_seconds=20.0,
+        )
+
+    def test_backlog_over_window_keeps_anchor_and_caps_length(self):
+        client = self._client()
+        client.frames_offset = 0.0
+        client.timestamp_offset = 0.0
+        client.frames_np = np.zeros(30 * 16000, dtype=np.float32)  # backlog 30s > window 20s
+
+        input_bytes, duration = client.get_audio_chunk_for_processing()
+
+        # Jangkar TIDAK bergeser (bug lama: melompat ke live_edge - window = 10.0).
+        self.assertAlmostEqual(client.timestamp_offset, 0.0)
+        # Decode dijangkar di titik terkonfirmasi, bukan live edge.
+        self.assertAlmostEqual(client.processing_offset, 0.0)
+        # Biaya decode dibatasi: panjang window 20s dari jangkar.
+        self.assertEqual(input_bytes.shape[0], 20 * 16000)
+        self.assertAlmostEqual(duration, 20.0, places=3)
+
+    def test_within_window_takes_all_from_anchor(self):
+        client = self._client()
+        client.frames_offset = 0.0
+        client.timestamp_offset = 2.0
+        client.frames_np = np.zeros(10 * 16000, dtype=np.float32)  # 8s dari jangkar < window
+
+        input_bytes, duration = client.get_audio_chunk_for_processing()
+
+        self.assertAlmostEqual(client.timestamp_offset, 2.0)  # tak berubah
+        self.assertAlmostEqual(client.processing_offset, 2.0)
+        self.assertAlmostEqual(duration, 8.0, places=3)  # [2s, 10s]
+
+
 if __name__ == "__main__":
     unittest.main()

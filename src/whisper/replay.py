@@ -11,7 +11,9 @@ from typing import Literal
 import numpy as np
 
 from src.capture.models import AudioFrame
-from src.preprocessing.core import AudioPreprocessor, PreprocessConfig
+from src.preprocessing.core import AudioPreprocessor
+from src.preprocessing.models import PreprocessConfig
+from src.whisper.capture import _build_mic_preprocess_config, _build_speaker_preprocess_config
 from src.whisper.client_base import (
     WhisperLiveStreamClient,
 )
@@ -19,20 +21,33 @@ from src.whisper.session_utils import _events_from_segments
 from src.whisper.merger import TranscriptMerger
 
 
-from src.whisper.models import WhisperLiveConnectionConfig, WhisperLiveReplayConfig, WhisperLiveReplayResult
+from src.whisper.models import (
+    WhisperLiveConnectionConfig,
+    WhisperLiveReplayConfig,
+    WhisperLiveReplayResult,
+    WhisperLiveSessionConfig,
+)
+
+
+def _preprocess_config_for_replay(config: WhisperLiveReplayConfig) -> PreprocessConfig:
+    """Bangun konfigurasi DSP replay yang IDENTIK dengan mode live per-source.
+
+    Memakai ulang builder live (`_build_mic/speaker_preprocess_config`) sehingga
+    setiap perubahan profil DSP live otomatis mengalir ke replay — tanpa drift.
+    Ini prasyarat agar baseline & A/B comparison merepresentasikan kondisi live
+    (lihat 07-audit-findings: preprocess/replay lama memakai -20/24, live -23/18).
+    """
+    session_cfg = WhisperLiveSessionConfig(chunk_seconds=config.chunk_seconds)
+    if config.source == "mic":
+        return _build_mic_preprocess_config(session_cfg)
+    return _build_speaker_preprocess_config(session_cfg)
 
 
 def replay_wav_to_whisperlive(config: WhisperLiveReplayConfig) -> WhisperLiveReplayResult:
     """Preprocess a WAV file and stream it as one source to WhisperLive."""
 
     frame = _read_wav_as_frame(config.wav_path, config.source)
-    preprocessor = AudioPreprocessor(
-        PreprocessConfig(
-            chunk_seconds=config.chunk_seconds,
-            min_chunk_seconds=config.chunk_seconds,
-            noise_reduction_enabled=False,
-        )
-    )
+    preprocessor = AudioPreprocessor(_preprocess_config_for_replay(config))
     chunks = preprocessor.preprocess_frames([frame])
     if not chunks:
         raise ValueError(f"no speech chunks produced from {config.wav_path}")

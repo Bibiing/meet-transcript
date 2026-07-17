@@ -1,7 +1,7 @@
 from .file_processing import preprocess_audio_dir
 from .core import AudioPreprocessor
 from .models import PreprocessConfig
-from .vad_filter import VoiceActivityDetector
+
 
 __all__ = [
     "preprocess_audio_dir",   # mode preprocess

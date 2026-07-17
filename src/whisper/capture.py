@@ -4,6 +4,7 @@ import logging
 import queue
 import threading
 from dataclasses import replace
+from typing import TYPE_CHECKING
 
 from src.capture.errors import CaptureError, CaptureNotSupportedError
 from src.capture.mac_sys_audio import MacSystemAudioConfig, MacSystemAudioStream
@@ -16,7 +17,63 @@ from src.utils.logging import log_process_event
 from src.utils.os_detector import AudioBackend, get_audio_backend
 from src.whisper.models import WhisperLiveSessionConfig, WhisperLiveSessionStats
 
+if TYPE_CHECKING:
+    from src.preprocessing.vad import SileroVADFilter
+
 _log = logging.getLogger(__name__)
+
+
+def _build_client_vad_filter(cfg: WhisperLiveSessionConfig) -> "SileroVADFilter | None":
+    """Bangun satu SileroVADFilter untuk satu source, atau None bila nonaktif.
+
+    Dipanggil sekali per source di _build_capture_streams sehingga mic dan
+    speaker memiliki instance terpisah (state RNN tidak boleh dibagi). Import
+    dilakukan lazy agar saat fitur nonaktif, modul VAD/onnxruntime tak disentuh.
+    """
+    if not cfg.client_vad_enabled:
+        return None
+    from src.preprocessing.vad import SileroVADFilter, default_model_path
+
+    model_path = cfg.client_vad_model_path or default_model_path()
+    return SileroVADFilter(
+        model_path=model_path,
+        threshold=cfg.client_vad_threshold,
+        hangover_chunks=cfg.client_vad_hangover_chunks,
+    )
+
+
+def _apply_client_vad(
+    vad_filter: "SileroVADFilter | None",
+    chunks: list[PreprocessedAudioChunk],
+    stats: WhisperLiveSessionStats,
+    source: str,
+    queue_size: int,
+) -> list[PreprocessedAudioChunk]:
+    """Admission control: buang chunk non-speech sebelum masuk queue (ADR-001).
+
+    Filter dimiliki eksklusif oleh satu reader thread (satu per source) sehingga
+    state RNN-nya tidak perlu lock. Bila filter None (nonaktif) atau internal
+    disabled (graceful degradation), seluruh chunk lolos. Chunk yang dibuang
+    tidak dikirim; SentTimeline mengompensasi drift waktunya di sisi client.
+    """
+    if vad_filter is None:
+        return chunks
+    admitted: list[PreprocessedAudioChunk] = []
+    for chunk in chunks:
+        if vad_filter.is_speech(chunk):
+            admitted.append(chunk)
+            continue
+        stats.add_vad_dropped()
+        log_process_event(
+            "client.vad_drop",
+            source=source,
+            start_seconds=round(chunk.start_seconds, 3),
+            duration_seconds=round(chunk.duration_seconds, 3),
+            output_rms_db=round(chunk.rms_db, 2),
+            client_vad_dropped=stats.client_vad_dropped,
+            queue_size=queue_size,
+        )
+    return admitted
 
 # stream capture mic/speaker beserta reader thread-nya digunakan untuk menginisialisasi stream audio dari mikrofon dan speaker, serta membuat thread pembaca yang akan memproses audio dari hardware ke dalam antrian chunk.
 def _build_capture_streams(
@@ -54,7 +111,9 @@ def _build_capture_streams(
                 device=cfg.mic_device,
             )
 
-            reader_threads.append(_reader("mic", mic_stream, mic_preprocess_config, chunk_queue, stop_event, stats))
+            reader_threads.append(
+                _reader("mic", mic_stream, mic_preprocess_config, chunk_queue, stop_event, stats, _build_client_vad_filter(cfg))
+            )
         except Exception as exc: 
             log_process_event("client.capture_backend_error", source="mic", backend="microphone", error=str(exc))
             _log.warning("whisperlive session: mic unavailable: %s", exc)
@@ -90,19 +149,21 @@ def _build_capture_streams(
                 source="speaker",
                 backend=backend,
                 backend_audio=backend_audio.value,
-                backenn_audio=backend_audio.value,
+
                 sample_rate=cfg.sample_rate,
                 block_size=cfg.block_size,
                 queue_size=cfg.queue_size,
                 device=cfg.speaker_device,
             )
-            reader_threads.append(_reader("speaker", speaker_stream, speaker_preprocess_config, chunk_queue, stop_event, stats))
+            reader_threads.append(
+                _reader("speaker", speaker_stream, speaker_preprocess_config, chunk_queue, stop_event, stats, _build_client_vad_filter(cfg))
+            )
         except CaptureNotSupportedError as exc:
             log_process_event(
                 "client.capture_backend_error",
                 source="speaker",
                 backend_audio=backend_audio.value,
-                backenn_audio=backend_audio.value,
+
                 error=str(exc),
             )
             _log.warning("whisperlive session: speaker unavailable: %s", exc)
@@ -115,7 +176,7 @@ def _build_mic_preprocess_config(cfg: WhisperLiveSessionConfig) -> PreprocessCon
         min_chunk_seconds=cfg.chunk_seconds,
         target_rms_db=cfg.mic_target_rms_db,
         max_normalization_gain_db=cfg.mic_max_normalization_gain_db,
-        noise_reduction_enabled=False,
+        noise_reduction_enabled=cfg.mic_noise_reduction,
     )
 
 
@@ -136,6 +197,7 @@ def _reader(
     chunk_queue: queue.Queue[PreprocessedAudioChunk],
     stop_event: threading.Event,
     stats: WhisperLiveSessionStats,
+    vad_filter: "SileroVADFilter | None" = None,
 ) -> threading.Thread:
     return threading.Thread(
         target=_reader_thread,
@@ -146,6 +208,7 @@ def _reader(
             preprocess_config.chunk_seconds,
             stop_event,
             stats,
+            vad_filter,
         ),
         name=f"whisperlive-{source}-reader",
         daemon=True,
@@ -165,6 +228,7 @@ def _reader_thread(
     chunk_seconds: float,
     stop_event: threading.Event,
     stats: WhisperLiveSessionStats,
+    vad_filter: "SileroVADFilter | None" = None,
 ) -> None:
     buffer: list[AudioFrame] = []
     source_name = "unknown"
@@ -246,6 +310,9 @@ def _reader_thread(
             )
             continue
 
+        # Admission control VAD lokal: buang chunk non-speech sebelum enqueue.
+        chunks = _apply_client_vad(vad_filter, chunks, stats, source_name, chunk_queue.qsize())
+
         for chunk in chunks:
             try:
                 chunk_queue.put_nowait(chunk) # menambahkan chunk audio ke chunk_queue tanpa menunggu jika antrian penuh.
@@ -314,7 +381,10 @@ def _reader_thread(
         if partial_duration >= preprocessor.config.min_chunk_seconds:
 
             # untuk setiap chunk audio yang dihasilkan dari buffer terakhir
-            for chunk in preprocessor.preprocess_frames(buffer):
+            final_chunks = _apply_client_vad(
+                vad_filter, preprocessor.preprocess_frames(buffer), stats, source_name, chunk_queue.qsize()
+            )
+            for chunk in final_chunks:
                 for decision in preprocessor.last_decisions:
                     log_process_event(
                         "client.preprocess_decision",

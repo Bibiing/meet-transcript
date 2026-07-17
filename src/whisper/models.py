@@ -25,7 +25,7 @@ class WhisperLiveProfile:
 
     language: str = "id"
     task: Literal["transcribe", "translate"] = "transcribe"
-    model: str = "small"
+    model: str = "medium"
     use_vad: bool = False
     vad_threshold: float = 0.55
     vad_min_speech_duration_ms: int = 250
@@ -110,12 +110,20 @@ class WhisperLiveSessionConfig:
     speaker_server_vad: bool = False
 
     # client preprocessing level policy
+    mic_noise_reduction: bool = False
     mic_target_rms_db: float = -20.0
     mic_max_normalization_gain_db: float = 18.0
-    mic_min_input_rms_db: float = -38.0
     speaker_target_rms_db: float = -23.0
     speaker_max_normalization_gain_db: float = 18.0
     max_chunk_queue_size: int = 32
+
+    # Client-side VAD (admission control, ADR-001). Kill-switch default OFF:
+    # fitur belum lolos verifikasi mutu (Status Milestone 4) sehingga perilaku
+    # default dipertahankan (semua chunk dikirim). Diaktifkan via env/CLI.
+    client_vad_enabled: bool = False
+    client_vad_threshold: float = 0.5
+    client_vad_hangover_chunks: int = 2
+    client_vad_model_path: Path | None = None
     
     # koneksi dan reconnect
     auto_reconnect: bool = True
@@ -145,6 +153,8 @@ class WhisperLiveSessionStats:
     chunks_sent: int = 0
     chunks_dropped: int = 0
     chunks_buffered: int = 0
+    client_vad_dropped: int = 0
+    client_mute_dropped: int = 0
     reconnect_attempts: int = 0
     reconnect_successes: int = 0
     results_received: int = 0
@@ -169,6 +179,14 @@ class WhisperLiveSessionStats:
     def add_chunks_dropped(self, count: int = 1) -> None:
         with self._lock:
             self.chunks_dropped += count
+
+    def add_vad_dropped(self, count: int = 1) -> None:
+        with self._lock:
+            self.client_vad_dropped += count
+
+    def add_mute_dropped(self, count: int = 1) -> None:
+        with self._lock:
+            self.client_mute_dropped += count
 
     def add_result_received(self, count: int = 1) -> None:
         with self._lock:

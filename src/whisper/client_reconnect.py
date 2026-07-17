@@ -9,6 +9,7 @@ from typing import Callable, Literal
 
 from src.preprocessing.core import PreprocessedAudioChunk
 from src.whisper.client_base import WhisperLiveStreamClient
+from src.whisper.sent_timeline import SentTimeline
 from src.utils.logging import log_process_event
 
 _log = logging.getLogger(__name__)
@@ -38,6 +39,11 @@ class _BufferedReconnectClient:
         self._next_reconnect_at = 0.0
         self._buffer: deque[PreprocessedAudioChunk] = deque()
         self._buffered_seconds = 0.0
+        self.sent_timeline = SentTimeline()
+        self._total_sent_seconds = 0.0
+        # Penanda epoch koneksi. Naik tiap _connect; segmen dari epoch usang
+        # di-drop agar tidak dipetakan terhadap timeline yang sudah di-reset (M1).
+        self._generation = 0
         self._lock = threading.RLock()
 
     # thread-safe property untuk memeriksa apakah client terhubung dan siap mengirim chunk
@@ -70,6 +76,8 @@ class _BufferedReconnectClient:
             if self.connected:
                 try:
                     self._client.send_chunk(chunk)  # mengirim chunk ke server
+                    self.sent_timeline.record_sent(self._total_sent_seconds, chunk.start_seconds)
+                    self._total_sent_seconds += chunk.duration_seconds
 
                     # outcome dengan sent=1 chunk berhasil dikirim
                     return _combine_outcome(outcome, SendOutcome(sent=1))
@@ -128,10 +136,22 @@ class _BufferedReconnectClient:
         )
         self.close(send_end_of_audio=False)
 
+        # Mulai epoch baru SEBELUM koneksi baru dibuat: naikkan generation dan
+        # reset timeline + counter di sini, bukan setelah connect sukses. Dengan
+        # begitu recv thread client baru selalu menemui timeline epoch baru yang
+        # bersih, dan segmen epoch lama (generation lama) dijamin di-drop oleh
+        # _forward_transcript. Ini menutup race pemetaan lintas-epoch (M1).
+        self._generation += 1
+        generation = self._generation
+        self._total_sent_seconds = 0.0
+        self.sent_timeline.reset()
+
         client = WhisperLiveStreamClient(
             self.source,
             self.connection_config,
-            on_transcript=self._on_transcript,
+            on_transcript=lambda src, segments, message, gen=generation: self._forward_transcript(
+                gen, src, segments, message
+            ),
             on_status=self._handle_status,
         )
         try:
@@ -151,7 +171,6 @@ class _BufferedReconnectClient:
                 buffered_seconds=round(self._buffered_seconds, 3),
             )
             return SendOutcome(reconnect_attempts=1)
-
         self._client = client
         self._connected = True
         self._attempt = 0
@@ -163,6 +182,28 @@ class _BufferedReconnectClient:
             buffered_seconds=round(self._buffered_seconds, 3),
         )
         return SendOutcome(reconnect_attempts=1, reconnect_successes=1)
+
+    def _forward_transcript(self, generation: int, source: str, segments: list[dict], message: dict) -> None:
+        """Teruskan segmen hanya bila berasal dari epoch koneksi terkini.
+
+        Segmen dari koneksi lama (generation usang) di-drop: timeline telah
+        di-reset untuk epoch baru sehingga memetakannya akan menghasilkan
+        timestamp salah, dan audio di sekitar reconnect sudah dikirim ulang ke
+        epoch baru (redundan). Cek generation di bawah _lock agar terserialisasi
+        dengan _connect; callback berat (_on_transcript) dipanggil di luar lock.
+        """
+        with self._lock:
+            current = self._generation
+        if generation != current:
+            log_process_event(
+                "client.transcript_dropped_stale_epoch",
+                source=source,
+                generation=generation,
+                current_generation=current,
+                segment_count=len(segments),
+            )
+            return
+        self._on_transcript(source, segments, message)
 
     def _handle_status(self, source: str, message: dict) -> None:
         status = str(message.get("status") or "")
@@ -230,6 +271,8 @@ class _BufferedReconnectClient:
             self._buffered_seconds = max(0.0, self._buffered_seconds - chunk.duration_seconds)
             try:
                 self._client.send_chunk(chunk)  # type: ignore[union-attr]
+                self.sent_timeline.record_sent(self._total_sent_seconds, chunk.start_seconds)
+                self._total_sent_seconds += chunk.duration_seconds
                 sent += 1
             except Exception as exc:
                 self._buffer.appendleft(chunk)

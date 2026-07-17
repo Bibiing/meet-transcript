@@ -282,7 +282,7 @@ class _PartialTranscriptPreview:
         self._last_print_by_source: dict[str, float] = {}
         self._min_interval_seconds = min_interval_seconds
 
-    def show(self, source: str, segments: list[dict]) -> None:
+    def show(self, source: str, segments: list[dict], timeline_mapper: Callable[[float], float] | None = None) -> None:
         partials = [segment for segment in segments if not segment.get("completed", True)]
         if not partials:
             return
@@ -306,6 +306,9 @@ class _PartialTranscriptPreview:
         label = MEETING_SOURCE_LABELS.get(source, source.upper())
         start = _float_or_zero(segment.get("start"))
         end = _float_or_zero(segment.get("end"))
+        if timeline_mapper:
+            start = timeline_mapper(start)
+            end = timeline_mapper(end)
         print(f"[live {_format_timestamp(start)} - {_format_timestamp(end)}] [{label}] {normalized}", flush=True)
 
 
@@ -337,6 +340,7 @@ def _events_from_segments(
     model_name: str,
     language: str | None,
     segments: list[dict],
+    timeline_mapper: Callable[[float], float] | None = None,
 ) -> list[WhisperLiveTranscriptEvent]:
     """Mengubah format segment JSON dari WhisperLive menjadi format internal event Transcript."""
     events: list[WhisperLiveTranscriptEvent] = []
@@ -346,6 +350,11 @@ def _events_from_segments(
             continue
         start = _float_or_zero(segment.get("start"))
         end = _float_or_zero(segment.get("end"))
+        
+        if timeline_mapper:
+            start = timeline_mapper(start)
+            end = timeline_mapper(end)
+            
         duration = max(0.0, end - start)
         result = (
             TranscriptionResult(

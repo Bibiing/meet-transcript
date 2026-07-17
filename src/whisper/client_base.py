@@ -155,9 +155,9 @@ class WhisperLiveStreamClient:
             self._socket.send_binary(self.END_OF_AUDIO)
             self._audio_finished = True
             self._emit_status("CLIENT_AUDIO_FINISHED", **self._diagnostics())
-        except Exception:
-            pass
-
+        except Exception as exc:
+            _log.warning("whisperlive stream '%s' failed to send END_OF_AUDIO: %s", self.source, exc)
+            self._emit_status("CLIENT_SEND_ERROR", error=str(exc))
     def close(self, *, send_end_of_audio: bool = True) -> None:
         was_closed = self._closed
         self._stop_event.set()
@@ -170,8 +170,8 @@ class WhisperLiveStreamClient:
         if socket is not None:
             try:
                 socket.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                _log.debug("whisperlive stream '%s' socket close error: %s", self.source, exc)
         thread = self._recv_thread
         if thread is not None and thread.is_alive() and thread is not threading.current_thread():
             thread.join(timeout=2.0)

@@ -18,27 +18,57 @@ from src.capture.mic_stream import list_input_devices
 from src.capture.win_loopback import list_soundcard_loopback_devices
 from src.utils.logging import load_transcript_entries
 from src.utils.os_detector import AudioBackend, get_audio_backend
+from src.utils.status_ipc import format_command_line, parse_level_line, parse_status_line
 
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 DEFAULT_TRANSCRIPT_LOG = ROOT_DIR / "audio" / "transcript_log.json"
 DEFAULT_LOG_FILE = ROOT_DIR / "logs" / "transcriber.log"
 
+# Margin di atas final_drain_seconds subprocess saat menunggu graceful stop.
+# Menutup batas atas deterministik yang berjalan seri dengan drain: join reader
+# thread (<=3s/thread), flush reconnect buffer (<=5s), plus slack. Lihat BUG-001.
+STOP_DRAIN_MARGIN_SECONDS = 12.0
+
+# Policy pemetaan kode status subprocess -> state koneksi UI (BUG-002).
+# Kode berasal dari handle_status/reconnect client di subprocess; state adalah
+# 4 nilai yang divalidasi set_connection_status. Kode di luar tabel ini
+# (mis. CLIENT_AUDIO_FINISHED, CLIENT_CLOSING, WAIT) tidak mengubah status.
+_CONNECTION_STATE_BY_CODE: dict[str, str] = {
+    "CLIENT_CONNECTING": "CONNECTING",
+    "CLIENT_CONNECTING_RETRY": "CONNECTING",
+    "CLIENT_RECONNECTING": "CONNECTING",
+    "CLIENT_SOCKET_OPEN": "CONNECTING",
+    "CLIENT_OPTIONS_SENT": "CONNECTING",
+    "CLIENT_WAITING_SERVER_READY": "CONNECTING",
+    "SERVER_READY": "CONNECTED",
+    "CLIENT_CONNECTED_READY": "CONNECTED",
+    "CLIENT_RECONNECTED": "CONNECTED",
+    "CLIENT_RECV_ERROR": "ERROR",
+    "CLIENT_READY_TIMEOUT": "ERROR",
+    "ERROR": "ERROR",
+    "DISCONNECT": "DISCONNECTED",
+    "CLIENT_REMOTE_CLOSED": "DISCONNECTED",
+    "CLIENT_RECONNECT_FAILED": "DISCONNECTED",
+    "CLIENT_CLOSED": "DISCONNECTED",
+}
+
 
 @dataclass(slots=True)
 class UiOptions:
     """Options for starting a live transcription subprocess."""
 
-    host: str = "localhost"
-    port: int = 9090
+    host: str | None = None
+    port: int | None = None
     source: str = "both"
-    model: str = "small"
+    model: str = "medium"
     language: str = "id"
     chunk_seconds: float = 0.5
     mic_device: int | str | None = None
     speaker_device: int | str | None = None
     mic_server_vad: bool = True
     speaker_server_vad: bool = False
+    mic_webrtc_ns: bool = False
     mic_target_rms_db: float = -20.0
     mic_max_normalization_gain_db: float = 18.0
     speaker_target_rms_db: float = -23.0
@@ -82,6 +112,10 @@ class LiveProcessState:
     stop_requested: bool = False
     last_error: str | None = None
     connection_status: str = "DISCONNECTED"
+    # Anggaran drain sesi aktif; dipakai stop_live untuk menurunkan timeout tunggu.
+    final_drain_seconds: float = 10.0
+    # Level audio nyata per source (RMS dB), diperbarui dari sinyal level subprocess.
+    audio_levels: dict[str, float] = field(default_factory=dict)
     lock: threading.RLock = field(default_factory=threading.RLock)
 
     def running(self) -> bool:
@@ -138,10 +172,13 @@ def build_live_command(options: UiOptions) -> list[str]:
         "live",
         "--source",
         options.source,
-        "--server-host",
-        options.host,
-        "--server-port",
-        str(options.port),
+    ]
+    if options.host is not None:
+        command.extend(["--server-host", options.host])
+    if options.port is not None:
+        command.extend(["--server-port", str(options.port)])
+        
+    command.extend([
         "--server-ready-timeout",
         _num(options.ready_timeout),
         "--whisper-model",
@@ -191,7 +228,7 @@ def build_live_command(options: UiOptions) -> list[str]:
         _num(options.rolling_audio_segment_seconds),
         "--process-log-summary-interval-seconds",
         _num(options.process_log_summary_interval_seconds),
-    ]
+    ])
     if options.mic_device is not None:
         command.extend(["--mic-device", str(options.mic_device)])
     if options.speaker_device is not None:
@@ -211,6 +248,7 @@ def build_live_command(options: UiOptions) -> list[str]:
 
 
 def start_live(options: UiOptions) -> dict[str, Any]:
+    _await_stop_in_progress()
     with STATE.lock:
         if STATE.process is not None and STATE.process.poll() is None:
             raise RuntimeError("live session is already running")
@@ -231,6 +269,7 @@ def start_live(options: UiOptions) -> dict[str, Any]:
         process = subprocess.Popen(
             command,
             cwd=str(ROOT_DIR),
+            stdin=subprocess.PIPE,  # kanal kontrol masuk (true mute) tanpa restart sesi
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -244,10 +283,12 @@ def start_live(options: UiOptions) -> dict[str, Any]:
         STATE.started_at = time.time()
         STATE.command = command
         STATE.transcript_log = options.transcript_log
+        STATE.final_drain_seconds = options.final_drain_seconds
         STATE.exit_code = None
         STATE.stop_requested = False
         STATE.last_error = None
         STATE.connection_status = "CONNECTING"
+        STATE.audio_levels.clear()
         STATE.log_lines.clear()
         STATE.append_log("UI started live client")
 
@@ -256,7 +297,7 @@ def start_live(options: UiOptions) -> dict[str, Any]:
     return STATE.snapshot()
 
 
-def stop_live(*, force: bool = False, wait_timeout_seconds: float = 3.0) -> dict[str, Any]:
+def stop_live(*, force: bool = False, wait_timeout_seconds: float | None = None) -> dict[str, Any]:
     with STATE.lock:
         process = STATE.process
         if process is None or process.poll() is not None:
@@ -265,6 +306,12 @@ def stop_live(*, force: bool = False, wait_timeout_seconds: float = 3.0) -> dict
         STATE.stop_requested = True
         STATE.connection_status = "DISCONNECTED"
         STATE.append_log("UI stop requested")
+        if wait_timeout_seconds is None:
+            # Turunkan anggaran tunggu dari final_drain_seconds subprocess, bukan
+            # konstanta pendek. Subprocess butuh >= final_drain_seconds untuk
+            # menerima hasil akhir server (END_OF_AUDIO) dan menuliskan flush
+            # merger terakhir; terminate() dini akan membuang transcript penutup.
+            wait_timeout_seconds = STATE.final_drain_seconds + STOP_DRAIN_MARGIN_SECONDS
 
     if force:
         process.terminate()
@@ -292,6 +339,69 @@ def stop_live(*, force: bool = False, wait_timeout_seconds: float = 3.0) -> dict
             process.kill()
 
     return STATE.snapshot()
+
+
+def _await_stop_in_progress() -> None:
+    """Tunggu sesi sebelumnya yang sedang di-stop hingga prosesnya benar-benar exit.
+
+    Konsekuensi dari graceful stop yang lebih panjang (BUG-001): proses lama bisa
+    masih hidup selama drain. Tanpa penantian ini, restart cepat (toggle mute atau
+    Start tepat setelah Stop) gagal dengan "live session is already running".
+    Hanya menunggu bila stop memang sedang berjalan; sesi aktif tanpa permintaan
+    stop tetap dibiarkan menolak start seperti semula.
+    """
+    with STATE.lock:
+        process = STATE.process
+        stopping = STATE.stop_requested
+        budget = STATE.final_drain_seconds + STOP_DRAIN_MARGIN_SECONDS
+    if process is None or not stopping:
+        return
+    deadline = time.time() + budget
+    while time.time() < deadline:
+        if process.poll() is not None:
+            return
+        time.sleep(0.05)
+
+
+def connection_status() -> str:
+    """Status koneksi sesi live saat ini (CONNECTING/CONNECTED/ERROR/DISCONNECTED).
+
+    Accessor tingkat-modul agar konsumen (GUI) tidak perlu menyentuh singleton
+    STATE secara langsung. Dipelihara oleh _monitor_process dari sinyal stdout
+    subprocess (lihat BUG-002).
+    """
+    return STATE.get_connection_status()
+
+
+def set_mute(source: str, muted: bool) -> bool:
+    """Mute/unmute satu source pada sesi live yang sedang berjalan (true mute).
+
+    Mengirim perintah lewat stdin subprocess sehingga koneksi WebSocket dan state
+    ASR server (termasuk local-agreement) tetap dipertahankan — tidak ada restart
+    sesi. Mengembalikan False bila tidak ada sesi aktif atau pipe tidak tersedia.
+    """
+    with STATE.lock:
+        process = STATE.process
+        if process is None or process.poll() is not None or process.stdin is None:
+            return False
+        try:
+            process.stdin.write(format_command_line("set_mute", source=source, muted=muted))
+            process.stdin.flush()
+        except (OSError, ValueError) as exc:
+            STATE.append_log(f"set_mute({source}) failed: {exc}")
+            return False
+        STATE.append_log(f"Mute {source}: {muted}")
+        return True
+
+
+def audio_levels() -> dict[str, float]:
+    """Level audio nyata per source (RMS dB) untuk indikator GUI real-time.
+
+    Dikosongkan saat tidak ada sesi berjalan. Diperbarui _monitor_process dari
+    sinyal level subprocess.
+    """
+    with STATE.lock:
+        return dict(STATE.audio_levels)
 
 
 def archive_transcript(path: Path = DEFAULT_TRANSCRIPT_LOG) -> Path | None:
@@ -425,6 +535,46 @@ def _speaker_capture_status(backend: AudioBackend) -> dict[str, Any]:
         "status": "unsupported",
         "message": "Speaker/system-audio capture is unsupported on this platform.",
     }
+
+
+def _handle_monitor_line(line: str) -> None:
+    """Proses satu baris stdout subprocess.
+
+    Status koneksi diambil HANYA dari baris sinyal terstruktur (BUG-002);
+    prosa/transcript tidak pernah discan kata kunci sehingga ucapan yang memuat
+    kata seperti "error" tidak lagi memicu status palsu.
+    """
+    parsed = parse_status_line(line)
+    if parsed is not None:
+        source, code = parsed
+        ui_state = _CONNECTION_STATE_BY_CODE.get(code)
+        if ui_state is not None:
+            STATE.set_connection_status(ui_state)
+            STATE.append_log(f"Connection status: {ui_state} ({source}:{code})")
+        return
+    level = parse_level_line(line)
+    if level is not None:
+        source, rms_db = level
+        with STATE.lock:
+            STATE.audio_levels[source] = rms_db
+        return  # baris level tidak di-log (frekuensi tinggi)
+    STATE.append_log(line)
+
+
+def _monitor_process(process: subprocess.Popen[str]) -> None:
+    if process.stdout is None:
+        raise RuntimeError("live client stdout is not captured")
+
+    try:
+        for line in process.stdout:
+            _handle_monitor_line(line)
+    finally:
+        exit_code = process.wait()
+        with STATE.lock:
+            STATE.exit_code = exit_code
+            STATE.connection_status = "DISCONNECTED"
+            STATE.audio_levels.clear()
+            STATE.append_log(f"live client exited with code {exit_code}")
 
 
 def _safe_path(value: str) -> Path:
