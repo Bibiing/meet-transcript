@@ -91,6 +91,14 @@ jobs:
     #   modulnya saat import (mediafoundation.py.h di Windows, coreaudio.py.h di macOS).
     #   --include-module hanya membawa bytecode, BUKAN file data -> import gagal dengan
     #   FileNotFoundError di dalam onefile. Flag ini yang membawa file .h tersebut.
+    # --include-windows-runtime-dlls=no: JANGAN bundel Windows C runtime (UCRT) dari
+    #   mesin build. Default Nuitka 'auto' memanen api-ms-win-crt-*.dll dari runner CI
+    #   (yang punya Visual Studio/Windows SDK) dan menaruhnya di payload onefile. Saat
+    #   diekstrak di mesin target, loader Windows memuat stub asing itu lebih dulu dan
+    #   menolaknya -> "Bad Image". UCRT adalah komponen OS pada Windows 10/11, jadi
+    #   target harus memakai milik OS-nya sendiri (sesuai panduan Microsoft: apiset
+    #   api-ms-win-* tidak boleh diredistribusi antar-versi Windows).
+    #   CI tidak dapat menangkap kelas bug ini: di runner, mesin build = mesin uji.
     - name: Build with Nuitka (Windows)
       if: runner.os == 'Windows'
       shell: cmd
@@ -106,6 +114,7 @@ jobs:
           --include-module=soundcard ^
           --include-package-data=soundcard ^
           --nofollow-import-to=whisper,numba,torch,torchaudio ^
+          --include-windows-runtime-dlls=no ^
           --windows-console-mode=disable ^
           --remove-output ^
           --assume-yes-for-downloads ^
