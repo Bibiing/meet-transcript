@@ -87,6 +87,10 @@ jobs:
     # --assume-yes-for-downloads: Otomatis download MinGW C compiler jika belum ada
     # --include-package=src: Pastikan semua modul src.* masuk ke bundle
     # --nofollow-import-to: Exclude package berat yang tidak dibutuhkan runtime client
+    # --include-package-data=soundcard: soundcard (CFFI) membaca file .h di sebelah
+    #   modulnya saat import (mediafoundation.py.h di Windows, coreaudio.py.h di macOS).
+    #   --include-module hanya membawa bytecode, BUKAN file data -> import gagal dengan
+    #   FileNotFoundError di dalam onefile. Flag ini yang membawa file .h tersebut.
     - name: Build with Nuitka (Windows)
       if: runner.os == 'Windows'
       shell: cmd
@@ -100,6 +104,7 @@ jobs:
           --include-package=src ^
           --include-module=sounddevice ^
           --include-module=soundcard ^
+          --include-package-data=soundcard ^
           --nofollow-import-to=whisper,numba,torch,torchaudio ^
           --windows-console-mode=disable ^
           --remove-output ^
@@ -131,6 +136,7 @@ jobs:
           $EXTRA_ARGS \
           --include-module=sounddevice \
           --include-module=soundcard \
+          --include-package-data=soundcard \
           --nofollow-import-to=whisper,numba,torch,torchaudio \
           --remove-output \
           --assume-yes-for-downloads \
