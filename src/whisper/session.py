@@ -110,14 +110,14 @@ _log = logging.getLogger(__name__)
 _status_emit_lock = threading.Lock()
 
 
-def _emit_connection_signal(source: str, status: str) -> None:
+def _emit_connection_signal(source: str, status: str, **details: object) -> None:
     """Kirim status koneksi terstruktur ke stdout untuk diparse parent (BUG-002).
 
     Terpisah dari prosa human-readable: parent tidak lagi menebak status dari
     substring yang menabrak teks transcript. Ditulis satu baris utuh di bawah
     lock agar tidak terpotong output thread source lain.
     """
-    line = format_status_line(source, status)
+    line = format_status_line(source, status, **details)
     with _status_emit_lock:
         sys.stdout.write(line)
         sys.stdout.flush()
@@ -354,7 +354,20 @@ def run_whisperlive_session(
         status = str(message.get("status") or message.get("message") or "UNKNOWN")
         # Sinyal terstruktur untuk parent (kode mentah; pemetaan ke state UI
         # adalah policy milik parent). Prosa di bawah tetap untuk pembacaan manusia.
-        _emit_connection_signal(source, status)
+        if status == "OUTDATED_CLIENT":
+            # W4: versi minimum ikut dikirim agar GUI dapat menyusun pesan yang
+            # dapat ditindaklanjuti (versi terpasang, minimum, URL unduh).
+            _emit_connection_signal(source, status, min_version=str(message.get("min_version") or ""))
+        elif status == "CLIENT_TLS_ERROR":
+            # W2: sebab kegagalan TLS ikut dikirim agar GUI tidak hanya menampilkan "Error".
+            _emit_connection_signal(
+                source,
+                status,
+                reason=str(message.get("reason") or ""),
+                url=str(message.get("url") or ""),
+            )
+        else:
+            _emit_connection_signal(source, status)
         label = source.upper()
         if status == "CLIENT_CONNECTING":
             log_process_event("client.ws_connect", source=source, details=message)

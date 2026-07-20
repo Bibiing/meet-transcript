@@ -18,6 +18,8 @@ services:
       WHISPERLIVE_FORCE_SERVER_PROMPT: "${WHISPERLIVE_FORCE_SERVER_PROMPT:-true}"
       WHISPERLIVE_DEFAULT_MODEL: "${WHISPERLIVE_DEFAULT_MODEL:-medium}"
       WHISPERLIVE_PROCESS_LOG: "${WHISPERLIVE_PROCESS_LOG:-/app/logs/process.log}"
+      # W4: versi client minimum (X.Y.Z). Kosong = penegakan mati (default).
+      WHISPERLIVE_MIN_CLIENT_VERSION: "${WHISPERLIVE_MIN_CLIENT_VERSION:-}"
     gpus: all
     command:
       - python

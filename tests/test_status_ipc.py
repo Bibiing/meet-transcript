@@ -54,7 +54,13 @@ def test_format_and_parse_round_trip() -> None:
     line = format_status_line("mic", "SERVER_READY")
     assert line.startswith(STATUS_SENTINEL)
     assert line.endswith("\n")
-    assert parse_status_line(line) == ("mic", "SERVER_READY")
+    assert parse_status_line(line) == ("mic", "SERVER_READY", {})
+
+
+def test_format_and_parse_round_trip_with_details() -> None:
+    # W4: detail pendamping kode status (mis. min_version) ikut lintas-proses.
+    line = format_status_line("mic", "OUTDATED_CLIENT", min_version="1.2.0")
+    assert parse_status_line(line) == ("mic", "OUTDATED_CLIENT", {"min_version": "1.2.0"})
 
 
 def test_parse_ignores_prose_and_transcript() -> None:
@@ -74,4 +80,4 @@ def test_parse_rejects_corrupted_payload() -> None:
 
 def test_parse_handles_non_ascii_status_source() -> None:
     line = format_status_line("speaker", "SERVER_READY")
-    assert parse_status_line(line) == ("speaker", "SERVER_READY")
+    assert parse_status_line(line) == ("speaker", "SERVER_READY", {})

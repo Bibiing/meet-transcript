@@ -21,18 +21,20 @@ LEVEL_SENTINEL = "##PLN-LEVEL##"
 COMMAND_SENTINEL = "##PLN-CMD##"
 
 
-def format_status_line(source: str, status: str) -> str:
+def format_status_line(source: str, status: str, **details: object) -> str:
     """Bentuk satu baris status ber-sentinel (termasuk newline penutup).
 
     Ditulis sebagai satu baris utuh agar parser parent dapat memisahkannya
     dari prosa/transcript hanya dengan memeriksa prefix dan mem-parse JSON.
+    `details` opsional membawa data pendamping kode status (mis. `min_version`
+    pada penolakan versi); mekanisme ini tetap netral terhadap policy.
     """
-    payload = json.dumps({"source": source, "status": status}, ensure_ascii=False)
+    payload = json.dumps({"source": source, "status": status, **details}, ensure_ascii=False)
     return f"{STATUS_SENTINEL}{payload}\n"
 
 
-def parse_status_line(line: str) -> tuple[str, str] | None:
-    """Ekstrak (source, status) dari baris stdout, atau None bila bukan sinyal.
+def parse_status_line(line: str) -> tuple[str, str, dict] | None:
+    """Ekstrak (source, status, details) dari baris stdout, atau None bila bukan sinyal.
 
     Defensif terhadap baris yang terpotong/tercampur: hanya mengembalikan hasil
     bila baris benar-benar diawali sentinel dan sisanya JSON valid dengan field
@@ -53,7 +55,8 @@ def parse_status_line(line: str) -> tuple[str, str] | None:
     status = payload.get("status")
     if not isinstance(source, str) or not isinstance(status, str):
         return None
-    return source, status
+    details = {k: v for k, v in payload.items() if k not in {"source", "status"}}
+    return source, status, details
 
 
 def format_level_line(source: str, rms_db: float) -> str:

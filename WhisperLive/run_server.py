@@ -46,6 +46,12 @@ if __name__ == "__main__":
         help='Default Faster-Whisper hotwords used when clients do not provide one.',
     )
     parser.add_argument(
+        '--min_client_version',
+        type=str,
+        default=os.getenv("WHISPERLIVE_MIN_CLIENT_VERSION", ""),
+        help='Minimum client version (X.Y.Z) allowed to connect. Empty = enforcement disabled.',
+    )
+    parser.add_argument(
         '--force_server_prompt',
         action='store_true',
         default=os.getenv("WHISPERLIVE_FORCE_SERVER_PROMPT", "true").strip().lower() in {"1", "true", "yes", "on"},
@@ -92,4 +98,5 @@ if __name__ == "__main__":
         default_hotwords=args.default_hotwords,
         default_model=args.default_model,
         force_server_prompt=args.force_server_prompt,
+        min_client_version=args.min_client_version,
     )

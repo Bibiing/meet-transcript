@@ -36,6 +36,7 @@ from whisper_live.vad import VoiceActivityDetector
 from whisper_live.backend.base import ServeClientBase
 from whisper_live.defaults import DEFAULT_HOTWORDS, DEFAULT_INITIAL_PROMPT
 from whisper_live.process_logging import log_process_event
+from whisper_live.version_policy import is_client_outdated, validate_min_client_version
 
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("faster_whisper").setLevel(logging.WARNING)
@@ -215,6 +216,8 @@ class TranscriptionServer:
         self.default_hotwords = DEFAULT_HOTWORDS
         self.default_model = "small"
         self.force_server_prompt = True
+        # W4: kosong = penegakan versi mati (default aman untuk pengembangan lokal).
+        self.min_client_version = ""
 
     def initialize_client(
         self, websocket, options, faster_whisper_custom_model_path,
@@ -453,6 +456,35 @@ class TranscriptionServer:
             options = websocket.recv()
             options = json.loads(options)
             options["model"] = options.get("model") or self.default_model
+
+            # W4: tolak client usang SEBELUM sesi dibuat (tidak memakan kapasitas).
+            # Pesan terstruktur: server tetap generik, client yang menyusun kalimat
+            # memakai URL unduh org-nya sendiri.
+            client_version = options.get("client_version")
+            if is_client_outdated(client_version, self.min_client_version):
+                logging.warning(
+                    "Rejected outdated client uid=%s client_version=%s min=%s",
+                    options.get("uid"), client_version, self.min_client_version,
+                )
+                log_process_event(
+                    "server.client_rejected_outdated",
+                    uid=options.get("uid"),
+                    client_version=client_version,
+                    min_client_version=self.min_client_version,
+                )
+                wl_metrics.track_connection_rejected(reason="outdated_client")
+                websocket.send(json.dumps({
+                    "uid": options.get("uid"),
+                    "status": "ERROR",
+                    "code": "OUTDATED_CLIENT",
+                    "min_version": self.min_client_version,
+                    "message": (
+                        f"Client version {client_version or 'unknown'} is older than the "
+                        f"minimum required version {self.min_client_version}."
+                    ),
+                }))
+                websocket.close()
+                return False
 
             self.use_vad = options.get('use_vad')
             if self.client_manager.is_server_full(websocket, options):
@@ -704,7 +736,8 @@ class TranscriptionServer:
             default_initial_prompt: Optional[str] = None,
             default_hotwords: Optional[str] = None,
             default_model: str = "small",
-            force_server_prompt: bool = True):
+            force_server_prompt: bool = True,
+            min_client_version: Optional[str] = None):
         """Jalankan server transcription.
 
         Jalur production project ini adalah WebSocket port 9090. REST API tetap
@@ -717,6 +750,11 @@ class TranscriptionServer:
         self.default_hotwords = default_hotwords or DEFAULT_HOTWORDS
         self.default_model = default_model or "small"
         self.force_server_prompt = force_server_prompt
+        # W4: validasi saat start -> salah ketik kebijakan gagal cepat di deploy,
+        # bukan menolak seluruh client diam-diam saat runtime.
+        self.min_client_version = validate_min_client_version(min_client_version)
+        if self.min_client_version:
+            logging.info("Client version enforcement active: minimum %s", self.min_client_version)
 
         if max_clients < 1:
             raise ValueError(f"max_clients must be >= 1, got {max_clients}")

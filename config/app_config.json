@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "server": {
+    "host": "localhost",
+    "port": 9090,
+    "use_tls": false
+  },
+  "transcription": {
+    "model": "medium",
+    "language": "id",
+    "initial_prompt": "Indonesian meeting transcript. Transcribe the audio in Indonesian; do not translate to English. Preserve technical terms, abbreviations, system names, and common loanwords as spoken.",
+    "hotwords": ""
+  },
+  "update": {
+    "download_url": "https://github.com/pln/meeting-transcriber/releases/latest"
+  }
+}

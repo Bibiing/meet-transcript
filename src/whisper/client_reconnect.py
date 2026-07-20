@@ -8,7 +8,7 @@ from time import perf_counter
 from typing import Callable, Literal
 
 from src.preprocessing.core import PreprocessedAudioChunk
-from src.whisper.client_base import WhisperLiveStreamClient
+from src.whisper.client_base import OutdatedClientError, TlsVerificationError, WhisperLiveStreamClient
 from src.whisper.sent_timeline import SentTimeline
 from src.utils.logging import log_process_event
 
@@ -44,6 +44,9 @@ class _BufferedReconnectClient:
         # Penanda epoch koneksi. Naik tiap _connect; segmen dari epoch usang
         # di-drop agar tidak dipetakan terhadap timeline yang sudah di-reset (M1).
         self._generation = 0
+        # W4: penolakan versi bersifat PERMANEN. Tanpa state terminal, kebijakan
+        # server akan berubah menjadi loop reconnect yang menghantam server.
+        self._fatal_status: str | None = None
         self._lock = threading.RLock()
 
     # thread-safe property untuk memeriksa apakah client terhubung dan siap mengirim chunk
@@ -120,6 +123,11 @@ class _BufferedReconnectClient:
             client.close(send_end_of_audio=send_end_of_audio)
 
     def _connect(self, *, force: bool) -> SendOutcome:
+        with self._lock:
+            fatal = self._fatal_status
+        if fatal is not None:
+            # Terminal: mencoba lagi tidak akan pernah berhasil (mis. versi usang).
+            return SendOutcome()
         if not self.policy.enabled and not force:
             return SendOutcome()
         now = perf_counter()
@@ -156,6 +164,20 @@ class _BufferedReconnectClient:
         )
         try:
             client.connect()
+        except (OutdatedClientError, TlsVerificationError) as exc:
+            # Terminal & deterministik: jangan bergantung pada callback status yang
+            # dijalankan recv thread (connect gagal-cepat bisa mendahuluinya).
+            # Keduanya permanen sampai server/sertifikat diperbaiki; mencoba ulang
+            # hanya menghantam server dengan kegagalan yang sama.
+            reason = "OUTDATED_CLIENT" if isinstance(exc, OutdatedClientError) else "TLS_ERROR"
+            with self._lock:
+                self._fatal_status = reason
+                self._client = None
+                self._connected = False
+            log_process_event("client.fatal_rejected", source=self.source, reason=reason, error=str(exc))
+            if not self.policy.enabled:
+                raise
+            return SendOutcome(reconnect_attempts=1)
         except Exception as exc:
             if not self.policy.enabled:
                 raise
@@ -210,6 +232,16 @@ class _BufferedReconnectClient:
         if status == "SERVER_READY":
             with self._lock:
                 self._connected = True
+        elif status == "OUTDATED_CLIENT":
+            with self._lock:
+                self._fatal_status = status
+                self._connected = False
+            log_process_event(
+                "client.fatal_rejected",
+                source=self.source,
+                reason=status,
+                min_version=message.get("min_version"),
+            )
         elif status in {"CLIENT_RECV_ERROR", "CLIENT_REMOTE_CLOSED", "DISCONNECT", "CLIENT_READY_TIMEOUT"}:
             with self._lock:
                 self._mark_disconnected_locked(status)

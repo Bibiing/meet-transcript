@@ -57,6 +57,21 @@ jobs:
         irm https://astral.sh/uv/install.ps1 | iex
         Add-Content $env:GITHUB_PATH "$env:USERPROFILE\.local\bin"
 
+    # 4b. W4: tag rilis wajib sama dengan src/version.py __version__. Tanpa gerbang
+    # ini, installer/handshake/tag dapat menyimpang diam-diam dan penegakan versi
+    # menolak klien yang sebenarnya baru.
+    - name: Verify release tag matches app version
+      if: startsWith(github.ref, 'refs/tags/v')
+      shell: bash
+      run: |
+        tag="${GITHUB_REF#refs/tags/v}"
+        app=$(python -c "import re,pathlib;print(re.search(r'__version__ = \"([^\"]+)\"', pathlib.Path('src/version.py').read_text()).group(1))")
+        echo "tag=$tag app_version=$app"
+        if [ "$tag" != "$app" ]; then
+          echo "::error::release tag v$tag does not match src/version.py ($app)"
+          exit 1
+        fi
+
     # 5. Install Dependensi
     # Install secara selektif TANPA openai-whisper dan numba.
     # openai-whisper menarik PyTorch (~1.5GB) yang TIDAK dibutuhkan oleh
@@ -81,6 +96,7 @@ jobs:
           --onefile ^
           --plugin-enable=pyside6 ^
           --include-data-dir=src/icon=src/icon ^
+          --include-data-dir=config=config ^
           --include-package=src ^
           --include-module=sounddevice ^
           --include-module=soundcard ^
@@ -88,8 +104,8 @@ jobs:
           --windows-console-mode=disable ^
           --remove-output ^
           --assume-yes-for-downloads ^
-          src/qt_client.py
-        move qt_client.exe MultiTranscriber-Windows.exe
+          src/app.py
+        move app.exe MultiTranscriber-Windows.exe
 
     - name: Build with Nuitka (macOS)
       if: runner.os == 'macOS'
@@ -110,6 +126,7 @@ jobs:
           --onefile \
           --plugin-enable=pyside6 \
           --include-data-dir=src/icon=src/icon \
+          --include-data-dir=config=config \
           --include-package=src \
           $EXTRA_ARGS \
           --include-module=sounddevice \
@@ -117,8 +134,54 @@ jobs:
           --nofollow-import-to=whisper,numba,torch,torchaudio \
           --remove-output \
           --assume-yes-for-downloads \
-          src/qt_client.py
-        mv qt_client.bin MultiTranscriber-Mac 2>/dev/null || mv qt_client MultiTranscriber-Mac
+          src/app.py
+        mv app.bin MultiTranscriber-Mac 2>/dev/null || mv app MultiTranscriber-Mac
+
+    # 6b. Smoke test: buktikan exe packaged menjalankan jalur CLI (bukan hanya --help),
+    # dan stdout jalur CLI sampai ke parent via PIPE (kritis untuk protokol sentinel).
+    - name: Smoke test packaged CLI dispatch (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: python scripts/ci_smoke_packaged_cli.py .\MultiTranscriber-Windows.exe
+
+    # 6c. Build installer profesional (Inno Setup, per-user) dari exe hasil Nuitka.
+    - name: Install Inno Setup (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: choco install innosetup -y --no-progress
+
+    - name: Build Windows Installer (Inno Setup)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $ver = "0.0.0"
+        if ($env:GITHUB_REF -like "refs/tags/v*") { $ver = $env:GITHUB_REF -replace "refs/tags/v","" }
+        Write-Host "Installer version: $ver"
+        & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DMyAppVersion=$ver" installer\windows\setup.iss
+        if (-not (Test-Path ".\MeetingTranscriber-Setup.exe")) { Write-Error "installer not produced"; exit 1 }
+
+    # 6d. Smoke installer: silent install -> exe terpasang menjalankan jalur CLI -> uninstall bersih.
+    - name: Smoke test installer (install / CLI run / uninstall)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $dir = Join-Path $env:TEMP "pln_install_test"
+        Start-Process -Wait -FilePath ".\MeetingTranscriber-Setup.exe" -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/DIR=$dir"
+        $exe = Join-Path $dir "MeetingTranscriber.exe"
+        if (-not (Test-Path $exe)) { Write-Error "installer did not place exe at $exe"; exit 1 }
+        python scripts/ci_smoke_packaged_cli.py $exe
+        if ($LASTEXITCODE -ne 0) { Write-Error "installed exe failed CLI smoke"; exit 1 }
+        Start-Process -Wait -FilePath (Join-Path $dir "unins000.exe") -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART"
+        if (Test-Path $exe) { Write-Error "uninstall left files behind"; exit 1 }
+        Write-Host "OK: install -> CLI runs via PIPE -> uninstall clean"
+
+    - name: Upload Windows Installer
+      if: runner.os == 'Windows'
+      uses: actions/upload-artifact@v4
+      with:
+        name: MeetingTranscriber-Setup.exe
+        path: MeetingTranscriber-Setup.exe
+        if-no-files-found: error
 
     # 7. Upload Artifacts
     - name: Upload Artifact
@@ -146,7 +209,7 @@ jobs:
       uses: softprops/action-gh-release@v2
       with:
         files: |
-          MultiTranscriber-Windows.exe
+          MeetingTranscriber-Setup.exe
           MultiTranscriber-Mac
         draft: true
         prerelease: false

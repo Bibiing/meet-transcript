@@ -18,7 +18,9 @@ from src.capture.mic_stream import list_input_devices
 from src.capture.win_loopback import list_soundcard_loopback_devices
 from src.utils.logging import load_transcript_entries
 from src.utils.os_detector import AudioBackend, get_audio_backend
+from src.app import is_frozen
 from src.utils.status_ipc import format_command_line, parse_level_line, parse_status_line
+from src.version import app_version
 
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
@@ -46,6 +48,8 @@ _CONNECTION_STATE_BY_CODE: dict[str, str] = {
     "CLIENT_RECONNECTED": "CONNECTED",
     "CLIENT_RECV_ERROR": "ERROR",
     "CLIENT_READY_TIMEOUT": "ERROR",
+    "OUTDATED_CLIENT": "ERROR",
+    "CLIENT_TLS_ERROR": "ERROR",
     "ERROR": "ERROR",
     "DISCONNECT": "DISCONNECTED",
     "CLIENT_REMOTE_CLOSED": "DISCONNECTED",
@@ -60,9 +64,15 @@ class UiOptions:
 
     host: str | None = None
     port: int | None = None
+    # W2: TLS (wss://) untuk sesi live. Diisi dari Config Provider; produksi wajib TRUE.
+    use_tls: bool = False
     source: str = "both"
     model: str = "medium"
     language: str = "id"
+    # Domain adaptation dari config provider (di-pass ke subprocess agar paket
+    # tanpa .env tetap berkualitas). Tidak di-edit di UI pada milestone ini.
+    initial_prompt: str = ""
+    hotwords: str = ""
     chunk_seconds: float = 0.5
     mic_device: int | str | None = None
     speaker_device: int | str | None = None
@@ -116,6 +126,11 @@ class LiveProcessState:
     final_drain_seconds: float = 10.0
     # Level audio nyata per source (RMS dB), diperbarui dari sinyal level subprocess.
     audio_levels: dict[str, float] = field(default_factory=dict)
+    # W4: detail penolakan versi oleh server (None = tidak ada). Bertahan setelah
+    # sesi berhenti agar GUI sempat membacanya lewat polling.
+    outdated_client: dict | None = None
+    # W2: detail kegagalan verifikasi TLS (None = tidak ada), pola sama dengan di atas.
+    tls_error: dict | None = None
     lock: threading.RLock = field(default_factory=threading.RLock)
 
     def running(self) -> bool:
@@ -164,10 +179,11 @@ STATE = LiveProcessState()
 
 
 def build_live_command(options: UiOptions) -> list[str]:
-    command = [
-        sys.executable,
-        "-m",
-        "src.main",
+    # Packaged (Nuitka): sys.executable = exe aplikasi yang men-dispatch pada args
+    # -> "exe --mode live ..." (Nuitka tak mendukung `-m modul`).
+    # Dev: lewat dispatcher tunggal -> "python -m src.app --mode live ...".
+    command = [sys.executable] if is_frozen() else [sys.executable, "-m", "src.app"]
+    command += [
         "--mode",
         "live",
         "--source",
@@ -177,7 +193,11 @@ def build_live_command(options: UiOptions) -> list[str]:
         command.extend(["--server-host", options.host])
     if options.port is not None:
         command.extend(["--server-port", str(options.port)])
-        
+    if options.use_tls:
+        # W2: menutup celah — tanpa ini GUI tidak pernah dapat memakai wss://.
+        command.append("--server-wss")
+
+
     command.extend([
         "--server-ready-timeout",
         _num(options.ready_timeout),
@@ -185,6 +205,10 @@ def build_live_command(options: UiOptions) -> list[str]:
         options.model,
         "--whisper-language",
         options.language,
+        "--initial-prompt",
+        options.initial_prompt or "",
+        "--hotwords",
+        options.hotwords or "",
         "--live-chunk-seconds",
         _num(options.chunk_seconds),
         "--mic-server-vad" if options.mic_server_vad else "--no-mic-server-vad",
@@ -289,6 +313,8 @@ def start_live(options: UiOptions) -> dict[str, Any]:
         STATE.last_error = None
         STATE.connection_status = "CONNECTING"
         STATE.audio_levels.clear()
+        STATE.outdated_client = None
+        STATE.tls_error = None
         STATE.log_lines.clear()
         STATE.append_log("UI started live client")
 
@@ -371,6 +397,26 @@ def connection_status() -> str:
     subprocess (lihat BUG-002).
     """
     return STATE.get_connection_status()
+
+
+def outdated_client_info() -> dict | None:
+    """Detail penolakan versi oleh server, atau None (W4).
+
+    Berisi `client_version` (versi terpasang) dan `min_version` (minimum server).
+    Dikonsumsi GUI untuk menampilkan panduan unduh; di-reset saat sesi baru dimulai.
+    """
+    with STATE.lock:
+        return dict(STATE.outdated_client) if STATE.outdated_client else None
+
+
+def tls_error_info() -> dict | None:
+    """Detail kegagalan verifikasi TLS, atau None (W2).
+
+    Berisi `reason` (sebab yang dapat ditindaklanjuti) dan `url` server.
+    Di-reset saat sesi baru dimulai.
+    """
+    with STATE.lock:
+        return dict(STATE.tls_error) if STATE.tls_error else None
 
 
 def set_mute(source: str, muted: bool) -> bool:
@@ -546,7 +592,21 @@ def _handle_monitor_line(line: str) -> None:
     """
     parsed = parse_status_line(line)
     if parsed is not None:
-        source, code = parsed
+        source, code, details = parsed
+        if code == "OUTDATED_CLIENT":
+            # W4: simpan detail agar GUI dapat menampilkan versi minimum + URL unduh.
+            with STATE.lock:
+                STATE.outdated_client = {
+                    "client_version": app_version(),
+                    "min_version": str(details.get("min_version") or ""),
+                }
+        elif code == "CLIENT_TLS_ERROR":
+            # W2: simpan sebab agar GUI menjelaskan kegagalan koneksi aman.
+            with STATE.lock:
+                STATE.tls_error = {
+                    "reason": str(details.get("reason") or ""),
+                    "url": str(details.get("url") or ""),
+                }
         ui_state = _CONNECTION_STATE_BY_CODE.get(code)
         if ui_state is not None:
             STATE.set_connection_status(ui_state)

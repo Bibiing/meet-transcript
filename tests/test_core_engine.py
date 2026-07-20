@@ -268,7 +268,7 @@ def test_build_live_command_uses_python_module_and_transcript_log(tmp_path: Path
     )
 
     assert "-m" in command
-    assert "src.main" in command
+    assert "src.app" in command
     assert "--mode" in command
     assert "live" in command
     assert "--source" in command
@@ -330,7 +330,7 @@ def test_build_live_command_round_trips_through_main_argparse() -> None:
         speaker_device="Headset",
     )
     command = build_live_command(opts)
-    argv = command[command.index("src.main") + 1:]
+    argv = command[command.index("src.app") + 1:]
 
     args = parse_args(argv)  # tidak boleh SystemExit
 
@@ -343,6 +343,21 @@ def test_build_live_command_round_trips_through_main_argparse() -> None:
     assert args.whisper_language == "en"
     assert args.live_chunk_seconds == 0.25
     assert args.vad_threshold == 0.4
+    # M2: domain adaptation (prompt/hotwords) HARUS diteruskan ke subprocess agar
+    # paket tanpa .env tetap terkonfigurasi penuh.
+    assert "--initial-prompt" in command
+    assert "--hotwords" in command
+
+
+def test_build_live_command_forwards_prompt_and_hotwords() -> None:
+    from src.main import parse_args
+
+    opts = UiOptions(initial_prompt="rapat PLN Batam", hotwords="gardu, trafo, meteran")
+    command = build_live_command(opts)
+    argv = command[command.index("src.app") + 1:]
+    args = parse_args(argv)
+    assert args.initial_prompt == "rapat PLN Batam"
+    assert args.hotwords == "gardu, trafo, meteran"
 
 
 def test_transcript_payload_counts_sources(tmp_path: Path) -> None:

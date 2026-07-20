@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import ssl
 import threading
 import time
 import uuid
@@ -12,8 +13,22 @@ from typing import Any, Callable, Literal
 import numpy as np
 
 from src.preprocessing.core import PreprocessedAudioChunk
+from src.version import app_version
 
 _log = logging.getLogger(__name__)
+
+
+class OutdatedClientError(RuntimeError):
+    """Server menolak client ini karena versinya di bawah minimum (W4)."""
+
+
+class TlsVerificationError(RuntimeError):
+    """Sertifikat server tidak lolos verifikasi TLS (W2).
+
+    Permanen sampai sertifikat/kepercayaan diperbaiki: mencoba ulang hanya
+    mengulang handshake yang sama. TIDAK ADA opsi menonaktifkan verifikasi —
+    tanpa auth, TLS adalah satu-satunya pelindung isi rapat.
+    """
 
 from src.whisper.models import (
     DEFAULT_READY_TIMEOUT_SECONDS,
@@ -49,6 +64,10 @@ class WhisperLiveStreamClient:
         self._recv_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._ready_event = threading.Event()
+        # W4: penolakan permanen dari server (mis. versi usang). Menunggu
+        # SERVER_READY sampai ready_timeout habis tidak ada gunanya.
+        self._fatal_error: str | None = None
+        self._fatal_min_version: str = ""
         self._closed = False
         self._connected_at: float | None = None
         self._chunks_sent = 0
@@ -59,7 +78,9 @@ class WhisperLiveStreamClient:
 
     @property
     def is_ready(self) -> bool:
-        return self._ready_event.is_set()
+        # Penolakan fatal membangunkan penunggu lewat _ready_event; stream itu
+        # tetap TIDAK siap dipakai.
+        return self._ready_event.is_set() and self._fatal_error is None
 
     def connect(self) -> None:
         """Buka WebSocket, kirim opsi, lalu tunggu SERVER_READY."""
@@ -77,11 +98,20 @@ class WhisperLiveStreamClient:
             headers.append(f"Authorization: Bearer {self.config.api_key}")
 
         factory = self._websocket_factory or _default_websocket_factory()
-        self._socket = factory(
-            self.config.url,
-            timeout=self.config.connect_timeout,
-            header=headers,
-        )
+        try:
+            self._socket = factory(
+                self.config.url,
+                timeout=self.config.connect_timeout,
+                header=headers,
+            )
+        except ssl.SSLError as exc:
+            # W2: kegagalan TLS bukan gangguan jaringan biasa — ia permanen sampai
+            # sertifikat/kepercayaan diperbaiki, dan pesannya harus dapat ditindaklanjuti.
+            reason = _tls_failure_reason(exc)
+            self._emit_status("CLIENT_TLS_ERROR", url=self.config.url, reason=reason, error=str(exc))
+            raise TlsVerificationError(
+                f"Secure connection to {self.config.url} failed: {reason}"
+            ) from exc
         self._connected_at = perf_counter()
         self._emit_status("CLIENT_SOCKET_OPEN", url=self.config.url)
         self._socket.send(json.dumps(self._options()))
@@ -116,6 +146,14 @@ class WhisperLiveStreamClient:
                     **self._diagnostics(),
                 )
                 next_wait_log = now + 10.0
+
+        if self._fatal_error is not None:
+            # Gagal cepat: server sudah menolak koneksi ini secara permanen.
+            self.close()
+            raise OutdatedClientError(
+                f"WhisperLive stream '{self.source}' rejected by server: {self._fatal_error} "
+                f"(minimum version {self._fatal_min_version or 'unknown'})"
+            )
 
         if not self._ready_event.is_set():
             self.close()
@@ -219,6 +257,9 @@ class WhisperLiveStreamClient:
             "sample_rate": self.config.sample_rate,
             "channels": self.config.channels,
             "audio_format": self.config.audio_format,
+            # W4: server menegakkan versi minimum berdasarkan nilai ini. Server tanpa
+            # kebijakan mengabaikannya (backward compatible).
+            "client_version": app_version(),
         }
 
     def _recv_loop(self) -> None:
@@ -261,6 +302,24 @@ class WhisperLiveStreamClient:
             if message.get("message") == "SERVER_READY":
                 self._ready_event.set()
                 self._emit_status("SERVER_READY", backend=message.get("backend"), **self._diagnostics())
+                continue
+
+            # W4: penolakan versi dinaikkan menjadi kode status tersendiri di sini —
+            # tempat kontrak server di-parse — agar lapisan di atasnya tidak perlu
+            # menggali `raw`. Penolakan ini permanen, bukan gangguan sementara.
+            if message.get("code") == "OUTDATED_CLIENT":
+                self._fatal_error = "OUTDATED_CLIENT"
+                self._fatal_min_version = str(message.get("min_version") or "")
+                # Bangunkan connect() SEBELUM emit status (pola yang sama dengan
+                # SERVER_READY: penunggu tidak boleh tertahan callback status).
+                self._ready_event.set()
+                self._emit_status(
+                    "OUTDATED_CLIENT",
+                    min_version=str(message.get("min_version") or ""),
+                    message=message.get("message"),
+                    raw=message,
+                    **self._diagnostics(),
+                )
                 continue
 
             if "status" in message:
@@ -330,6 +389,19 @@ def _encode_audio_payload(samples: np.ndarray, audio_format: Literal["float32", 
         pcm8 = np.round((samples + 1.0) * 127.5).astype(np.uint8)
         return np.ascontiguousarray(pcm8).tobytes()
     raise ValueError(f"unsupported WhisperLive audio format: {audio_format}")
+
+
+def _tls_failure_reason(exc: ssl.SSLError) -> str:
+    """Klasifikasikan kegagalan TLS menjadi sebab yang dapat ditindaklanjuti (W2)."""
+    if isinstance(exc, ssl.SSLCertVerificationError):
+        if exc.verify_code == 62 or "hostname mismatch" in str(exc).lower():
+            return "certificate does not match the server name"
+        if exc.verify_code in (18, 19, 20, 21):
+            return "server certificate is not trusted by this computer"
+        if "expired" in str(exc).lower():
+            return "server certificate has expired"
+        return f"server certificate verification failed ({exc.verify_message or exc.reason})"
+    return f"TLS handshake failed ({exc.reason or exc})"
 
 
 def _default_websocket_factory() -> WebSocketFactory:

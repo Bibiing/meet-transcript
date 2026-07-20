@@ -7,8 +7,9 @@ from pathlib import Path
 def load_env_file(path: Path = Path(".env")) -> None:
     # memuat environtment variabel dari file .env ke dalam os.environ
 
-    if not path.exists(): # jika tidak ada
-        print(f"File .env tidak ditemukan di {path.resolve()}.")
+    # .env bersifat opsional (dev). Paket produksi memakai config provider +
+    # QSettings, jadi ketiadaan .env adalah kondisi normal — jangan berisik.
+    if not path.exists():
         return
     for raw_line in path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip() # menghapus spasi

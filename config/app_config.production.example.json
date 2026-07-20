@@ -1,0 +1,18 @@
+{
+  "_comment": "Contoh config PRODUCTION: hostname resmi PLN + TLS. Perpindahan dari staging hanya mengubah 'host' (dan sertifikat + deployment di sisi server). Tidak ada perubahan kode aplikasi.",
+  "version": 1,
+  "server": {
+    "host": "transcript.pln.co.id",
+    "port": 443,
+    "use_tls": true
+  },
+  "transcription": {
+    "model": "medium",
+    "language": "id",
+    "initial_prompt": "Indonesian meeting transcript. Transcribe the audio in Indonesian; do not translate to English. Preserve technical terms, abbreviations, system names, and common loanwords as spoken.",
+    "hotwords": ""
+  },
+  "update": {
+    "download_url": "https://github.com/pln/meeting-transcriber/releases/latest"
+  }
+}

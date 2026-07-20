@@ -14,14 +14,50 @@ from src.core.engine import (
     audio_devices_payload,
     audio_levels,
     connection_status,
+    outdated_client_info,
     set_mute,
+    tls_error_info,
     start_live,
     stop_live,
     transcript_payload,
     DEFAULT_TRANSCRIPT_LOG,
     UiOptions,
 )
+from src.config import ConfigProvider, QtUserStore
+from src.onboarding import ensure_microphone_ready, maybe_run_first_run_wizard
+from src.permissions import source_uses_microphone
+from src.version import app_version
 from src.utils.mode_detector import is_production_build, should_enable_debug_features
+
+
+def _build_user_store() -> Optional[QtUserStore]:
+    """QSettings per-user; None bila tak tersedia (tanpa persistensi)."""
+    try:
+        return QtUserStore()
+    except Exception:
+        return None
+
+
+def _build_config_provider() -> ConfigProvider:
+    """Config provider GUI: bundled defaults + override user (QSettings)."""
+    store = _build_user_store()
+    if store is None:
+        # QSettings gagal (mis. env aneh) -> tetap jalan tanpa persistensi.
+        return ConfigProvider()
+    return ConfigProvider(user_store=store)
+
+
+def _options_from_config(cfg: ConfigProvider, base: Optional[UiOptions] = None) -> UiOptions:
+    """Bangun UiOptions dari config provider (server URL, model, bahasa, domain adaptation)."""
+    opts = base or UiOptions()
+    opts.host = cfg.server_host()
+    opts.port = cfg.server_port()
+    opts.use_tls = cfg.use_tls()
+    opts.model = cfg.model()
+    opts.language = cfg.language()
+    opts.initial_prompt = cfg.initial_prompt()
+    opts.hotwords = cfg.hotwords()
+    return opts
 
 
 PRIMARY = "#6AD8E5"
@@ -106,6 +142,11 @@ class SettingsDialog(QtWidgets.QDialog):
         g_layout.addRow("Speaker:", self.spk_select)
         g_layout.addRow("Language:", self.lang_select)
         g_layout.addRow("Model:", self.model_select)
+        # W4: versi terpasang terlihat pengguna, agar dukungan dapat menanyakannya.
+        self.version_label = QtWidgets.QLabel(app_version())
+        self.version_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.version_label.setToolTip("Versi aplikasi yang terpasang")
+        g_layout.addRow("Version:", self.version_label)
         g_layout.addRow("LLM API Key:", self.llm_api_key)
 
         self.general.setLayout(g_layout)
@@ -270,10 +311,16 @@ class SettingsDialog(QtWidgets.QDialog):
             if idx >= 0:
                 self.spk_select.setCurrentIndex(idx)
                 
+        # Seed server host/port dari opts (sebelumnya selalu "localhost"/9090).
+        if getattr(opts, "host", None):
+            self.host_input.setText(str(opts.host))
+        if getattr(opts, "port", None):
+            self.port_input.setValue(int(opts.port))
+
         idx = self.lang_select.findText(opts.language)
         if idx >= 0:
             self.lang_select.setCurrentIndex(idx)
-            
+
         idx = self.model_select.findText(opts.model)
         if idx >= 0:
             self.model_select.setCurrentIndex(idx)
@@ -377,10 +424,15 @@ class CompactWidget(QtWidgets.QWidget):
         self.setWindowFlags(QtCore.Qt.WindowType.WindowStaysOnTopHint)
         self.setMinimumSize(600, 300) # Tinggi ditambah sedikit untuk menampung bottom bar
         self.recording = False
-        self.current_options: Optional[UiOptions] = None
+        # Config provider (SSOT) + opsi awal dari bundled defaults + QSettings user.
+        self._config = _build_config_provider()
+        self.current_options: Optional[UiOptions] = _options_from_config(self._config)
         self.llm_api_key: Optional[str] = None
         # F3: mtime transcript terakhir agar refresh tidak re-parse/re-render bila tak berubah.
         self._last_transcript_mtime: float | None = None
+        # W4/W2: dialog kegagalan permanen hanya sekali per sesi (refresh berjalan 500ms).
+        self._outdated_notified = False
+        self._tls_notified = False
 
         self.setObjectName("MainWindow")
 
@@ -808,6 +860,20 @@ class CompactWidget(QtWidgets.QWidget):
             
         if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
             self.current_options = dlg.to_options()
+            # Domain adaptation tidak di-edit di UI: bawa dari config provider.
+            self.current_options.initial_prompt = self._config.initial_prompt()
+            self.current_options.hotwords = self._config.hotwords()
+            # W2: TLS tidak di-edit di UI. Tanpa baris ini, to_options() (yang membuat
+            # UiOptions baru) akan MEMATIKAN TLS diam-diam setelah Settings dibuka.
+            self.current_options.use_tls = self._config.use_tls()
+            # Persist pengaturan user ke QSettings (persisten lintas restart).
+            try:
+                self._config.set_user("server_host", self.current_options.host)
+                self._config.set_user("server_port", self.current_options.port)
+                self._config.set_user("model", self.current_options.model)
+                self._config.set_user("language", self.current_options.language)
+            except Exception as exc:
+                print("failed to persist settings:", exc)
             try:
                 self._preferred_source = getattr(self.current_options, "source", "both") or "both"
             except Exception:
@@ -817,11 +883,80 @@ class CompactWidget(QtWidgets.QWidget):
             self.resume_btn.setEnabled(bool(self.llm_api_key))
 
     def toggle_record(self, checked: bool):
+        # W3: gate permission sebelum sesi dijalankan, agar mikrofon yang diblokir
+        # menghasilkan panduan yang jelas — bukan sesi yang berjalan senyap.
+        if checked and not self._ensure_microphone_permission():
+            self.record_btn.setChecked(False)  # `clicked` -> setChecked tidak re-emit
+            self._apply_record_button_state(recording=False)
+            return
         self._apply_record_button_state(recording=checked)
         if checked:
             self._start_live()
         else:
             self._stop_live()
+
+    def _abort_session_and_warn(self, title: str, body: str, *, link: str = "") -> None:
+        """Kegagalan permanen sesi: hentikan rekaman lalu jelaskan sekali.
+
+        Dipakai jalur yang mencoba ulang tidak akan pernah berhasil sampai ada
+        tindakan di luar aplikasi (versi usang W4, verifikasi TLS gagal W2).
+        """
+        if self.record_btn.isChecked():
+            self.record_btn.setChecked(False)
+            self._apply_record_button_state(recording=False)
+            self._stop_live()
+
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Icon.Warning)
+        box.setWindowTitle(title)
+        if link:
+            box.setTextFormat(QtCore.Qt.TextFormat.RichText)
+            box.setText(body.replace("\n", "<br>") + f'<br><br><a href="{link}">{link}</a>')
+            box.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextBrowserInteraction)
+        else:
+            box.setText(body)
+        box.exec()
+
+    def _check_outdated_client(self) -> None:
+        """W4: server menolak versi ini -> hentikan sesi dan arahkan pengguna mengunduh."""
+        info = outdated_client_info()
+        if info is None or self._outdated_notified:
+            return
+        self._outdated_notified = True
+        minimum = info.get("min_version") or "-"
+        self._abort_session_and_warn(
+            "Pembaruan Diperlukan",
+            f"Versi aplikasi Anda ({info.get('client_version')}) sudah tidak didukung server. "
+            f"Versi minimum yang diperlukan: {minimum}.\n\n"
+            "Rekaman tidak dapat dijalankan sampai aplikasi diperbarui.\n\nUnduh versi terbaru:",
+            link=self._config.download_url(),
+        )
+
+    def _check_tls_error(self) -> None:
+        """W2: koneksi aman gagal -> hentikan sesi dan jelaskan sebabnya.
+
+        Tanpa ini pengguna hanya melihat indikator "Error" tanpa tahu bahwa
+        masalahnya ada pada sertifikat server (tindakan ada di sisi IT, bukan pengguna).
+        """
+        info = tls_error_info()
+        if info is None or self._tls_notified:
+            return
+        self._tls_notified = True
+        reason = info.get("reason") or "verifikasi sertifikat gagal"
+        self._abort_session_and_warn(
+            "Koneksi Aman Gagal",
+            f"Aplikasi tidak dapat membuat koneksi aman ke server ({info.get('url') or '-'}).\n\n"
+            f"Penyebab: {reason}.\n\n"
+            "Rekaman dihentikan demi menjaga kerahasiaan rapat. Hubungi tim IT/administrator "
+            "server Anda — sertifikat server perlu diperbaiki."
+        )
+
+    def _ensure_microphone_permission(self) -> bool:
+        """True bila rekaman boleh jalan (source tanpa mic, atau mikrofon siap)."""
+        opts = self.current_options or UiOptions()
+        if not source_uses_microphone(getattr(opts, "source", "both")):
+            return True
+        return ensure_microphone_ready(self, device=getattr(opts, "mic_device", None))
 
     def _apply_record_button_state(self, recording: bool) -> None:
         if recording:
@@ -902,6 +1037,10 @@ class CompactWidget(QtWidgets.QWidget):
         threading.Thread(target=_runner, daemon=True).start()
 
     def _start_live(self):
+        # Sesi baru -> penolakan versi berikutnya harus tetap diberitahukan
+        # (engine juga me-reset detailnya saat start).
+        self._outdated_notified = False
+        self._tls_notified = False
         opts = self.current_options or UiOptions()
         opts.host = getattr(opts, "host", "localhost")
         opts.port = getattr(opts, "port", 9090)
@@ -1008,6 +1147,8 @@ class CompactWidget(QtWidgets.QWidget):
         try:
             self._update_connection_indicator()
             self._update_audio_meters()
+            self._check_outdated_client()
+            self._check_tls_error()
         except Exception:
             pass
 
@@ -1092,7 +1233,7 @@ class CompactWidget(QtWidgets.QWidget):
         self.preview.setStyleSheet(f"font-size: {new_size}px;")
 
 
-def main():
+def run_gui() -> int:
     # --- Dukungan High-DPI ---
     # Di Qt6, High-DPI scaling sudah AKTIF SECARA OTOMATIS (berbeda dari Qt5 yang
     # memerlukan AA_EnableHighDpiScaling/AA_UseHighDpiPixmaps secara eksplisit -
@@ -1135,10 +1276,18 @@ def main():
     # ini hanya mempengaruhi rendering dasar widget yang belum di-style eksplisit.
     app.setStyle("Fusion")
 
+    # W3: onboarding first-run (Welcome -> Izin Mikrofon -> Selesai) sebelum jendela
+    # utama tampil. Ditutup pengguna -> keluar dengan aman, tanpa jendela utama.
+    if not maybe_run_first_run_wizard(_build_user_store()):
+        return 0
+
     w = CompactWidget()
     w.show()
-    sys.exit(app.exec())
+    return app.exec()
 
 
 if __name__ == "__main__":
-    main()
+    # Tetap lewat dispatcher tunggal agar jalur startup konsisten.
+    from src.app import main as _dispatch
+
+    raise SystemExit(_dispatch())

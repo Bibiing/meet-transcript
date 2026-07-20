@@ -1,0 +1,18 @@
+{
+  "_comment": "Contoh config STAGING/UAT: hostname publik + TLS. Salin menjadi app_config.json saat build klien untuk staging. Hanya nilai server yang berubah dari production — kode tidak berubah.",
+  "version": 1,
+  "server": {
+    "host": "transcript.bingopos.my.id",
+    "port": 443,
+    "use_tls": true
+  },
+  "transcription": {
+    "model": "medium",
+    "language": "id",
+    "initial_prompt": "Indonesian meeting transcript. Transcribe the audio in Indonesian; do not translate to English. Preserve technical terms, abbreviations, system names, and common loanwords as spoken.",
+    "hotwords": ""
+  },
+  "update": {
+    "download_url": "https://github.com/pln/meeting-transcriber/releases/latest"
+  }
+}

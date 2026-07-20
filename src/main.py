@@ -9,22 +9,25 @@ from src.preprocessing.file_processing import PreprocessResult, preprocess_audio
 # live session
 from src.whisper import (
     WhisperLiveProfile,
-    DEFAULT_HOTWORDS,
-    DEFAULT_INITIAL_PROMPT,
     # replay
     WhisperLiveReplayConfig,
     replay_wav_to_whisperlive,
     # session
     WhisperLiveSessionConfig,
-    run_whisperlive_session, 
+    run_whisperlive_session,
 )
 
 from src.settings import env_bool, env_float, env_int, env_optional, env_str, load_env_file
+from src.config import ConfigProvider
 from src.utils.logging import configure_logging
 from src.utils.os_detector import get_audio_backend
 
 
 DEFAULT_SERVER_READY_TIMEOUT = 300.0
+
+# CLI/subprocess memakai Config Provider yang sama (tanpa user store — config user
+# tiba via CLI args dari GUI; env/.env dihormati untuk dev). SSOT presedensi.
+_cfg = ConfigProvider()
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # Mode menjalankan aplikasi
@@ -33,8 +36,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     # ASR / WhisperLive konfigurasi
     parser.add_argument("--asr-backend", choices=("whisperlive",), default="whisperlive", help="ASR backend for live mode: WhisperLive server")
-    parser.add_argument("--server-host", default=env_str("WHISPERLIVE_HOST", "localhost"), help="WhisperLive server host for live mode")
-    parser.add_argument("--server-port", type=int, default=env_int("WHISPERLIVE_PORT", 9090), help="WhisperLive websocket port for live mode")
+    parser.add_argument("--server-host", default=_cfg.server_host(), help="WhisperLive server host for live mode")
+    parser.add_argument("--server-port", type=int, default=_cfg.server_port(), help="WhisperLive websocket port for live mode")
     parser.add_argument("--server-wss", action="store_true", help="Use wss:// for WhisperLive websocket")
     parser.add_argument("--server-api-key", default=None, help="Optional WhisperLive API key")
     parser.add_argument("--server-ready-timeout", type=float, default=env_float("WHISPERLIVE_READY_TIMEOUT", DEFAULT_SERVER_READY_TIMEOUT), help="seconds to wait for WhisperLive SERVER_READY",)
@@ -76,7 +79,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     
     # Konfigurasi Whisper / OpenAI ASR Model
     parser.add_argument("--whisper-model", default=None, help="Whisper model name")
-    parser.add_argument("--whisper-language", default=env_str("WHISPERLIVE_LANGUAGE", "id"), help="language hint, for example id or en")
+    parser.add_argument("--whisper-language", default=_cfg.language(), help="language hint, for example id or en")
     parser.add_argument("--whisper-task", choices=("transcribe", "translate"), default="transcribe")
     parser.add_argument("--whisper-device", default=None, help="Whisper device override, for example cpu or cuda")
     parser.add_argument("--whisper-fp16", action=argparse.BooleanOptionalAction, default=None)
@@ -104,8 +107,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--speech-boundary-detection", action=argparse.BooleanOptionalAction, default=env_bool("WHISPERLIVE_SPEECH_BOUNDARY_DETECTION", True), help="delay ASR until recent speech appears to have ended, with a max-wait fallback",)
     parser.add_argument("--speech-boundary-silence-seconds", type=float, default=env_float("WHISPERLIVE_SPEECH_BOUNDARY_SILENCE_SECONDS", 0.8), help="seconds without new speech chunks before ASR is triggered",)
     parser.add_argument("--speech-boundary-max-wait-seconds", type=float, default=env_float("WHISPERLIVE_SPEECH_BOUNDARY_MAX_WAIT_SECONDS", 5.0), help="maximum seconds to wait before ASR runs during continuous speech",)
-    parser.add_argument("--initial-prompt", default=env_str("WHISPERLIVE_INITIAL_PROMPT", DEFAULT_INITIAL_PROMPT), help="WhisperLive initial prompt",)
-    parser.add_argument("--hotwords", default=env_str("WHISPERLIVE_HOTWORDS", DEFAULT_HOTWORDS), help="WhisperLive hotwords",)
+    parser.add_argument("--initial-prompt", default=_cfg.initial_prompt(), help="WhisperLive initial prompt",)
+    parser.add_argument("--hotwords", default=_cfg.hotwords(), help="WhisperLive hotwords",)
     
     # Output & logging
     parser.add_argument("--transcript-output", type=Path, default=None, help="JSON output path for transcription results",)
@@ -128,7 +131,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     load_env_file(Path(".env"))
-    env_model = env_optional("WHISPERLIVE_MODEL")
 
     args = parse_args(argv)
     mode = _resolve_mode(args)
@@ -207,7 +209,7 @@ def main(argv: list[str] | None = None) -> int:
         case "live":
             log_transcript = args.transcript_log or (args.output_dir / "transcript_log.json")
 
-            live_model = args.whisper_model or env_model or "medium"
+            live_model = args.whisper_model or _cfg.model()
 
             # ASR whisper server live
             profile = WhisperLiveProfile(
@@ -286,7 +288,7 @@ def main(argv: list[str] | None = None) -> int:
         
         case "replay-file":
             # Replay untuk test whisper langsung dari file.
-            replay_model = args.whisper_model or env_model or "medium"
+            replay_model = args.whisper_model or _cfg.model()
             profile = WhisperLiveProfile(
                 language=args.whisper_language,
                 task=args.whisper_task,
