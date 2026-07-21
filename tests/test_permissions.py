@@ -105,3 +105,32 @@ def test_guidance_device_when_not_accessible_and_indicator_unknown() -> None:
 )
 def test_source_uses_microphone(source, expected) -> None:
     assert source_uses_microphone(source) is expected
+
+
+# Regresi W3: kegagalan mikrofon di subprocess TIDAK boleh ditelan diam-diam ---
+def test_mic_failure_is_emitted_to_parent_not_swallowed() -> None:
+    """capture.py wajib menaikkan kegagalan mic sebagai status, bukan hanya log."""
+    from pathlib import Path
+
+    source = Path("src/whisper/capture.py").read_text(encoding="utf-8")
+    assert "emit_status(\"mic\", \"CLIENT_MIC_ERROR\"" in source
+
+
+def test_engine_records_mic_error_and_sets_error_state() -> None:
+    from src.core import engine
+    from src.utils.status_ipc import format_status_line
+
+    engine.STATE.mic_error = None
+    engine._handle_monitor_line(
+        format_status_line("mic", "CLIENT_MIC_ERROR", reason="Error opening InputStream")
+    )
+    assert engine.mic_error_info() == {"reason": "Error opening InputStream"}
+    assert engine.connection_status() == "ERROR"
+    engine.STATE.mic_error = None
+
+
+def test_engine_mic_error_none_by_default() -> None:
+    from src.core import engine
+
+    engine.STATE.mic_error = None
+    assert engine.mic_error_info() is None

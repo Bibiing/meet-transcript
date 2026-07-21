@@ -15,7 +15,9 @@ from typing import Any, Callable, Optional, Protocol
 from PySide6 import QtWidgets
 
 from src.permissions import (
+    GUIDANCE_DEVICE,
     GUIDANCE_NONE,
+    GUIDANCE_PRIVACY,
     MicrophoneAccess,
     check_microphone,
     guidance_kind,
@@ -28,6 +30,14 @@ _log = logging.getLogger(__name__)
 FIRST_RUN_KEY = "app/first_run_completed"
 
 _READY_TEXT = "Mikrofon siap digunakan."
+
+# Judul mengikuti PENYEBAB. Menyebut "Izin Mikrofon" untuk device yang tidak ada
+# atau sedang dipakai aplikasi lain mengarahkan pengguna ke tempat yang salah.
+_TITLE_BY_KIND = {
+    GUIDANCE_PRIVACY: "Izin Mikrofon",
+    GUIDANCE_DEVICE: "Mikrofon Tidak Tersedia",
+}
+_TITLE_FALLBACK = "Mikrofon Bermasalah"
 _NOT_READY_SUFFIX = (
     "\n\nAnda tetap dapat melanjutkan penyiapan, namun rekaman baru dapat dimulai "
     "setelah mikrofon dapat digunakan."
@@ -74,7 +84,7 @@ class MicrophoneGuidanceDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self._device = device
         self._checker = checker
-        self.setWindowTitle("Izin Mikrofon")
+        self.setWindowTitle(_TITLE_BY_KIND.get(guidance_kind(access), _TITLE_FALLBACK))
         self.setMinimumWidth(460)
 
         self._message = QtWidgets.QLabel(guidance_message(access))
@@ -109,6 +119,7 @@ class MicrophoneGuidanceDialog(QtWidgets.QDialog):
         if guidance_kind(access) == GUIDANCE_NONE:
             self.accept()
             return
+        self.setWindowTitle(_TITLE_BY_KIND.get(guidance_kind(access), _TITLE_FALLBACK))
         self._message.setText(guidance_message(access))
 
 

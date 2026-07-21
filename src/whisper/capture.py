@@ -14,6 +14,7 @@ from src.capture.models import AudioFrame
 from src.preprocessing.core import AudioPreprocessor, PreprocessConfig, PreprocessedAudioChunk
 import numpy as np
 from src.utils.logging import log_process_event
+from src.utils.status_ipc import emit_status
 from src.utils.os_detector import AudioBackend, get_audio_backend
 from src.whisper.models import WhisperLiveSessionConfig, WhisperLiveSessionStats
 
@@ -114,9 +115,13 @@ def _build_capture_streams(
             reader_threads.append(
                 _reader("mic", mic_stream, mic_preprocess_config, chunk_queue, stop_event, stats, _build_client_vad_filter(cfg))
             )
-        except Exception as exc: 
+        except Exception as exc:
             log_process_event("client.capture_backend_error", source="mic", backend="microphone", error=str(exc))
             _log.warning("whisperlive session: mic unavailable: %s", exc)
+            # Mikrofon adalah input UTAMA. Menelan kegagalan ini membuat sesi berjalan
+            # tanpa suara tanpa penjelasan apa pun ke pengguna. Naikkan ke parent agar
+            # GUI dapat menampilkan panduan yang dapat ditindaklanjuti (W3).
+            emit_status("mic", "CLIENT_MIC_ERROR", reason=str(exc))
 
     # Inisialisasi stream speaker
     if cfg.source in ("speaker", "both"):

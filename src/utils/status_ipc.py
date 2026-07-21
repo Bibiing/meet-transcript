@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import sys
+import threading
 
 # Protokol status terstruktur lintas-proses (BUG-002).
 #
@@ -31,6 +33,19 @@ def format_status_line(source: str, status: str, **details: object) -> str:
     """
     payload = json.dumps({"source": source, "status": status, **details}, ensure_ascii=False)
     return f"{STATUS_SENTINEL}{payload}\n"
+
+
+# Satu lock untuk SEMUA penulis status di proses subprocess. Tanpa ini, dua modul
+# (session & capture) yang menulis ke stdout dapat saling menyisip dan merusak baris.
+_emit_lock = threading.Lock()
+
+
+def emit_status(source: str, status: str, **details: object) -> None:
+    """Tulis satu baris status ber-sentinel ke stdout secara atomik."""
+    line = format_status_line(source, status, **details)
+    with _emit_lock:
+        sys.stdout.write(line)
+        sys.stdout.flush()
 
 
 def parse_status_line(line: str) -> tuple[str, str, dict] | None:

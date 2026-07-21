@@ -14,6 +14,7 @@ from src.core.engine import (
     audio_devices_payload,
     audio_levels,
     connection_status,
+    mic_error_info,
     outdated_client_info,
     set_mute,
     tls_error_info,
@@ -25,7 +26,13 @@ from src.core.engine import (
 )
 from src.config import ConfigProvider, QtUserStore
 from src.onboarding import ensure_microphone_ready, maybe_run_first_run_wizard
-from src.permissions import source_uses_microphone
+from src.permissions import (
+    GUIDANCE_NONE,
+    check_microphone,
+    guidance_kind,
+    guidance_message,
+    source_uses_microphone,
+)
 from src.version import app_version
 from src.utils.mode_detector import is_production_build, should_enable_debug_features
 
@@ -70,6 +77,9 @@ BG = "#F2F9FA"
 TEXT = "#112629"
 TEXT_MUTED = "#C0D6D8"
 BORDER = "#B6CFD3"
+
+# Label entri perangkat "ikuti default OS" (data=None) pada combo Settings.
+DEFAULT_DEVICE_LABEL = "Default sistem"
 
 # Direktori root aplikasi, dihitung dari lokasi file ini (bukan cwd saat dijalankan).
 # Memastikan ikon tetap ditemukan meskipun aplikasi dijalankan dari folder lain (mis. via
@@ -285,10 +295,15 @@ class SettingsDialog(QtWidgets.QDialog):
     def reload_devices(self):
         try:
             payload = audio_devices_payload()
+            # Entri "Default sistem" (data=None) WAJIB ada: tanpanya, state "ikuti
+            # default OS" tidak dapat direpresentasikan di UI dan akan berubah
+            # menjadi device konkret setiap kali Settings disimpan (silent rebinding).
             self.mic_select.clear()
+            self.mic_select.addItem(DEFAULT_DEVICE_LABEL, None)
             for d in payload.get("mic", []):
                 self.mic_select.addItem(d.get("label") or d.get("name"), d.get("id"))
             self.spk_select.clear()
+            self.spk_select.addItem(DEFAULT_DEVICE_LABEL, None)
             for d in payload.get("speaker", []):
                 self.spk_select.addItem(d.get("name"), d.get("id"))
         except Exception:
@@ -301,15 +316,14 @@ class SettingsDialog(QtWidgets.QDialog):
         if opts.port is not None:
             self.port_input.setValue(opts.port)
         
-        # Set mic/speaker based on data ID if present
-        if opts.mic_device is not None:
-            idx = self.mic_select.findData(opts.mic_device)
-            if idx >= 0:
-                self.mic_select.setCurrentIndex(idx)
-        if opts.speaker_device is not None:
-            idx = self.spk_select.findData(opts.speaker_device)
-            if idx >= 0:
-                self.spk_select.setCurrentIndex(idx)
+        # Pilih berdasarkan data ID, TERMASUK None -> entri "Default sistem",
+        # sehingga round-trip None -> UI -> None utuh.
+        idx = self.mic_select.findData(opts.mic_device)
+        if idx >= 0:
+            self.mic_select.setCurrentIndex(idx)
+        idx = self.spk_select.findData(opts.speaker_device)
+        if idx >= 0:
+            self.spk_select.setCurrentIndex(idx)
                 
         # Seed server host/port dari opts (sebelumnya selalu "localhost"/9090).
         if getattr(opts, "host", None):
@@ -420,7 +434,7 @@ class CompactWidget(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("PLN Meeting Transcriber")
-        self.setWindowIcon(load_icon("apps.png"))
+        self.setWindowIcon(load_icon("app.ico"))
         self.setWindowFlags(QtCore.Qt.WindowType.WindowStaysOnTopHint)
         self.setMinimumSize(600, 300) # Tinggi ditambah sedikit untuk menampung bottom bar
         self.recording = False
@@ -433,6 +447,10 @@ class CompactWidget(QtWidgets.QWidget):
         # W4/W2: dialog kegagalan permanen hanya sekali per sesi (refresh berjalan 500ms).
         self._outdated_notified = False
         self._tls_notified = False
+        self._mic_notified = False
+        # W3: readiness mikrofon (health check startup) ditampilkan lewat tombol Mute Mic.
+        self._mic_ready = True
+        self._mic_not_ready_reason = ""
 
         self.setObjectName("MainWindow")
 
@@ -441,6 +459,10 @@ class CompactWidget(QtWidgets.QWidget):
 
         # F4: error dari thread latar disurunkan ke UI (QueuedConnection lintas-thread).
         self.error_occurred.connect(self._on_error)
+
+        # W3: health check mikrofon dijalankan setelah startup selesai (0 ms = setelah
+        # event loop mulai), agar jendela tampil dulu dan device tidak ditahan terbuka.
+        QtCore.QTimer.singleShot(0, self.run_mic_health_check)
 
         self.timer = QtCore.QTimer(self)
         self.timer.setInterval(500)
@@ -761,6 +783,13 @@ class CompactWidget(QtWidgets.QWidget):
                 color: {DANGER};
                 border: 1px solid {DANGER};
             }}
+            /* Mikrofon tidak siap: tombol yang sama dipakai sebagai indikator,
+               tanpa menambah widget baru. */
+            QPushButton#MuteBtn[micState="unavailable"] {{
+                background-color: #FEF3C7;
+                color: #92400E;
+                border: 1px solid #F59E0B;
+            }}
 
             /* Action Button */
             QPushButton#ActionBtn {{
@@ -852,6 +881,9 @@ class CompactWidget(QtWidgets.QWidget):
 
     def open_settings(self):
         opts = self.current_options or UiOptions()
+        # Rekam binding perangkat SEBELUM dialog, untuk membedakan "config server
+        # berubah" dari "perangkat audio berubah" (lihat _apply_settings_result).
+        prev_devices = (getattr(opts, "mic_device", None), getattr(opts, "speaker_device", None))
         dlg = SettingsDialog(self, options=opts)
         
         # Populate the LLM API key field if previously set
@@ -881,6 +913,14 @@ class CompactWidget(QtWidgets.QWidget):
             
             self.llm_api_key = dlg.llm_api_key.text().strip() or None
             self.resume_btn.setEnabled(bool(self.llm_api_key))
+            # Validasi audio HANYA bila pilihan perangkat benar-benar berubah.
+            # Mengubah host/port/model/bahasa tidak boleh menyentuh subsistem audio.
+            new_devices = (
+                getattr(self.current_options, "mic_device", None),
+                getattr(self.current_options, "speaker_device", None),
+            )
+            if new_devices != prev_devices:
+                self.run_mic_health_check()
 
     def toggle_record(self, checked: bool):
         # W3: gate permission sebelum sesi dijalankan, agar mikrofon yang diblokir
@@ -951,6 +991,25 @@ class CompactWidget(QtWidgets.QWidget):
             "server Anda — sertifikat server perlu diperbaiki."
         )
 
+    def _check_mic_error(self) -> None:
+        """W3: subprocess gagal membuka mikrofon -> hentikan sesi dan beri panduan.
+
+        Windows TIDAK menampilkan dialog izin untuk aplikasi desktop Win32; satu-satunya
+        jalan bagi pengguna adalah Setelan Privasi. Karena itu kegagalan ini harus
+        dijelaskan, bukan dibiarkan senyap.
+        """
+        info = mic_error_info()
+        if info is None or self._mic_notified:
+            return
+        self._mic_notified = True
+        access = check_microphone(getattr(self.current_options or UiOptions(), "mic_device", None))
+        detail = guidance_message(access) or (
+            "Aplikasi tidak dapat membuka mikrofon.\n\nPenyebab: "
+            f"{info.get('reason') or 'tidak diketahui'}."
+        )
+        self._abort_session_and_warn("Mikrofon Tidak Dapat Digunakan", detail)
+        self.run_mic_health_check()
+
     def _ensure_microphone_permission(self) -> bool:
         """True bila rekaman boleh jalan (source tanpa mic, atau mikrofon siap)."""
         opts = self.current_options or UiOptions()
@@ -1008,18 +1067,55 @@ class CompactWidget(QtWidgets.QWidget):
         self.mic_vu.setToolTip(f"Level mikrofon: {mic_pct}%")
         self.spk_vu.setToolTip(f"Level speaker: {spk_pct}%")
 
-    def toggle_mute(self, checked: bool):
-        self.muted = bool(checked)
-        
-        if self.muted:
+    def run_mic_health_check(self) -> None:
+        """Health check mikrofon sekali jalan; device dibuka lalu SEGERA ditutup.
+
+        Windows tidak menyediakan dialog izin untuk aplikasi desktop Win32, jadi
+        readiness harus dideteksi sendiri. Hasilnya ditampilkan lewat tombol Mute Mic
+        (tanpa menambah indikator UI baru), bukan dengan menahan device tetap terbuka.
+        """
+        opts = self.current_options or UiOptions()
+        if not source_uses_microphone(getattr(opts, "source", "both")):
+            self._mic_ready = True
+            self._apply_mute_button_state()
+            return
+        access = check_microphone(getattr(opts, "mic_device", None))
+        self._mic_ready = guidance_kind(access) == GUIDANCE_NONE
+        self._mic_not_ready_reason = guidance_message(access)
+        self._apply_mute_button_state()
+
+    def _apply_mute_button_state(self) -> None:
+        """Tampilkan state mute ATAU ketidaksiapan mikrofon pada satu tombol yang sama."""
+        if not self._mic_ready:
+            # Status DITAMPILKAN, kontrol TIDAK diubah: label dan arti klik tetap
+            # "mute", agar satu tombol tidak berganti makna diam-diam. Jalur
+            # perbaikan disediakan di Start Recording (validasi otoritatif).
+            self.mute_btn.setText(" Muted" if self.muted else " Mute Mic")
+            self.mute_btn.setIcon(load_icon("micoff.svg" if self.muted else "mic.svg"))
+            self.mute_btn.setToolTip(
+                "Mikrofon belum dapat digunakan.\n\n"
+                + (self._mic_not_ready_reason or "Penyebab tidak diketahui.")
+                + "\n\nTekan Start Recording untuk melihat langkah perbaikannya."
+            )
+            self.mute_btn.setProperty("micState", "unavailable")
+        elif self.muted:
             self.mute_btn.setText(" Muted")
-            self.mute_btn.setIcon(load_icon("micoff.svg")) 
+            self.mute_btn.setIcon(load_icon("micoff.svg"))
             self.mute_btn.setToolTip("Aktifkan kembali mikrofon (Ctrl+M)")
+            self.mute_btn.setProperty("micState", "muted")
         else:
             self.mute_btn.setText(" Mute Mic")
-            self.mute_btn.setIcon(load_icon("mic.svg"))  
+            self.mute_btn.setIcon(load_icon("mic.svg"))
             self.mute_btn.setToolTip("Bisukan mikrofon (Ctrl+M)")
-            
+            self.mute_btn.setProperty("micState", "ready")
+        # Refresh QSS agar perubahan property ikut ter-render.
+        self.mute_btn.style().unpolish(self.mute_btn)
+        self.mute_btn.style().polish(self.mute_btn)
+
+    def toggle_mute(self, checked: bool):
+        self.muted = bool(checked)
+        self._apply_mute_button_state()
+
         # True mute: terapkan ke sesi yang sedang berjalan tanpa restart koneksi.
         if self.record_btn.isChecked():
             self._apply_mute()
@@ -1041,6 +1137,7 @@ class CompactWidget(QtWidgets.QWidget):
         # (engine juga me-reset detailnya saat start).
         self._outdated_notified = False
         self._tls_notified = False
+        self._mic_notified = False
         opts = self.current_options or UiOptions()
         opts.host = getattr(opts, "host", "localhost")
         opts.port = getattr(opts, "port", 9090)
@@ -1149,6 +1246,7 @@ class CompactWidget(QtWidgets.QWidget):
             self._update_audio_meters()
             self._check_outdated_client()
             self._check_tls_error()
+            self._check_mic_error()
         except Exception:
             pass
 
@@ -1248,7 +1346,7 @@ def run_gui() -> int:
     app = QtWidgets.QApplication(sys.argv)
 
     # Menetapkan ikon aplikasi secara global agar muncul di Taskbar & semua Window
-    app_icon = load_icon("apps.png")
+    app_icon = load_icon("app.ico")
     app.setWindowIcon(app_icon)
 
     # Khusus Windows: Supaya taskbar Windows tidak mengelompokkan aplikasi ke dalam grup generic 'Python'

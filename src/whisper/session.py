@@ -87,7 +87,7 @@ from src.whisper.client_reconnect import (
     ReconnectPolicy,
     _BufferedReconnectClient,
 )
-from src.utils.status_ipc import format_level_line, format_status_line, parse_command_line
+from src.utils.status_ipc import emit_status, format_level_line, format_status_line, parse_command_line
 from src.whisper.capture import _build_capture_streams
 from src.whisper.session_utils import (
     TranscriptCallback,
@@ -117,10 +117,7 @@ def _emit_connection_signal(source: str, status: str, **details: object) -> None
     substring yang menabrak teks transcript. Ditulis satu baris utuh di bawah
     lock agar tidak terpotong output thread source lain.
     """
-    line = format_status_line(source, status, **details)
-    with _status_emit_lock:
-        sys.stdout.write(line)
-        sys.stdout.flush()
+    emit_status(source, status, **details)
 
 
 # True mute: source yang di-mute tidak dikirim ke server, tetapi koneksi dan

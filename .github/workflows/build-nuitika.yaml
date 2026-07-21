@@ -108,6 +108,7 @@ jobs:
           --onefile ^
           --plugin-enable=pyside6 ^
           --include-data-dir=src/icon=src/icon ^
+          --windows-icon-from-ico=src/icon/app.ico ^
           --include-data-dir=config=config ^
           --include-package=src ^
           --include-module=sounddevice ^

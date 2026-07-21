@@ -64,10 +64,54 @@ def test_build_live_command_dev_uses_dispatcher_module(monkeypatch) -> None:
     assert "-m" in command  # dev: interpreter + modul dispatcher
 
 
-def test_build_live_command_frozen_uses_exe_without_dash_m(monkeypatch) -> None:
+def test_build_live_command_frozen_uses_exe_without_dash_m(monkeypatch, tmp_path) -> None:
+    exe = tmp_path / "MeetingTranscriber.exe"
+    exe.write_bytes(b"stub")
     monkeypatch.setattr(engine, "is_frozen", lambda: True)
+    monkeypatch.setattr(sys, "argv", [str(exe)])
+
     command = build_live_command(UiOptions())
     # Packaged: exe men-dispatch pada args; TIDAK boleh ada `-m` (Nuitka tak dukung).
-    assert command[0] == sys.executable
+    assert command[0] == str(exe.resolve())
     assert "-m" not in command
     assert command[1:3] == ["--mode", "live"]
+
+
+# Regresi WinError 2: pada Nuitka onefile, sys.executable menunjuk python.exe
+# di direktori ekstraksi yang TIDAK ADA -> CreateProcess gagal.
+def test_app_executable_dev_uses_sys_executable(monkeypatch) -> None:
+    monkeypatch.setattr(engine, "is_frozen", lambda: False)
+    assert engine.app_executable() == sys.executable
+
+
+def test_app_executable_frozen_prefers_argv0_over_sys_executable(monkeypatch, tmp_path) -> None:
+    exe = tmp_path / "MeetingTranscriber.exe"
+    exe.write_bytes(b"stub")
+    phantom = tmp_path / "onefile_tmp" / "python.exe"  # tidak dibuat: meniru onefile
+    monkeypatch.setattr(engine, "is_frozen", lambda: True)
+    monkeypatch.setattr(sys, "argv", [str(exe)])
+    monkeypatch.setattr(sys, "executable", str(phantom))
+
+    assert engine.app_executable() == str(exe.resolve())
+
+
+def test_app_executable_frozen_falls_back_to_sys_executable(monkeypatch, tmp_path) -> None:
+    real = tmp_path / "app.exe"
+    real.write_bytes(b"stub")
+    monkeypatch.setattr(engine, "is_frozen", lambda: True)
+    monkeypatch.setattr(sys, "argv", [str(tmp_path / "hilang.exe")])
+    monkeypatch.setattr(sys, "executable", str(real))
+
+    assert engine.app_executable() == str(real.resolve())
+
+
+def test_app_executable_frozen_raises_actionable_error_when_missing(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(engine, "is_frozen", lambda: True)
+    monkeypatch.setattr(sys, "argv", [str(tmp_path / "hilang.exe")])
+    monkeypatch.setattr(sys, "executable", str(tmp_path / "juga-hilang.exe"))
+
+    with pytest.raises(RuntimeError) as excinfo:
+        engine.app_executable()
+    message = str(excinfo.value)
+    assert "executable aplikasi" in message
+    assert "sys.argv[0]" in message and "sys.executable" in message

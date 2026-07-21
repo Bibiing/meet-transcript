@@ -50,6 +50,7 @@ _CONNECTION_STATE_BY_CODE: dict[str, str] = {
     "CLIENT_READY_TIMEOUT": "ERROR",
     "OUTDATED_CLIENT": "ERROR",
     "CLIENT_TLS_ERROR": "ERROR",
+    "CLIENT_MIC_ERROR": "ERROR",
     "ERROR": "ERROR",
     "DISCONNECT": "DISCONNECTED",
     "CLIENT_REMOTE_CLOSED": "DISCONNECTED",
@@ -131,6 +132,8 @@ class LiveProcessState:
     outdated_client: dict | None = None
     # W2: detail kegagalan verifikasi TLS (None = tidak ada), pola sama dengan di atas.
     tls_error: dict | None = None
+    # W3: detail kegagalan membuka mikrofon di subprocess (None = tidak ada).
+    mic_error: dict | None = None
     lock: threading.RLock = field(default_factory=threading.RLock)
 
     def running(self) -> bool:
@@ -178,11 +181,42 @@ class LiveProcessState:
 STATE = LiveProcessState()
 
 
+def app_executable() -> str:
+    """Executable yang dipakai untuk men-spawn ulang aplikasi ini (jalur live).
+
+    JANGAN memakai `sys.executable` pada build frozen. Pada Nuitka **onefile**,
+    `sys.executable` menunjuk ke `<dir-ekstraksi-temp>\\python.exe` — berkas yang
+    TIDAK PERNAH ADA (diverifikasi: `os.path.exists` -> False, dan direktori
+    ekstraksi memang tidak memuat satu pun .exe). Men-spawn path itu membuat
+    CreateProcess gagal dengan `WinError 2: The system cannot find the file
+    specified`. Path exe yang sebenarnya berada di `sys.argv[0]`.
+
+    Dev (tidak frozen) tetap memakai `sys.executable` — di sana nilainya benar.
+    """
+    if not is_frozen():
+        return sys.executable
+
+    for candidate in (sys.argv[0], sys.executable):
+        if not candidate:
+            continue
+        resolved = Path(candidate).resolve()
+        if resolved.is_file():
+            return str(resolved)
+
+    # Guard: gagal dengan diagnosis yang dapat ditindaklanjuti, bukan WinError 2 mentah.
+    raise RuntimeError(
+        "Tidak dapat menemukan executable aplikasi untuk memulai sesi. "
+        f"sys.argv[0]={sys.argv[0]!r}, sys.executable={sys.executable!r}. "
+        "Jalankan aplikasi dari lokasi instalasinya, lalu coba lagi."
+    )
+
+
 def build_live_command(options: UiOptions) -> list[str]:
-    # Packaged (Nuitka): sys.executable = exe aplikasi yang men-dispatch pada args
-    # -> "exe --mode live ..." (Nuitka tak mendukung `-m modul`).
+    # Packaged (Nuitka): exe aplikasi men-dispatch pada args -> "exe --mode live ..."
+    # (Nuitka tak mendukung `-m modul`; percobaan itu diblokir guard self-execution).
     # Dev: lewat dispatcher tunggal -> "python -m src.app --mode live ...".
-    command = [sys.executable] if is_frozen() else [sys.executable, "-m", "src.app"]
+    executable = app_executable()
+    command = [executable] if is_frozen() else [executable, "-m", "src.app"]
     command += [
         "--mode",
         "live",
@@ -315,6 +349,7 @@ def start_live(options: UiOptions) -> dict[str, Any]:
         STATE.audio_levels.clear()
         STATE.outdated_client = None
         STATE.tls_error = None
+        STATE.mic_error = None
         STATE.log_lines.clear()
         STATE.append_log("UI started live client")
 
@@ -417,6 +452,12 @@ def tls_error_info() -> dict | None:
     """
     with STATE.lock:
         return dict(STATE.tls_error) if STATE.tls_error else None
+
+
+def mic_error_info() -> dict | None:
+    """Detail kegagalan membuka mikrofon di sesi live, atau None (W3)."""
+    with STATE.lock:
+        return dict(STATE.mic_error) if STATE.mic_error else None
 
 
 def set_mute(source: str, muted: bool) -> bool:
@@ -600,6 +641,9 @@ def _handle_monitor_line(line: str) -> None:
                     "client_version": app_version(),
                     "min_version": str(details.get("min_version") or ""),
                 }
+        elif code == "CLIENT_MIC_ERROR":
+            with STATE.lock:
+                STATE.mic_error = {"reason": str(details.get("reason") or "")}
         elif code == "CLIENT_TLS_ERROR":
             # W2: simpan sebab agar GUI menjelaskan kegagalan koneksi aman.
             with STATE.lock:

@@ -31,8 +31,49 @@ def is_cli_invocation(argv: list[str]) -> bool:
     return False
 
 
+SELFTEST_SPAWN_FLAG = "--selftest-spawn"
+
+
+def _selftest_spawn() -> int:
+    """Diagnostik: aplikasi men-spawn DIRINYA SENDIRI, persis seperti jalur live.
+
+    Menutup celah uji nyata: smoke test lama memanggil exe dari LUAR, sehingga tidak
+    pernah melewati `app_executable()`. Jalur itulah yang dulu memakai `sys.executable`
+    (= python.exe fiktif di direktori ekstraksi onefile) dan gagal dengan WinError 2.
+    Di sini dipakai `--mode preprocess` karena ringan dan pasti berhenti sendiri.
+    """
+    import subprocess
+    import tempfile
+
+    from src.core.engine import app_executable, is_frozen
+
+    executable = app_executable()
+    print(f"selftest: frozen={is_frozen()} executable={executable}")
+    command = [executable] if is_frozen() else [executable, "-m", "src.app"]
+    command += ["--mode", "preprocess", "--output-dir", tempfile.mkdtemp(prefix="pln_selftest_")]
+
+    proc = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=180,
+    )
+    output = proc.stdout or ""
+    print(output)
+    if "Detected OS" not in output:
+        print("selftest: GAGAL - subprocess hasil self-spawn tidak berjalan", file=sys.stderr)
+        return 1
+    print("selftest: OK - executable berhasil men-spawn subprocess dan subprocess berjalan")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:]) if argv is None else list(argv)
+    if SELFTEST_SPAWN_FLAG in argv:
+        return _selftest_spawn()
     if is_cli_invocation(argv):
         from src.main import main as cli_main
 

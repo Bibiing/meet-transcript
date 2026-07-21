@@ -57,6 +57,32 @@ def main() -> int:
         return 1
 
     print("[OK] exe packaged men-dispatch ke jalur CLI dan stdout sampai ke parent via PIPE.")
+
+    # 3. Jalur SELF-SPAWN: exe -> spawn subprocess -> subprocess berjalan.
+    # Smoke di atas memanggil exe dari LUAR, sehingga tidak pernah melewati
+    # `app_executable()`. Jalur itulah yang gagal dengan WinError 2 karena memakai
+    # `sys.executable` (python.exe fiktif di direktori ekstraksi onefile).
+    print("--- self-spawn check ---")
+    spawn = subprocess.run(
+        [str(exe), "--selftest-spawn"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=300,
+    )
+    spawn_output = spawn.stdout or ""
+    print(spawn_output)
+    if spawn.returncode != 0 or "selftest: OK" not in spawn_output:
+        print(
+            "[FAIL] exe packaged TIDAK dapat men-spawn dirinya sendiri. "
+            "Ini regresi WinError 2: executable untuk self-spawn salah di-resolve.",
+            file=sys.stderr,
+        )
+        return 1
+
+    print("[OK] exe packaged berhasil men-spawn subprocess dan subprocess berjalan.")
     return 0
 
 
