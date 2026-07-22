@@ -517,10 +517,22 @@ class HistoryDialog(QtWidgets.QDialog):
 
         header = QtWidgets.QLabel("Riwayat Transkrip")
         header.setObjectName("HistTitle")
+
+        separator = QtWidgets.QLabel("|")
+        separator.setObjectName("HistSeparator")
+
         subtitle = QtWidgets.QLabel(
             f"{len(items)} rekaman tersimpan" if items else "Belum ada rekaman tersimpan"
         )
         subtitle.setObjectName("HistSubtitle")
+
+        header_layout = QtWidgets.QHBoxLayout()
+        header_layout.addWidget(header, alignment=QtCore.Qt.AlignmentFlag.AlignVCenter)
+        header_layout.addSpacing(8) 
+        header_layout.addWidget(separator, alignment=QtCore.Qt.AlignmentFlag.AlignVCenter)
+        header_layout.addSpacing(8) 
+        header_layout.addWidget(subtitle, alignment=QtCore.Qt.AlignmentFlag.AlignVCenter)
+        header_layout.addStretch(1)
 
         self.list = QtWidgets.QListWidget()
         self.list.setObjectName("HistList")
@@ -531,7 +543,7 @@ class HistoryDialog(QtWidgets.QDialog):
         self.list.itemSelectionChanged.connect(self._sync_open_enabled)
         self._populate(items)
 
-        self.open_btn = QtWidgets.QPushButton("  Buka di jendela utama")
+        self.open_btn = QtWidgets.QPushButton("Buka")
         self.open_btn.setObjectName("HistPrimary")
         self.open_btn.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
         self.open_btn.clicked.connect(self._open_selected)
@@ -550,8 +562,8 @@ class HistoryDialog(QtWidgets.QDialog):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(20, 18, 20, 16)
         layout.setSpacing(4)
-        layout.addWidget(header)
-        layout.addWidget(subtitle)
+
+        layout.addLayout(header_layout)
         layout.addSpacing(10)
 
         if items:
