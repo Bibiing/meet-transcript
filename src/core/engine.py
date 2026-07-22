@@ -19,13 +19,17 @@ from src.capture.win_loopback import list_soundcard_loopback_devices
 from src.utils.logging import load_transcript_entries
 from src.utils.os_detector import AudioBackend, get_audio_backend
 from src.app import is_frozen
+from src import paths
 from src.utils.status_ipc import format_command_line, parse_level_line, parse_status_line
 from src.version import app_version
 
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
-DEFAULT_TRANSCRIPT_LOG = ROOT_DIR / "audio" / "transcript_log.json"
-DEFAULT_LOG_FILE = ROOT_DIR / "logs" / "transcriber.log"
+# Transkrip & log HARUS di direktori data per-user yang persisten, BUKAN relatif
+# terhadap __file__: pada Nuitka onefile, __file__ ada di direktori ekstraksi temp
+# yang dihapus saat keluar (data hilang). Lihat src/paths.py.
+DEFAULT_TRANSCRIPT_LOG = paths.current_transcript_log()
+DEFAULT_LOG_FILE = paths.logs_dir() / "transcriber.log"
 
 # Margin di atas final_drain_seconds subprocess saat menunggu graceful stop.
 # Menutup batas atas deterministik yang berjalan seri dengan drain: join reader
@@ -315,6 +319,7 @@ def start_live(options: UiOptions) -> dict[str, Any]:
             archive_transcript(options.transcript_log)
 
         options.transcript_log.parent.mkdir(parents=True, exist_ok=True)
+        paths.ensure_dir(DEFAULT_LOG_FILE.parent)  # subprocess menulis --log-file ke sini
         command = build_live_command(options)
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
@@ -501,6 +506,71 @@ def archive_transcript(path: Path = DEFAULT_TRANSCRIPT_LOG) -> Path | None:
     target = archive_dir / f"{path.stem}.{stamp}{path.suffix}"
     shutil.move(str(path), str(target))
     return target
+
+
+def archive_transcript_to_history(path: Path = DEFAULT_TRANSCRIPT_LOG) -> Path | None:
+    """Arsipkan transkrip sesi ke folder history (satu berkas per rapat, bertanggal).
+
+    Berkas `current` berformat JSONL (satu entri per baris); di-parse dengan parser
+    resmi lalu ditulis ke history sebagai `{"entries": [...]}` yang self-describing,
+    seragam dengan yang dibaca list_history/SummaryWindow. Hanya entri final
+    (completed) yang disimpan — sama dengan yang tampil pada live view/export.
+    Transkrip kosong tidak diarsipkan.
+    """
+    path = path.resolve()
+    if not path.exists():
+        return None
+    try:
+        entries = [e for e in load_transcript_entries(path) if isinstance(e, dict)]
+    except Exception:
+        return None
+    final = [e for e in entries if bool(e.get("completed", True))]
+    if not final:
+        return None  # jangan arsipkan sesi tanpa transkrip final
+
+    hist = paths.ensure_dir(paths.history_dir())
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    target = hist / f"transcript-{stamp}.json"
+    # Hindari menimpa arsip lain bila dua sesi berakhir pada detik yang sama.
+    suffix = 1
+    while target.exists():
+        target = hist / f"transcript-{stamp}-{suffix}.json"
+        suffix += 1
+    payload = {"created_at": datetime.now().isoformat(timespec="seconds"), "entries": final}
+    try:
+        target.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        return None
+    return target
+
+
+def list_history() -> list[dict[str, Any]]:
+    """Daftar riwayat transkrip (terbaru dulu) dari folder history."""
+    hist = paths.history_dir()
+    if not hist.exists():
+        return []
+    items: list[dict[str, Any]] = []
+    for file in hist.glob("transcript-*.json"):
+        try:
+            data = json.loads(file.read_text(encoding="utf-8"))
+            entries = data.get("entries", []) if isinstance(data, dict) else []
+        except (OSError, ValueError):
+            entries = []
+        preview = ""
+        for entry in entries:
+            text = str(entry.get("text") or "").strip() if isinstance(entry, dict) else ""
+            if text:
+                preview = text
+                break
+        items.append({
+            "path": str(file),
+            "name": file.stem,
+            "mtime": file.stat().st_mtime,
+            "entry_count": len(entries),
+            "preview": preview,
+        })
+    items.sort(key=lambda it: it["mtime"], reverse=True)
+    return items
 
 
 def transcript_payload(path: Path = DEFAULT_TRANSCRIPT_LOG) -> dict[str, Any]:

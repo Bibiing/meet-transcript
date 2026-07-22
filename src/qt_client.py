@@ -11,9 +11,11 @@ import json
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from src.core.engine import (
+    archive_transcript_to_history,
     audio_devices_payload,
     audio_levels,
     connection_status,
+    list_history,
     mic_error_info,
     outdated_client_info,
     set_mute,
@@ -401,29 +403,287 @@ class SummaryWindow(QtWidgets.QDialog):
     def __init__(self, transcript: dict, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Transcript Summary")
-        self.setWindowIcon(load_icon("apps.png"))
+        self.setWindowIcon(load_icon("app.ico"))
         self.resize(700, 500)
+        self._entries = transcript.get("entries", [])
         layout = QtWidgets.QVBoxLayout()
         self.text = QtWidgets.QPlainTextEdit()
         self.text.setReadOnly(True)
-        content = "\n".join([e.get("text", "") for e in transcript.get("entries", [])])
+        content = "\n".join([e.get("text", "") for e in self._entries])
         self.text.setPlainText(content)
         layout.addWidget(self.text)
 
         btns = QtWidgets.QHBoxLayout()
-        export_txt = QtWidgets.QPushButton("Export .txt")
-        export_txt.clicked.connect(self.export_txt)
+        export_pdf = QtWidgets.QPushButton("Export PDF")
+        export_pdf.setObjectName("SecondaryBtn")
+        export_pdf.clicked.connect(self.export_pdf)
         btns.addStretch(1)
-        btns.addWidget(export_txt)
+        btns.addWidget(export_pdf)
         layout.addLayout(btns)
         self.setLayout(layout)
 
-    def export_txt(self):
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save transcript", "transcript.txt", "Text files (*.txt)")
+    def export_pdf(self):
+        if not self._entries:
+            QtWidgets.QMessageBox.information(self, "No transcript", "No transcript data to export.")
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export transcript", "transcript.pdf", "PDF (*.pdf)")
         if not path:
             return
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(self.text.toPlainText())
+        if not path.lower().endswith(".pdf"):
+            path += ".pdf"
+        try:
+            _export_transcript_pdf(path, self._entries)
+            QtWidgets.QMessageBox.information(self, "Exported", f"Transcript exported to {path}")
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Error", f"Failed to export: {exc}")
+
+
+def _entries_to_html(entries: list) -> str:
+    """Render entri transkrip ke HTML dengan label source (Mic/Speaker).
+
+    Dipakai bersama oleh live view DAN tampilan history agar identik.
+    """
+    rows = []
+    for e in entries:
+        text = e.get("text", "")
+        source = str(e.get("source") or "other")
+        if source == "mic":
+            label = '<b style="color: #2563EB;">[Me]</b>'
+        elif source == "speaker":
+            label = '<b style="color: #059669;">[Speaker]</b>'
+        else:
+            label = f'<b style="color: #64748B;">[{source}]</b>'
+        rows.append(f"{label} {text}")
+    return "<br>".join(rows)
+
+
+def _export_transcript_pdf(path: str, entries: list) -> None:
+    """Render transkrip ke PDF memakai Qt (QTextDocument -> QPdfWriter)"""
+    lines = []
+    for e in entries:
+        src = e.get("source") or "other"
+        text = (e.get("text", "") or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        lines.append(f"<p><b>[{src}]</b> {text}</p>")
+    doc = QtGui.QTextDocument()
+    doc.setHtml("<h2>Transcript</h2>" + "".join(lines))
+    writer = QtGui.QPdfWriter(path)
+    writer.setPageSize(QtGui.QPageSize(QtGui.QPageSize.PageSizeId.A4))
+    doc.print_(writer)
+
+
+def _humanize_history_time(epoch: float) -> str:
+    """Waktu yang enak dibaca: 'Hari ini 14:30', 'Kemarin 09:15', atau tanggal penuh."""
+    _BULAN = ["", "Jan", "Feb", "Mar", "Apr", "Mei", "Jun",
+              "Jul", "Agu", "Sep", "Okt", "Nov", "Des"]
+    now = time.localtime()
+    t = time.localtime(epoch)
+    jam = time.strftime("%H:%M", t)
+    today = time.strftime("%Y-%m-%d", now)
+    that_day = time.strftime("%Y-%m-%d", t)
+    yesterday = time.strftime("%Y-%m-%d", time.localtime(time.mktime(now) - 86400))
+    if that_day == today:
+        return f"Hari ini {jam}"
+    if that_day == yesterday:
+        return f"Kemarin {jam}"
+    return f"{t.tm_mday} {_BULAN[t.tm_mon]} {t.tm_year} · {jam}"
+
+
+class _ElidedLabel(QtWidgets.QLabel):
+    """QLabel yang meng-elide teks (…) mengikuti lebar tersedia, responsif."""
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(parent)
+        self._full = text
+        self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored, QtWidgets.QSizePolicy.Policy.Preferred)
+        super().setText(text)
+
+    def resizeEvent(self, event):  # noqa: N802 (API Qt)
+        metrics = self.fontMetrics()
+        super().setText(metrics.elidedText(self._full, QtCore.Qt.TextElideMode.ElideRight, self.width()))
+        super().resizeEvent(event)
+
+
+class HistoryDialog(QtWidgets.QDialog):
+    """Riwayat transkrip dari folder khusus per-user (bukan dialog file kosong)"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Riwayat Transkrip")
+        self.setWindowIcon(load_icon("app.ico"))
+        self.setMinimumSize(560, 460)
+        self.setStyleSheet(self._stylesheet())
+
+        items = list_history()
+
+        header = QtWidgets.QLabel("Riwayat Transkrip")
+        header.setObjectName("HistTitle")
+        subtitle = QtWidgets.QLabel(
+            f"{len(items)} rekaman tersimpan" if items else "Belum ada rekaman tersimpan"
+        )
+        subtitle.setObjectName("HistSubtitle")
+
+        self.list = QtWidgets.QListWidget()
+        self.list.setObjectName("HistList")
+        self.list.setSpacing(4)
+        self.list.setVerticalScrollMode(QtWidgets.QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.list.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.list.itemDoubleClicked.connect(lambda _it: self._open_selected())
+        self.list.itemSelectionChanged.connect(self._sync_open_enabled)
+        self._populate(items)
+
+        self.open_btn = QtWidgets.QPushButton("  Buka di jendela utama")
+        self.open_btn.setObjectName("HistPrimary")
+        self.open_btn.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
+        self.open_btn.clicked.connect(self._open_selected)
+        self.open_btn.setEnabled(False)
+
+        close_btn = QtWidgets.QPushButton("Tutup")
+        close_btn.setObjectName("HistGhost")
+        close_btn.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
+        close_btn.clicked.connect(self.reject)
+
+        buttons = QtWidgets.QHBoxLayout()
+        buttons.addStretch(1)
+        buttons.addWidget(close_btn)
+        buttons.addWidget(self.open_btn)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 16)
+        layout.setSpacing(4)
+        layout.addWidget(header)
+        layout.addWidget(subtitle)
+        layout.addSpacing(10)
+
+        if items:
+            layout.addWidget(self.list, 1)
+        else:
+            layout.addWidget(self._empty_state(), 1)
+        layout.addSpacing(6)
+        layout.addLayout(buttons)
+
+    def _empty_state(self) -> QtWidgets.QWidget:
+        box = QtWidgets.QFrame()
+        box.setObjectName("HistEmpty")
+        lay = QtWidgets.QVBoxLayout(box)
+        lay.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        icon = QtWidgets.QLabel("🗂")
+        icon.setObjectName("HistEmptyIcon")
+        icon.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        msg = QtWidgets.QLabel(
+            "Transkrip akan muncul di sini secara otomatis\n"
+            "setiap kali Anda menghentikan rekaman yang berisi teks."
+        )
+        msg.setObjectName("HistEmptyMsg")
+        msg.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(icon)
+        lay.addWidget(msg)
+        return box
+
+    def _populate(self, items: list) -> None:
+        for item in items:
+            row = self._make_row(item)
+            widget_item = QtWidgets.QListWidgetItem(self.list)
+            widget_item.setData(QtCore.Qt.ItemDataRole.UserRole, item["path"])
+            widget_item.setSizeHint(row.sizeHint())
+            self.list.addItem(widget_item)
+            self.list.setItemWidget(widget_item, row)
+
+    def _make_row(self, item: dict) -> QtWidgets.QWidget:
+        row = QtWidgets.QWidget()
+        row.setObjectName("HistRow")
+        outer = QtWidgets.QVBoxLayout(row)
+        outer.setContentsMargins(14, 10, 14, 10)
+        outer.setSpacing(4)
+
+        top = QtWidgets.QHBoxLayout()
+        top.setSpacing(8)
+        when = QtWidgets.QLabel(_humanize_history_time(item["mtime"]))
+        when.setObjectName("HistWhen")
+        count = QtWidgets.QLabel(f"{item['entry_count']} baris")
+        count.setObjectName("HistCount")
+        top.addWidget(when)
+        top.addStretch(1)
+        top.addWidget(count)
+
+        preview_text = (item.get("preview") or "Tanpa teks").strip()
+        preview = _ElidedLabel(preview_text)
+        preview.setObjectName("HistPreview")
+
+        outer.addLayout(top)
+        outer.addWidget(preview)
+        return row
+
+    def _sync_open_enabled(self) -> None:
+        self.open_btn.setEnabled(self.list.currentItem() is not None)
+
+    @staticmethod
+    def _stylesheet() -> str:
+        return f"""
+            QDialog {{ background: {BG}; }}
+            QLabel#HistTitle {{ color: {TEXT}; font-size: 17px; font-weight: 700; }}
+            QLabel#HistSubtitle {{ color: #6B8890; font-size: 12px; }}
+            QListWidget#HistList {{
+                background: transparent; border: none; outline: none;
+            }}
+            QListWidget#HistList::item {{
+                border: 1px solid {BORDER}; border-radius: 10px;
+                background: white; margin: 0px; padding: 0px;
+            }}
+            QListWidget#HistList::item:selected {{
+                border: 1px solid {PRIMARY}; background: #EAF9FB;
+            }}
+            QListWidget#HistList::item:hover {{ border: 1px solid {PRIMARY}; }}
+            QWidget#HistRow {{ background: transparent; }}
+            QLabel#HistWhen {{ color: {TEXT}; font-size: 13px; font-weight: 600; }}
+            QLabel#HistCount {{
+                color: #4B6B72; font-size: 11px; font-weight: 600;
+                background: {SECONDARY}; border-radius: 9px; padding: 2px 9px;
+            }}
+            QLabel#HistPreview {{ color: #64808A; font-size: 12px; }}
+            QFrame#HistEmpty {{
+                background: white; border: 1px dashed {BORDER}; border-radius: 12px;
+            }}
+            QLabel#HistEmptyIcon {{ font-size: 40px; }}
+            QLabel#HistEmptyMsg {{ color: #6B8890; font-size: 13px; }}
+            QPushButton#HistPrimary {{
+                background: {PRIMARY}; color: #0A2E33; border: none;
+                border-radius: 9px; padding: 9px 18px; font-weight: 700; min-height: 20px;
+            }}
+            QPushButton#HistPrimary:hover {{ background: {PRIMARY_HOVER}; }}
+            QPushButton#HistPrimary:disabled {{ background: #D7E6E8; color: #9BB3B8; }}
+            QPushButton#HistGhost {{
+                background: transparent; color: {TEXT}; border: 1px solid {BORDER};
+                border-radius: 9px; padding: 9px 18px; font-weight: 600;
+            }}
+            QPushButton#HistGhost:hover {{ background: {SECONDARY}; }}
+        """
+
+    def _load_and_show(self, path: str) -> None:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and "entries" in data:
+                entries = data.get("entries", [])
+            elif isinstance(data, list):
+                entries = data
+            else:
+                entries = []
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Error", f"Gagal membuka transkrip: {exc}")
+            return
+        # Tutup window riwayat, tampilkan di window utama (dengan label source).
+        main = self.parent()
+        if main is not None and hasattr(main, "show_history_entries"):
+            main.show_history_entries(entries)
+            self.accept()
+        else:  # fallback bila tanpa parent window utama
+            SummaryWindow({"entries": entries}, parent=self).exec()
+
+    def _open_selected(self) -> None:
+        item = self.list.currentItem()
+        if item is None:
+            return
+        self._load_and_show(item.data(QtCore.Qt.ItemDataRole.UserRole))
 
 
 class CompactWidget(QtWidgets.QWidget):
@@ -451,6 +711,8 @@ class CompactWidget(QtWidgets.QWidget):
         # W3: readiness mikrofon (health check startup) ditampilkan lewat tombol Mute Mic.
         self._mic_ready = True
         self._mic_not_ready_reason = ""
+        # Menampilkan riwayat di window utama (bukan window baru): tangguhkan render live.
+        self._viewing_history = False
 
         self.setObjectName("MainWindow")
 
@@ -747,6 +1009,7 @@ class CompactWidget(QtWidgets.QWidget):
                 font-weight: bold;
                 font-size: 12px;
                 border: 1px solid {BORDER};
+                padding: 6px 16px;
             }}
             
             QPushButton:disabled,
@@ -854,8 +1117,7 @@ class CompactWidget(QtWidgets.QWidget):
                 border-radius: 6px;
                 font-weight: bold;
                 font-size: 12px;
-                min-width: 110px;
-                min-height: 36px;
+                padding: 8px 16px;
             }}
             QPushButton#SaveBtn:hover {{
                 background-color: {PRIMARY_HOVER};
@@ -869,8 +1131,7 @@ class CompactWidget(QtWidgets.QWidget):
                 border-radius: 6px;
                 font-weight: bold;
                 font-size: 12px;
-                min-width: 90px;
-                min-height: 36px;
+                padding: 8px 16px;
             }}
             QPushButton#CancelBtn:hover {{
                 background-color: #FEF2F2;
@@ -931,9 +1192,24 @@ class CompactWidget(QtWidgets.QWidget):
             return
         self._apply_record_button_state(recording=checked)
         if checked:
+            # Mulai rekaman -> keluar dari mode lihat-riwayat, kembali ke live view.
+            self._viewing_history = False
+            self._last_transcript_mtime = None
             self._start_live()
         else:
             self._stop_live()
+
+    def show_history_entries(self, entries: list) -> None:
+        """Tampilkan riwayat terpilih di window utama (bukan window baru).
+
+        Menahan render live agar tidak menimpa; format (label Mic/Speaker) sama
+        dengan live view. Mulai rekaman baru mengembalikan tampilan ke live.
+        """
+        self._viewing_history = True
+        self.preview.setHtml(_entries_to_html(entries))
+        scrollbar = self.preview.verticalScrollBar()
+        if scrollbar:
+            scrollbar.setValue(0)
 
     def _abort_session_and_warn(self, title: str, body: str, *, link: str = "") -> None:
         """Kegagalan permanen sesi: hentikan rekaman lalu jelaskan sekali.
@@ -1159,6 +1435,12 @@ class CompactWidget(QtWidgets.QWidget):
         def _runner():
             try:
                 stop_live()
+                # Sesi selesai & transkrip sudah ter-drain -> arsipkan ke history
+                # (satu berkas per rapat). Transkrip kosong tidak diarsipkan.
+                try:
+                    archive_transcript_to_history()
+                except Exception as exc:
+                    print("failed to archive transcript to history:", exc)
             except Exception as exc:
                 self.error_occurred.emit(f"Gagal menghentikan sesi: {exc}", False)
 
@@ -1177,21 +1459,8 @@ class CompactWidget(QtWidgets.QWidget):
         widget.setGraphicsEffect(shadow)
 
     def open_history(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open transcript (JSON)", str(), "JSON files (*.json);;All files (*)")
-        if not path:
-            return
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict) and "entries" in data:
-                entries = data.get("entries", [])
-            elif isinstance(data, list):
-                entries = data
-            else:
-                entries = []
-            SummaryWindow({"entries": entries}, parent=self).exec()
-        except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, "Error", f"Failed to open transcript: {exc}")
+        # Riwayat dibaca dari folder khusus per-user (bukan dialog file kosong).
+        HistoryDialog(self).exec()
 
     def resume_summary(self):
         if not self.llm_api_key:
@@ -1218,22 +1487,14 @@ class CompactWidget(QtWidgets.QWidget):
             if not entries:
                 QtWidgets.QMessageBox.information(self, "No transcript", "No transcript data to export.")
                 return
-            path, filt = QtWidgets.QFileDialog.getSaveFileName(self, "Export transcript", "transcript.txt", "Text files (*.txt);;Markdown (*.md)")
+            path, _ = QtWidgets.QFileDialog.getSaveFileName(
+                self, "Export transcript", "transcript.pdf", "PDF (*.pdf)",
+            )
             if not path:
                 return
-            if path.endswith(".md") or filt.startswith("Markdown"):
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write("# Transcript\n\n")
-                    for e in entries:
-                        src = e.get("source") or "other"
-                        text = e.get("text", "")
-                        f.write(f"- **{src}**: {text}\n")
-            else:
-                with open(path, "w", encoding="utf-8") as f:
-                    for e in entries:
-                        src = e.get("source") or "other"
-                        text = e.get("text", "")
-                        f.write(f"[{src}] {text}\n")
+            if not path.lower().endswith(".pdf"):
+                path += ".pdf"
+            _export_transcript_pdf(path, entries)
             QtWidgets.QMessageBox.information(self, "Exported", f"Transcript exported to {path}")
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Error", f"Failed to export: {exc}")
@@ -1255,6 +1516,9 @@ class CompactWidget(QtWidgets.QWidget):
             mtime = os.path.getmtime(DEFAULT_TRANSCRIPT_LOG) if os.path.exists(DEFAULT_TRANSCRIPT_LOG) else None
         except OSError:
             mtime = None
+        # Sedang menampilkan riwayat di window utama -> jangan ditimpa transkrip live.
+        if self._viewing_history:
+            return
         if mtime is not None and mtime == self._last_transcript_mtime:
             return
         self._last_transcript_mtime = mtime
@@ -1268,31 +1532,12 @@ class CompactWidget(QtWidgets.QWidget):
             stable_count = sum(1 for e in audit_entries if str(e.get("stability") or "") == "stable")
             candidate_count = sum(1 for e in audit_entries if str(e.get("stability") or "") == "candidate")
             
-            display_html = []
-            
-            for e in entries:
-                stability = e.get("stability") or ("stable" if e.get("completed", True) else "candidate")
-                text = e.get("text", "")
-                source = str(e.get("source") or "other")
-                client_score = e.get("client_reliability_score")
-                
-                # Format label dengan Bold dan Warna berbeda per source
-                if source == "mic":
-                    label_html = '<b style="color: #2563EB;">[Me]</b>'
-                elif source == "speaker":
-                    label_html = '<b style="color: #059669;">[Speaker]</b>'
-                else:
-                    label_html = f'<b style="color: #64748B;">[{source}]</b>'
-
-                # Menyusun baris transkrip (revert to stable rendering for clean production UI)
-                display_html.append(f"{label_html} {text}")
-
             # Amankan posisi scroll jika pengguna sedang scroll ke atas
             scrollbar = self.preview.verticalScrollBar()
             was_at_bottom = scrollbar.value() >= scrollbar.maximum() - 10 if scrollbar else True
 
-            # Render HTML
-            self.preview.setHtml("<br>".join(display_html))
+            # Render HTML (label source bersama dengan tampilan history)
+            self.preview.setHtml(_entries_to_html(entries))
             
             if was_at_bottom and scrollbar:
                 scrollbar.setValue(scrollbar.maximum())
