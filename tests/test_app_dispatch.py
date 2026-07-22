@@ -65,7 +65,7 @@ def test_build_live_command_dev_uses_dispatcher_module(monkeypatch) -> None:
 
 
 def test_build_live_command_frozen_uses_exe_without_dash_m(monkeypatch, tmp_path) -> None:
-    exe = tmp_path / "MeetingTranscriber.exe"
+    exe = tmp_path / "ListenPLN.exe"
     exe.write_bytes(b"stub")
     monkeypatch.setattr(engine, "is_frozen", lambda: True)
     monkeypatch.setattr(sys, "argv", [str(exe)])
@@ -85,7 +85,7 @@ def test_app_executable_dev_uses_sys_executable(monkeypatch) -> None:
 
 
 def test_app_executable_frozen_prefers_argv0_over_sys_executable(monkeypatch, tmp_path) -> None:
-    exe = tmp_path / "MeetingTranscriber.exe"
+    exe = tmp_path / "ListenPLN.exe"
     exe.write_bytes(b"stub")
     phantom = tmp_path / "onefile_tmp" / "python.exe"  # tidak dibuat: meniru onefile
     monkeypatch.setattr(engine, "is_frozen", lambda: True)

@@ -23,5 +23,8 @@ draft/
 temp_server.py
 CLAUDE.md
 # Artifact build lokal (scripts/build_windows_local.ps1)
-MultiTranscriber-Windows.exe
+ListenPLN-Windows.exe
 app.exe
+
+# Claude settings
+.claude/

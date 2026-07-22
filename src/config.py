@@ -147,7 +147,7 @@ class ConfigProvider:
 class QtUserStore:
     """UserStore berbasis QSettings (per-user, lokasi native OS). Qt di-import lazy."""
 
-    def __init__(self, organization: str = "MeetingTranscriber", application: str = "MeetingTranscriber") -> None:
+    def __init__(self, organization: str = "ListenPLN", application: str = "ListenPLN") -> None:
         from PySide6.QtCore import QSettings
 
         self._settings = QSettings(organization, application)

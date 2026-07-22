@@ -1,6 +1,6 @@
-; Inno Setup script — installer Windows per-user untuk Meeting Transcriber (W1).
+; Inno Setup script — installer Windows per-user untuk ListenPLN (W1).
 ;
-; Membungkus exe onefile Nuitka (MultiTranscriber-Windows.exe) menjadi installer
+; Membungkus exe onefile Nuitka (ListenPLN-Windows.exe) menjadi installer
 ; profesional: per-user (TANPA admin), shortcut Start Menu/desktop, uninstaller.
 ; Config aplikasi sudah ter-bundle DI DALAM exe (M2), jadi installer hanya
 ; memasang satu exe.
@@ -8,15 +8,15 @@
 ; Generik: nilai spesifik org (nama/publisher) di #define bagian atas. Versi
 ; di-pass CI via /DMyAppVersion=x.y.z.
 
-#define MyAppName "Meeting Transcriber"
+#define MyAppName "ListenPLN"
 #define MyAppPublisher "PLN"
-#define MyAppExeName "MeetingTranscriber.exe"
+#define MyAppExeName "ListenPLN.exe"
 #ifndef MyAppVersion
   #define MyAppVersion "0.0.0"
 #endif
 ; Path exe hasil Nuitka; default relatif ke lokasi .iss (repo root = ..\..).
 #ifndef AppExe
-  #define AppExe "..\..\MultiTranscriber-Windows.exe"
+  #define AppExe "..\..\ListenPLN-Windows.exe"
 #endif
 
 [Setup]
@@ -34,7 +34,7 @@ UninstallDisplayIcon={app}\{#MyAppExeName}
 ; Ikon installer = logo aplikasi yang sama dengan exe.
 SetupIconFile=..\..\src\icon\app.ico
 OutputDir=..\..
-OutputBaseFilename=MeetingTranscriber-Setup
+OutputBaseFilename=ListenPLN-Setup
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern

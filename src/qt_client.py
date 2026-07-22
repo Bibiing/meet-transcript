@@ -433,7 +433,7 @@ class CompactWidget(QtWidgets.QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("PLN Meeting Transcriber")
+        self.setWindowTitle("ListenPLN")
         self.setWindowIcon(load_icon("app.ico"))
         self.setWindowFlags(QtCore.Qt.WindowType.WindowStaysOnTopHint)
         self.setMinimumSize(600, 300) # Tinggi ditambah sedikit untuk menampung bottom bar
@@ -1353,7 +1353,7 @@ def run_gui() -> int:
     # dan menampilkan logo custom kita secara konsisten pada taskbar.
     if sys.platform == "win32":
         import ctypes
-        myappid = "pln.meeting.transcriber.client.1.0"
+        myappid = "pln.listenpln.client.1"
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
 
     # Paksa skema warna TERANG secara eksplisit. Sejak Qt 6.5, Qt secara otomatis

@@ -27,7 +27,7 @@ if (-not (Test-Path $python)) { $python = "python" }
 $ver = & $python -c "import sys;print('.'.join(map(str,sys.version_info[:2])))"
 if ($ver -ne "3.11") { Write-Warning "Python lokal $ver != CI 3.11 - hasil smoke test kurang dapat dipercaya" }
 
-$output = "MultiTranscriber-Windows.exe"
+$output = "ListenPLN-Windows.exe"
 
 Write-Host "== Build Nuitka (flag identik CI) ==" -ForegroundColor Cyan
 & $python -m nuitka `

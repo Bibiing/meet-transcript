@@ -1,4 +1,4 @@
-# PLN Meeting Transcriber
+# ListenPLN
 
 Aplikasi client-server untuk transkripsi online meeting. Folder `WhisperLive`
 adalah server ASR yang dideploy dengan Docker. Folder root adalah client Python

@@ -243,7 +243,7 @@ class FirstRunWizard(QtWidgets.QWizard):
         checker: Checker = check_microphone,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Penyiapan PLN Meeting Transcriber")
+        self.setWindowTitle("Penyiapan ListenPLN")
         self.setWizardStyle(QtWidgets.QWizard.WizardStyle.ModernStyle)
         self._permission_page = _PermissionPage(device=device, checker=checker)
         self.addPage(_WelcomePage())

@@ -1,7 +1,7 @@
 [project]
 name = "multi-transcriber"
-version = "0.1.0"
-description = "Multiplatform real-time meeting transcriber foundation."
+version = "1.0.0"
+description = "ListenPLN - real-time meeting transcriber."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
