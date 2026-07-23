@@ -43,6 +43,30 @@ def test_saving_without_touching_device_keeps_binding_none(qapp) -> None:
     assert opts.speaker_device is None
 
 
+# Regresi bug #2: nama model di dropdown WAJIB cocok dengan daftar tervalidasi
+# server WhisperLive; "large" polos gagal dimuat dan tak boleh muncul.
+def test_model_options_match_whisperlive_model_sizes(qapp) -> None:
+    from pathlib import Path
+
+    dlg = SettingsDialog(options=UiOptions())
+    items = [dlg.model_select.itemText(i) for i in range(dlg.model_select.count())]
+
+    backend_src = Path("WhisperLive/whisper_live/backend/faster_whisper_backend.py").read_text(
+        encoding="utf-8"
+    )
+    # Setiap opsi harus muncul sebagai literal di daftar model_sizes server.
+    for name in items:
+        assert f'"{name}"' in backend_src, f"model '{name}' tidak ada di WhisperLive model_sizes"
+
+    assert "large" not in items  # "large" polos gagal dimuat
+    assert "large-v3" in items and "medium" in items
+
+
+def test_model_default_is_medium(qapp) -> None:
+    dlg = SettingsDialog(options=UiOptions(model="medium"))
+    assert dlg.model_select.currentText() == "medium"
+
+
 def test_explicit_device_selection_round_trips(qapp) -> None:
     dlg = SettingsDialog(options=UiOptions())
     if dlg.mic_select.count() < 2:

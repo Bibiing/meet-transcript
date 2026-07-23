@@ -70,6 +70,57 @@ def test_check_microphone_passes_device_to_opener() -> None:
     assert seen["device"] == 3
 
 
+# Regresi bug #1: id device string ("3") harus diperlakukan sebagai INDEKS int,
+# bukan pola nama, agar health check tidak keliru melaporkan mikrofon tak siap.
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        ("3", 3),
+        (" 7 ", 7),
+        (0, 0),
+        (5, 5),
+        (None, None),
+        ("Headset Mic", "Headset Mic"),
+        ("", ""),
+    ],
+)
+def test_as_sd_device_normalizes_numeric_string_to_index(value, expected) -> None:
+    from src.permissions import _as_sd_device
+
+    assert _as_sd_device(value) == expected
+
+
+def test_default_opener_opens_numeric_string_as_int_index() -> None:
+    import src.permissions as permissions
+
+    captured = {}
+
+    class _DummyStream:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class _DummySD:
+        def InputStream(self, device, channels):  # noqa: N802 (API sounddevice)
+            captured["device"] = device
+            return _DummyStream()
+
+    import sys as _sys
+
+    prev = _sys.modules.get("sounddevice")
+    _sys.modules["sounddevice"] = _DummySD()
+    try:
+        permissions._default_opener("3")
+    finally:
+        if prev is not None:
+            _sys.modules["sounddevice"] = prev
+        else:
+            _sys.modules.pop("sounddevice", None)
+    assert captured["device"] == 3
+
+
 # Klasifikasi panduan ------------------------------------------------------
 def test_guidance_none_when_accessible_and_privacy_allowed() -> None:
     access = MicrophoneAccess(accessible=True, privacy=PRIVACY_ALLOWED)

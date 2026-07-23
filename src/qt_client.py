@@ -137,7 +137,13 @@ class SettingsDialog(QtWidgets.QDialog):
         self.mic_select = QtWidgets.QComboBox()
         self.spk_select = QtWidgets.QComboBox()
         self.model_select = QtWidgets.QComboBox()
-        self.model_select.addItems(["tiny", "base", "small", "medium", "large"])
+        # Nama model WAJIB cocok dengan daftar tervalidasi server WhisperLive
+        # (faster_whisper_backend.model_sizes). "large" polos tidak ada di sana dan
+        # gagal dimuat; gunakan nama eksplisit (large-v2/large-v3/...). Varian .en dan
+        # distil-* sengaja tidak disertakan karena English-only (aplikasi ini id).
+        self.model_select.addItems(
+            ["tiny", "base", "small", "medium", "large-v2", "large-v3", "large-v3-turbo", "turbo"]
+        )
         self.lang_select = QtWidgets.QComboBox()
         self.lang_select.addItems(["id", "en"])
         self.llm_api_key = QtWidgets.QLineEdit()
@@ -725,6 +731,9 @@ class CompactWidget(QtWidgets.QWidget):
         self._mic_not_ready_reason = ""
         # Menampilkan riwayat di window utama (bukan window baru): tangguhkan render live.
         self._viewing_history = False
+        # Entri riwayat yang sedang ditampilkan; jadi sumber Export saat mode riwayat
+        # (bukan log transkrip live) agar isi yang diekspor = yang tampil di layar.
+        self._history_entries: list = []
 
         self.setObjectName("MainWindow")
 
@@ -1218,6 +1227,7 @@ class CompactWidget(QtWidgets.QWidget):
         dengan live view. Mulai rekaman baru mengembalikan tampilan ke live.
         """
         self._viewing_history = True
+        self._history_entries = list(entries)
         self.preview.setHtml(_entries_to_html(entries))
         scrollbar = self.preview.verticalScrollBar()
         if scrollbar:
@@ -1494,8 +1504,12 @@ class CompactWidget(QtWidgets.QWidget):
 
     def export_transcript(self):
         try:
-            data = transcript_payload()
-            entries = data.get("entries", [])
+            # Mode riwayat: ekspor entri yang sedang ditampilkan, bukan log live
+            # (yang mungkin kosong atau berisi sesi lain).
+            if self._viewing_history:
+                entries = self._history_entries
+            else:
+                entries = transcript_payload().get("entries", [])
             if not entries:
                 QtWidgets.QMessageBox.information(self, "No transcript", "No transcript data to export.")
                 return

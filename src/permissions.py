@@ -109,11 +109,29 @@ def microphone_privacy_indicator(reader: Callable[[str], Optional[str]] | None =
     return PRIVACY_UNKNOWN
 
 
+def _as_sd_device(device: Any) -> Any:
+    """Normalisasi id device untuk sounddevice: string angka -> int indeks.
+
+    UI menyimpan id device sebagai `str(index)` (mis. "3"). sounddevice menafsirkan
+    string sebagai POLA NAMA device, bukan indeks, sehingga "3" gagal/salah cocok dan
+    membuat health check keliru melaporkan mikrofon tak siap. Subsistem capture sudah
+    mengonversi ke int (main._device_arg); pengecekan izin harus konsisten.
+    """
+    if isinstance(device, str):
+        text = device.strip()
+        if text:
+            try:
+                return int(text)
+            except ValueError:
+                return text
+    return device
+
+
 def _default_opener(device: Any) -> None:
     """Buka-tutup stream input singkat: membuktikan device benar-benar dapat dipakai."""
     import sounddevice as sd
 
-    with sd.InputStream(device=device, channels=1):
+    with sd.InputStream(device=_as_sd_device(device), channels=1):
         pass
 
 

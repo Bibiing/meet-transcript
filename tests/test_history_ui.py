@@ -51,6 +51,44 @@ def test_show_history_entries_renders_in_main_window(qapp):
     assert "halo pembicara" in html and "[Speaker]" in html
 
 
+# Regresi bug #3: saat mode riwayat, Export harus memakai entri yang ditampilkan,
+# bukan log transkrip live (yang bisa kosong -> "No transcript to export").
+def test_export_uses_history_entries_when_viewing_history(qapp, monkeypatch):
+    w = qt.CompactWidget()
+    w.show_history_entries([{"source": "mic", "text": "isi riwayat"}])
+
+    # Log live kosong: tanpa fix, export akan gagal mendeteksi transkrip.
+    monkeypatch.setattr(qt, "transcript_payload", lambda: {"entries": []})
+    monkeypatch.setattr(
+        qt.QtWidgets.QFileDialog, "getSaveFileName",
+        staticmethod(lambda *a, **k: ("C:/tmp/out.pdf", "PDF (*.pdf)")),
+    )
+    monkeypatch.setattr(qt.QtWidgets.QMessageBox, "information", staticmethod(lambda *a, **k: None))
+    monkeypatch.setattr(qt.QtWidgets.QMessageBox, "warning", staticmethod(lambda *a, **k: None))
+
+    captured = {}
+    monkeypatch.setattr(qt, "_export_transcript_pdf", lambda path, entries: captured.update(entries=entries))
+
+    w.export_transcript()
+    assert captured.get("entries") == [{"source": "mic", "text": "isi riwayat"}]
+
+
+def test_export_uses_live_payload_when_not_viewing_history(qapp, monkeypatch):
+    w = qt.CompactWidget()
+    assert w._viewing_history is False
+    monkeypatch.setattr(qt, "transcript_payload", lambda: {"entries": [{"source": "mic", "text": "live"}]})
+    monkeypatch.setattr(
+        qt.QtWidgets.QFileDialog, "getSaveFileName",
+        staticmethod(lambda *a, **k: ("C:/tmp/out.pdf", "PDF (*.pdf)")),
+    )
+    monkeypatch.setattr(qt.QtWidgets.QMessageBox, "information", staticmethod(lambda *a, **k: None))
+    captured = {}
+    monkeypatch.setattr(qt, "_export_transcript_pdf", lambda path, entries: captured.update(entries=entries))
+
+    w.export_transcript()
+    assert captured.get("entries") == [{"source": "mic", "text": "live"}]
+
+
 def test_refresh_does_not_overwrite_history_view(qapp):
     w = qt.CompactWidget()
     w.show_history_entries([{"source": "mic", "text": "riwayat"}])
