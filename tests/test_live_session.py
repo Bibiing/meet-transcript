@@ -252,3 +252,54 @@ def _wait_for(predicate, timeout_seconds: float = 2.0) -> bool:
             return True
         time.sleep(0.01)
     return predicate()
+
+
+# Regresi: perintah `stop` dari parent harus memicu jalur berhenti yang SAMA
+# dengan SIGINT (set stop_event), sehingga blok finalisasi — END_OF_AUDIO +
+# flush merger — tetap dijalankan. Pada aplikasi paket (tanpa console) inilah
+# satu-satunya jalur graceful; tanpanya transcript penutup hilang.
+def test_command_reader_stop_command_sets_stop_event(monkeypatch) -> None:
+    import io
+
+    from src.utils.status_ipc import format_command_line
+    from src.whisper import session
+
+    monkeypatch.setattr(session.sys, "stdin", io.StringIO(format_command_line("stop")))
+    stop_event = threading.Event()
+
+    session._command_reader_thread(stop_event)
+
+    assert stop_event.is_set() is True
+
+
+def test_command_reader_ignores_unknown_command(monkeypatch) -> None:
+    import io
+
+    from src.utils.status_ipc import format_command_line
+    from src.whisper import session
+
+    monkeypatch.setattr(session.sys, "stdin", io.StringIO(format_command_line("bogus")))
+    stop_event = threading.Event()
+
+    session._command_reader_thread(stop_event)
+
+    assert stop_event.is_set() is False
+
+
+def test_command_reader_still_handles_set_mute(monkeypatch) -> None:
+    import io
+
+    from src.utils.status_ipc import format_command_line
+    from src.whisper import session
+
+    monkeypatch.setattr(
+        session.sys, "stdin",
+        io.StringIO(format_command_line("set_mute", source="mic", muted=True)),
+    )
+    stop_event = threading.Event()
+    try:
+        session._command_reader_thread(stop_event)
+        assert session._is_source_muted("mic") is True
+        assert stop_event.is_set() is False
+    finally:
+        session._set_source_muted("mic", False)

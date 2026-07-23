@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import threading
 import time
@@ -24,11 +25,38 @@ from src.utils.os_detector import AudioBackend
 from src.utils.status_ipc import format_status_line
 
 
+class _FakeStdin:
+    """Pipe stdin tiruan; merekam perintah yang ditulis parent ke subprocess."""
+
+    def __init__(self, *, fail: bool = False) -> None:
+        self.writes: list[str] = []
+        self.flushed = False
+        self._fail = fail
+
+    def write(self, data: str) -> int:
+        if self._fail:
+            raise OSError("broken pipe")
+        self.writes.append(data)
+        return len(data)
+
+    def flush(self) -> None:
+        self.flushed = True
+
+
 class _FakeProcess:
     """Popen tiruan deterministik untuk menguji jalur stop tanpa proses nyata."""
 
-    def __init__(self, *, pid: int = 4321, exit_on_wait: bool = True, exit_after_terminate: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        pid: int = 4321,
+        exit_on_wait: bool = True,
+        exit_after_terminate: bool = True,
+        stdin: "_FakeStdin | None" = -1,  # type: ignore[assignment]
+    ) -> None:
         self.pid = pid
+        # Popen selalu punya atribut stdin (pipe atau None); tiruan harus setia.
+        self.stdin = _FakeStdin() if stdin == -1 else stdin
         self._alive = True
         self.terminated = False
         self.killed = False
@@ -88,6 +116,62 @@ def test_stop_live_waits_full_drain_budget_and_avoids_terminate(reset_state) -> 
     # Proses exit graceful dalam anggaran => tidak ada hard kill.
     assert proc.terminated is False
     assert proc.killed is False
+
+
+# Regresi: pada aplikasi paket (--windows-console-mode=disable) tidak ada console,
+# sehingga CTRL_BREAK_EVENT gagal dan stop selalu jatuh ke TerminateProcess —
+# finalisasi (END_OF_AUDIO + flush merger) tak pernah jalan dan transcript
+# penutup hilang. Stop WAJIB lewat kanal stdin lebih dulu.
+def test_stop_live_requests_graceful_stop_via_stdin(reset_state, monkeypatch) -> None:
+    from src.utils.status_ipc import parse_command_line
+
+    kills: list[int] = []
+    monkeypatch.setattr(engine.os, "kill", lambda pid, sig: kills.append(sig))
+
+    proc = _FakeProcess(exit_on_wait=True)
+    with STATE.lock:
+        STATE.process = proc
+
+    stop_live()
+
+    assert proc.stdin is not None
+    assert proc.stdin.writes, "perintah stop tidak dikirim lewat stdin"
+    assert parse_command_line(proc.stdin.writes[-1])[0] == "stop"
+    assert proc.stdin.flushed is True
+    # stdin berhasil => tidak perlu console control event, dan tidak ada hard kill.
+    assert kills == []
+    assert proc.terminated is False
+    assert proc.killed is False
+
+
+def test_stop_live_falls_back_to_console_signal_when_stdin_missing(reset_state, monkeypatch) -> None:
+    kills: list[int] = []
+    monkeypatch.setattr(engine.os, "kill", lambda pid, sig: kills.append(sig))
+
+    proc = _FakeProcess(exit_on_wait=True, stdin=None)
+    with STATE.lock:
+        STATE.process = proc
+
+    stop_live()
+
+    if os.name == "nt":
+        assert kills, "fallback sinyal console tidak dijalankan"
+    assert proc.terminated is False
+
+
+def test_stop_live_falls_back_when_stdin_write_fails(reset_state, monkeypatch) -> None:
+    kills: list[int] = []
+    monkeypatch.setattr(engine.os, "kill", lambda pid, sig: kills.append(sig))
+
+    proc = _FakeProcess(exit_on_wait=True, stdin=_FakeStdin(fail=True))
+    with STATE.lock:
+        STATE.process = proc
+
+    stop_live()
+
+    if os.name == "nt":
+        assert kills, "pipe rusak harus jatuh ke sinyal console"
+    assert proc.terminated is False
 
 
 def test_stop_live_terminates_hung_process_as_backstop(reset_state) -> None:

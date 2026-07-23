@@ -363,6 +363,27 @@ def start_live(options: UiOptions) -> dict[str, Any]:
     return STATE.snapshot()
 
 
+def _request_stop_via_stdin(process: subprocess.Popen) -> bool:
+    """Minta subprocess berhenti graceful lewat kanal perintah stdin.
+
+    Kanal yang sama dipakai set_mute, jadi terbukti bekerja pada aplikasi paket.
+    Mengembalikan False bila pipe tidak tersedia/gagal ditulis, sehingga pemanggil
+    dapat jatuh ke jalur sinyal console lalu terminate().
+    """
+    with STATE.lock:
+        if process.stdin is None:
+            STATE.append_log("stop via stdin unavailable: no stdin pipe")
+            return False
+        try:
+            process.stdin.write(format_command_line("stop"))
+            process.stdin.flush()
+        except (OSError, ValueError) as exc:
+            STATE.append_log(f"stop via stdin failed: {exc}")
+            return False
+        STATE.append_log("Stop requested via stdin command")
+        return True
+
+
 def stop_live(*, force: bool = False, wait_timeout_seconds: float | None = None) -> dict[str, Any]:
     with STATE.lock:
         process = STATE.process
@@ -383,14 +404,22 @@ def stop_live(*, force: bool = False, wait_timeout_seconds: float | None = None)
         process.terminate()
         return STATE.snapshot()
 
-    try:
-        if os.name == "nt":
-            os.kill(process.pid, signal.CTRL_BREAK_EVENT)  # type: ignore[attr-defined]
-        else:
-            process.send_signal(signal.SIGINT)
-    except Exception as exc:
-        STATE.append_log(f"graceful stop failed, terminating process: {exc}")
-        process.terminate()
+    # Stop berjenjang. Perintah stdin didahulukan karena merupakan satu-satunya
+    # jalur yang bekerja pada aplikasi paket: build GUI memakai
+    # --windows-console-mode=disable sehingga proses TIDAK punya console, dan
+    # GenerateConsoleCtrlEvent (CTRL_BREAK_EVENT) gagal. Tanpa ini stop selalu
+    # jatuh ke terminate() = TerminateProcess, yang mematikan subprocess seketika
+    # sehingga blok finalisasi (END_OF_AUDIO + flush merger) tidak pernah jalan
+    # dan transcript penutup hilang.
+    if not _request_stop_via_stdin(process):
+        try:
+            if os.name == "nt":
+                os.kill(process.pid, signal.CTRL_BREAK_EVENT)  # type: ignore[attr-defined]
+            else:
+                process.send_signal(signal.SIGINT)
+        except Exception as exc:
+            STATE.append_log(f"graceful stop failed, terminating process: {exc}")
+            process.terminate()
 
     try:
         process.wait(timeout=wait_timeout_seconds)

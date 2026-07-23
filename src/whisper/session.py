@@ -147,6 +147,12 @@ def _command_reader_thread(stop_event: threading.Event) -> None:
     Baris non-perintah diabaikan; kegagalan apa pun hanya menghentikan pembaca
     tanpa memengaruhi sesi (graceful degradation: mute berhenti bekerja, sesi
     tetap jalan).
+
+    Perintah `stop` menyetel stop_event — jalur berhenti yang sama dengan SIGINT,
+    sehingga blok finalisasi (END_OF_AUDIO + flush merger) tetap dijalankan.
+    Dibutuhkan karena aplikasi paket tidak punya console, sehingga parent tidak
+    dapat mengirim CTRL_BREAK_EVENT dan terpaksa memakai TerminateProcess yang
+    membuang transcript penutup.
     """
     try:
         for line in sys.stdin:
@@ -156,6 +162,11 @@ def _command_reader_thread(stop_event: threading.Event) -> None:
             if parsed is None:
                 continue
             cmd, payload = parsed
+            if cmd == "stop":
+                log_process_event("client.stop_command_received")
+                _log.info("whisperlive session: stop command received via stdin")
+                stop_event.set()
+                return
             if cmd != "set_mute":
                 continue
             source = payload.get("source")

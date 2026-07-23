@@ -4,6 +4,7 @@ import os
 import sys
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Optional
 import json
@@ -120,7 +121,7 @@ class SettingsDialog(QtWidgets.QDialog):
         self.setWindowTitle("Settings")
         self.setWindowIcon(load_icon("apps.png"))
         self.setModal(True)
-        self.resize(520, 320)
+        self.resize(520, 360)
         self.setSizeGripEnabled(True)
         self.is_production = is_production_build()
         self.debug_enabled = should_enable_debug_features()
@@ -134,6 +135,11 @@ class SettingsDialog(QtWidgets.QDialog):
 
         # General layout - tampilan utama yang sederhana
         g_layout = QtWidgets.QFormLayout()
+        g_layout.setHorizontalSpacing(20)  # Jarak antara label dan inputan
+        g_layout.setVerticalSpacing(12)    # Jarak antar baris agar tidak terlalu rapat
+        # -------------------------------
+        
+        self.mic_select = QtWidgets.QComboBox()
         self.mic_select = QtWidgets.QComboBox()
         self.spk_select = QtWidgets.QComboBox()
         self.model_select = QtWidgets.QComboBox()
@@ -164,114 +170,149 @@ class SettingsDialog(QtWidgets.QDialog):
         self.version_label = QtWidgets.QLabel(app_version())
         self.version_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
         self.version_label.setToolTip("Versi aplikasi yang terpasang")
-        g_layout.addRow("Version:", self.version_label)
         g_layout.addRow("LLM API Key:", self.llm_api_key)
+        g_layout.addRow("Version:", self.version_label)
 
         self.general.setLayout(g_layout)
 
-        # Advanced settings (technical)
-        a_layout = QtWidgets.QFormLayout()
+        # Advanced settings.
+        # Prinsip seleksi: sebuah setelan hanya tampil bila (1) pengguna punya
+        # informasi yang tidak dimiliki aplikasi, (2) ada gejala yang dapat ia
+        # amati, dan (3) ia dapat menilai perubahannya membantu. Aplikasi belum
+        # punya metrik akurasi (WER/CER), sehingga knob DSP yang nilainya sudah
+        # dituning TIDAK diekspos — mengubahnya tanpa umpan balik hanya merusak.
+        # Nilai yang tidak tampil tetap dapat diatur lewat app_config.json/env,
+        # dan dibawa utuh oleh to_options().
 
-        # Server host & port - dipindah ke Advanced
+        # --- Kualitas Transkrip -------------------------------------------
+        # vad_threshold dievaluasi di SERVER, dan hanya berlaku pada source yang
+        # penyaringan VAD-nya aktif (default: mikrofon aktif, speaker tidak).
+        self.vad_threshold = QtWidgets.QDoubleSpinBox()
+        self.vad_threshold.setRange(0.0, 1.0)
+        self.vad_threshold.setSingleStep(0.01)
+        self.vad_threshold.setDecimals(2)
+        self.vad_threshold.setValue(0.55)
+        self.vad_threshold_slider = self._make_slider_for(self.vad_threshold)
+
+        quality = self._make_group(
+            "Kualitas Transkrip",
+            "Mempengaruhi seberapa tepat ucapan diubah menjadi teks.",
+        )
+        self._add_row(
+            quality, "Sensitivitas deteksi suara:",
+            self._slider_field(self.vad_threshold_slider, self.vad_threshold, "Sensitif", "Ketat"),
+            "Seberapa keras suara harus terdengar agar dianggap ucapan.\n\n"
+            "Geser ke Sensitif bila suara pelan sering tidak tertangkap.\n"
+            "Geser ke Ketat bila noise ikut tertranskrip.\n"
+            "Berlaku pada mikrofon, tempat penyaringan suara aktif.\n\n"
+        )
+
+        # --- Audio ---------------------------------------------------------
+        # Berjalan di KLIEN sebelum audio dikirim, dan hanya untuk mikrofon
+        # (_build_speaker_preprocess_config mengunci noise_reduction_enabled=False).
+        # Implementasinya noise gate numpy, BUKAN WebRTC APM — nama field
+        # `mic_webrtc_ns` bersifat historis.
+        self.mic_webrtc_ns_cb = QtWidgets.QCheckBox()
+        self.mic_webrtc_ns_cb.setChecked(False)
+
+        audio = self._make_group(
+            "Audio",
+            "Diproses di aplikasi sebelum audio dikirim ke server.",
+        )
+        self._add_row(
+            audio, "Redam noise latar mikrofon:", self.mic_webrtc_ns_cb,
+            "Meredam noise, suara yang lebih pelan dari ambang noise ikut teredam, jadi\n"
+            "matikan bila pembicara yang jauh dari mikrofon jadi terpotong.\n\n"
+            "Hanya berlaku untuk mikrofon, tidak untuk suara speaker."
+            ,
+        )
+
+        # --- Koneksi Server ------------------------------------------------
         self.host_input = QtWidgets.QLineEdit("localhost")
         self.port_input = QtWidgets.QSpinBox()
         self.port_input.setRange(1, 65535)
         self.port_input.setValue(9090)
-        self.host_input.setToolTip("Alamat server transcription (default: localhost)")
-        self.port_input.setToolTip("Port server transcription (1-65535)")
-        a_layout.addRow("Server host:", self.host_input)
-        a_layout.addRow("Server port:", self.port_input)
 
-        # VAD and normalization
-        self.mic_server_vad_cb = QtWidgets.QCheckBox()
-        self.mic_server_vad_cb.setChecked(True)
-        self.speaker_server_vad_cb = QtWidgets.QCheckBox()
-        self.speaker_server_vad_cb.setChecked(False)
-        self.mic_webrtc_ns_cb = QtWidgets.QCheckBox("Enable Mic Noise Suppression (WebRTC APM) [Experimental]")
-        self.mic_webrtc_ns_cb.setChecked(False)
+        conn = self._make_group(
+            "Koneksi Server",
+            "Alamat server transkripsi.",
+        )
+        self._add_row(
+            conn, "Alamat server:", self.host_input,
+            "Nama host atau alamat IP server",
+        )
+        self._add_row(
+            conn, "Port server:", self.port_input,
+            "Port server transkripsi (default 9090)",
+        )
 
-        self.mic_target_rms = QtWidgets.QDoubleSpinBox()
-        self.mic_target_rms.setRange(-60.0, 0.0)
-        self.mic_target_rms.setValue(-20.0)
-        self.mic_max_gain = QtWidgets.QDoubleSpinBox()
-        self.mic_max_gain.setRange(0.0, 60.0)
-        self.mic_max_gain.setValue(18.0)
-
-        self.spk_target_rms = QtWidgets.QDoubleSpinBox()
-        self.spk_target_rms.setRange(-60.0, 0.0)
-        self.spk_target_rms.setValue(-23.0)
-        self.spk_max_gain = QtWidgets.QDoubleSpinBox()
-        self.spk_max_gain.setRange(0.0, 60.0)
-        self.spk_max_gain.setValue(18.0)
-
-        # VAD thresholds
-        self.vad_threshold = QtWidgets.QDoubleSpinBox()
-        self.vad_threshold.setRange(0.0, 1.0)
-        self.vad_threshold.setSingleStep(0.01)
-        self.vad_threshold.setValue(0.55)
-
-        self.no_speech_thresh = QtWidgets.QDoubleSpinBox()
-        self.no_speech_thresh.setRange(0.0, 1.0)
-        self.no_speech_thresh.setSingleStep(0.01)
-        self.no_speech_thresh.setValue(0.75)
-
-        self.speech_boundary_silence = QtWidgets.QDoubleSpinBox()
-        self.speech_boundary_silence.setRange(0.0, 10.0)
-        self.speech_boundary_silence.setValue(0.8)
-        self.speech_boundary_max_wait = QtWidgets.QDoubleSpinBox()
-        self.speech_boundary_max_wait.setRange(0.0, 30.0)
-        self.speech_boundary_max_wait.setValue(5.0)
-
-        # Debug/archive - hanya tampilkan di development
+        # --- Diagnostik (development saja) ---------------------------------
         self.debug_chunk_archive_cb = QtWidgets.QCheckBox()
         self.rolling_audio_archive_cb = QtWidgets.QCheckBox()
         self.rolling_audio_segment = QtWidgets.QSpinBox()
         self.rolling_audio_segment.setRange(1, 3600)
+        self.rolling_audio_segment.setSuffix(" detik")
         self.rolling_audio_segment.setValue(60)
-
-        # Log level - hanya tampilkan di development
         self.log_level = QtWidgets.QComboBox()
         self.log_level.addItems(["DEBUG", "INFO", "WARNING", "ERROR"])
 
-        # Tooltip untuk parameter teknis
-        self.mic_server_vad_cb.setToolTip("Aktifkan Voice Activity Detection di server untuk audio mikrofon")
-        self.speaker_server_vad_cb.setToolTip("Aktifkan Voice Activity Detection di server untuk audio speaker")
-        self.mic_webrtc_ns_cb.setToolTip(
-            "Dapat meredam desis latar belakang (hum/hiss) pada mikrofon, namun berpotensi mengubah karakteristik suara. "
-            "Lakukan tes performa jika akurasi transkripsi menurun."
-        )
-        self.mic_target_rms.setToolTip("Target volume (RMS) mikrofon setelah normalisasi, dalam dB")
-        self.mic_max_gain.setToolTip("Batas maksimal penguatan (gain) yang diterapkan pada mikrofon")
-        self.spk_target_rms.setToolTip("Target volume (RMS) speaker setelah normalisasi, dalam dB")
-        self.spk_max_gain.setToolTip("Batas maksimal penguatan (gain) yang diterapkan pada speaker")
-        self.vad_threshold.setToolTip("Ambang sensitivitas deteksi suara (0-1). Semakin tinggi, semakin ketat")
-        self.no_speech_thresh.setToolTip("Ambang probabilitas untuk menganggap segmen sebagai 'tidak ada suara'")
-        self.speech_boundary_silence.setToolTip("Durasi hening (detik) sebelum segmen ucapan dianggap selesai")
-        self.speech_boundary_max_wait.setToolTip("Waktu tunggu maksimum (detik) sebelum segmen dipotong paksa")
-        self.debug_chunk_archive_cb.setToolTip("Simpan potongan audio mentah untuk keperluan debugging")
-        self.rolling_audio_archive_cb.setToolTip("Simpan rekaman audio berkelanjutan ke disk")
-        self.rolling_audio_segment.setToolTip("Panjang tiap segmen arsip audio berkelanjutan, dalam detik")
-        self.log_level.setToolTip("Tingkat detail log aplikasi")
-
-        a_layout.addRow("Mic server VAD:", self.mic_server_vad_cb)
-        a_layout.addRow("Speaker server VAD:", self.speaker_server_vad_cb)
-        a_layout.addRow(self.mic_webrtc_ns_cb)
-        a_layout.addRow("Mic target RMS (dB):", self.mic_target_rms)
-        a_layout.addRow("Mic max gain (dB):", self.mic_max_gain)
-        a_layout.addRow("Speaker target RMS (dB):", self.spk_target_rms)
-        a_layout.addRow("Speaker max gain (dB):", self.spk_max_gain)
-        a_layout.addRow("VAD threshold:", self.vad_threshold)
-        a_layout.addRow("No-speech threshold:", self.no_speech_thresh)
-        a_layout.addRow("Speech boundary silence (s):", self.speech_boundary_silence)
-        a_layout.addRow("Speech boundary max wait (s):", self.speech_boundary_max_wait)
-
-        # Debug features hanya di development
+        diag = None
         if self.debug_enabled:
-            a_layout.addRow("Debug chunk archive:", self.debug_chunk_archive_cb)
-            a_layout.addRow("Rolling audio archive:", self.rolling_audio_archive_cb)
-            a_layout.addRow("Rolling audio segment (s):", self.rolling_audio_segment)
-            a_layout.addRow("Log level:", self.log_level)
-        
+            diag = self._make_group(
+                "Diagnostik",
+                "Hanya untuk pengembangan dan investigasi masalah.",
+            )
+            self._add_row(
+                diag, "Simpan potongan audio:", self.debug_chunk_archive_cb,
+                "Menyimpan tiap potongan audio mentah ke disk untuk debugging.\n"
+                "Memakan ruang disk besar.",
+            )
+            self._add_row(
+                diag, "Simpan rekaman berkelanjutan:", self.rolling_audio_archive_cb,
+                "Menyimpan audio sesi secara berkelanjutan ke disk.",
+            )
+            self._add_row(
+                diag, "Panjang tiap segmen rekaman:", self.rolling_audio_segment,
+                "Panjang tiap berkas arsip audio berkelanjutan.",
+            )
+            self._add_row(
+                diag, "Tingkat detail log:", self.log_level,
+                "Makin detail makin besar berkas log.\nProduksi memakai WARNING.",
+            )
+
+        self.reset_defaults_btn = QtWidgets.QPushButton("Default")
+        self.reset_defaults_btn.setToolTip(
+            "Kembalikan setelan ke nilai bawaan aplikasi.\n"
+            "Alamat server dan perangkat audio tidak diubah."
+        )
+        self.reset_defaults_btn.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
+        self.reset_defaults_btn.clicked.connect(self._reset_advanced_defaults)
+
+        inner = QtWidgets.QWidget()
+        inner.setObjectName("AdvancedContent")
+        inner_layout = QtWidgets.QVBoxLayout(inner)
+        inner_layout.setContentsMargins(4, 4, 4, 16)
+        inner_layout.addWidget(quality)
+        inner_layout.addWidget(audio)
+        inner_layout.addWidget(conn)
+        if diag is not None:
+            inner_layout.addWidget(diag)
+        inner_layout.addSpacing(10)
+        reset_row = QtWidgets.QHBoxLayout()
+        reset_row.addStretch(1)
+        reset_row.addWidget(self.reset_defaults_btn)
+        inner_layout.addLayout(reset_row)
+        inner_layout.addStretch(1)
+
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidget(inner)
+
+        a_layout = QtWidgets.QVBoxLayout()
+        a_layout.setContentsMargins(0, 0, 0, 0)
+        a_layout.addWidget(scroll)
         self.advanced.setLayout(a_layout)
 
         btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
@@ -295,10 +336,189 @@ class SettingsDialog(QtWidgets.QDialog):
         main.addWidget(btns)
         self.setLayout(main)
 
+        # Keterangan pendukung dibedakan secara visual dari label setelan agar
+        # terbaca sebagai penjelasan, bukan sebagai kontrol.
+        self.setStyleSheet(f"""
+            QLabel#AdvancedNotice {{
+                background-color: {SECONDARY};
+                border: 1px solid {BORDER};
+                border-radius: 6px;
+                padding: 8px;
+                color: {TEXT};
+            }}
+            QLabel#GroupHint {{
+                color: #64748B;
+                font-size: 11px;
+                padding-bottom: 4px;
+            }}
+            QLabel#SliderEnd {{
+                color: #64748B;
+                font-size: 10px;
+            }}
+            QGroupBox {{
+                font-weight: 600;
+                border: 1px solid {BORDER};
+                border-radius: 6px;
+                margin-top: 10px;
+                padding-top: 10px;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 4px;
+            }}
+            QScrollArea {{
+                background-color: transparent;
+            }}
+            QWidget#AdvancedContent {{
+                background-color: transparent;
+               
+            }}
+            QLabel#AdvancedNotice {{
+                background-color: {SECONDARY};
+                border: 1px solid {BORDER};
+                border-radius: 6px;
+                padding: 8px;
+                color: {TEXT};
+            }}
+        """)
+
         self.reload_devices()
-        
+
+        # Simpan opsi sumber agar to_options() MEMPERTAHANKAN field yang tidak
+        # diwakili UI. Tanpa ini, menyimpan Settings mengembalikan setiap field
+        # tak terekspos ke default dataclass secara diam-diam — dan kini mayoritas
+        # field memang sengaja tidak diekspos.
+        self._source_options = options or UiOptions()
         if options:
             self.load_options(options)
+
+    def _make_group(self, title: str, description: str = "") -> QtWidgets.QGroupBox:
+        """Kotak setelan bertema dengan keterangan singkat di atas isinya."""
+        box = QtWidgets.QGroupBox(title)
+        outer = QtWidgets.QVBoxLayout(box)
+
+        form = QtWidgets.QFormLayout()
+        form.setHorizontalSpacing(20)  # Jarak antara label dan inputan
+        form.setVerticalSpacing(12)    # Jarak antar baris
+
+        if description:
+            hint = QtWidgets.QLabel(description)
+            hint.setWordWrap(True)
+            hint.setObjectName("GroupHint")
+            form.addRow(hint)
+
+        form.setFieldGrowthPolicy(
+            QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
+        )
+        
+        outer.addLayout(form)
+        box.form = form  # type: ignore[attr-defined]
+        return box
+
+    def _add_row(
+        self,
+        group: QtWidgets.QGroupBox,
+        label: str,
+        widget: QtWidgets.QWidget,
+        tooltip: str = "",
+    ) -> QtWidgets.QLabel:
+        """Tambah satu baris setelan; tooltip dipasang pada label DAN field.
+
+        Label ikut diberi tooltip karena pengguna cenderung mengarahkan kursor ke
+        teksnya, bukan ke kotak isian — tooltip yang hanya menempel di field
+        sering tidak pernah terlihat.
+        """
+        lbl = QtWidgets.QLabel(label)
+        # lbl.setWordWrap(True)
+        if tooltip:
+            lbl.setToolTip(tooltip)
+            widget.setToolTip(tooltip)
+            # Field majemuk (slider + kotak angka) adalah pembungkus: tooltip di
+            # pembungkus tidak muncul saat kursor berada di atas kontrol nyatanya.
+            for child in widget.findChildren(QtWidgets.QWidget):
+                child.setToolTip(tooltip)
+        group.form.addRow(lbl, widget)  # type: ignore[attr-defined]
+        return lbl
+
+    def _make_slider_for(self, spin: QtWidgets.QDoubleSpinBox) -> QtWidgets.QSlider:
+        """Slider yang tersinkron dua arah dengan sebuah spinbox desimal.
+
+        Slider memberi POSISI RELATIF terhadap rentang — informasi yang tidak
+        terbaca dari angka telanjang — sementara spinbox tetap ada untuk nilai
+        persis. Keduanya wajib selalu menampilkan nilai sama, jadi pembaruan
+        dijaga flag agar tidak saling memicu tanpa henti.
+        """
+        steps = int(round((spin.maximum() - spin.minimum()) / spin.singleStep()))
+        slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        slider.setRange(0, max(1, steps))
+        slider.setPageStep(max(1, steps // 10))
+        self._slider_syncing = False
+
+        def to_slider(value: float) -> None:
+            if self._slider_syncing:
+                return
+            self._slider_syncing = True
+            slider.setValue(int(round((value - spin.minimum()) / spin.singleStep())))
+            self._slider_syncing = False
+
+        def to_spin(position: int) -> None:
+            if self._slider_syncing:
+                return
+            self._slider_syncing = True
+            spin.setValue(spin.minimum() + position * spin.singleStep())
+            self._slider_syncing = False
+
+        spin.valueChanged.connect(to_slider)
+        slider.valueChanged.connect(to_spin)
+        to_slider(spin.value())
+        return slider
+
+    def _slider_field(
+        self,
+        slider: QtWidgets.QSlider,
+        spin: QtWidgets.QDoubleSpinBox,
+        low_label: str,
+        high_label: str,
+    ) -> QtWidgets.QWidget:
+        """Bungkus slider + spinbox + penanda arah efek menjadi satu field.
+
+        Penanda ujung ("Sensitif ... Ketat") membuat arah efek terbaca langsung,
+        tanpa pengguna harus membuka tooltip lebih dulu.
+        """
+        holder = QtWidgets.QWidget()
+        outer = QtWidgets.QVBoxLayout(holder)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(2)
+
+        row = QtWidgets.QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        spin.setMaximumWidth(90)
+        row.addWidget(slider, 1)
+        row.addWidget(spin, 0)
+        outer.addLayout(row)
+
+        ends = QtWidgets.QHBoxLayout()
+        ends.setContentsMargins(0, 0, 0, 0)
+        low = QtWidgets.QLabel(low_label)
+        low.setObjectName("SliderEnd")
+        high = QtWidgets.QLabel(high_label)
+        high.setObjectName("SliderEnd")
+        ends.addWidget(low)
+        ends.addStretch(1)
+        ends.addWidget(high)
+        outer.addLayout(ends)
+        return holder
+
+    def _reset_advanced_defaults(self) -> None:
+        """Kembalikan setelan lanjutan ke default aplikasi.
+
+        Alamat server dan perangkat audio sengaja TIDAK diubah: keduanya hasil
+        penyiapan lingkungan, bukan tuning kualitas.
+        """
+        d = UiOptions()
+        self.vad_threshold.setValue(d.vad_threshold)
+        self.mic_webrtc_ns_cb.setChecked(d.mic_webrtc_ns)
 
     def reload_devices(self):
         try:
@@ -347,18 +567,12 @@ class SettingsDialog(QtWidgets.QDialog):
         if idx >= 0:
             self.model_select.setCurrentIndex(idx)
             
-        self.mic_server_vad_cb.setChecked(opts.mic_server_vad)
-        self.speaker_server_vad_cb.setChecked(opts.speaker_server_vad)
-        self.mic_webrtc_ns_cb.setChecked(opts.mic_webrtc_ns)
-        self.mic_target_rms.setValue(opts.mic_target_rms_db)
-        self.mic_max_gain.setValue(opts.mic_max_normalization_gain_db)
-        self.spk_target_rms.setValue(opts.speaker_target_rms_db)
-        self.spk_max_gain.setValue(opts.speaker_max_normalization_gain_db)
+        # Hanya setelan yang benar-benar tampil di Advanced. Sisanya dibawa utuh
+        # oleh to_options() dari opsi sumber.
         self.vad_threshold.setValue(opts.vad_threshold)
-        self.no_speech_thresh.setValue(opts.no_speech_thresh)
-        self.speech_boundary_silence.setValue(opts.speech_boundary_silence_seconds)
-        self.speech_boundary_max_wait.setValue(opts.speech_boundary_max_wait_seconds)
-        
+        self.mic_webrtc_ns_cb.setChecked(opts.mic_webrtc_ns)
+
+
         # Debug features hanya ada di development mode
         if self.debug_enabled:
             self.debug_chunk_archive_cb.setChecked(opts.debug_chunk_archive)
@@ -369,7 +583,10 @@ class SettingsDialog(QtWidgets.QDialog):
                 self.log_level.setCurrentIndex(idx)
 
     def to_options(self) -> UiOptions:
-        opts = UiOptions()
+        # Mulai dari SALINAN opsi sumber, bukan UiOptions() kosong: field yang
+        # tidak diwakili UI (use_tls, hotwords, knob DSP, parameter reconnect)
+        # harus dipertahankan, bukan dikembalikan ke default secara diam-diam.
+        opts = replace(self._source_options)
         opts.host = self.host_input.text().strip() or "localhost"
         opts.port = int(self.port_input.value())
         opts.mic_device = self.mic_select.currentData()
@@ -377,18 +594,11 @@ class SettingsDialog(QtWidgets.QDialog):
         opts.language = str(self.lang_select.currentText())
         opts.model = str(self.model_select.currentText())
         
-        opts.mic_server_vad = self.mic_server_vad_cb.isChecked()
-        opts.speaker_server_vad = self.speaker_server_vad_cb.isChecked()
-        opts.mic_webrtc_ns = self.mic_webrtc_ns_cb.isChecked()
-        opts.mic_target_rms_db = self.mic_target_rms.value()
-        opts.mic_max_normalization_gain_db = self.mic_max_gain.value()
-        opts.speaker_target_rms_db = self.spk_target_rms.value()
-        opts.speaker_max_normalization_gain_db = self.spk_max_gain.value()
+        # Hanya dua setelan lanjutan yang diekspos; sisanya dibawa dari opsi sumber.
         opts.vad_threshold = self.vad_threshold.value()
-        opts.no_speech_thresh = self.no_speech_thresh.value()
-        opts.speech_boundary_silence_seconds = self.speech_boundary_silence.value()
-        opts.speech_boundary_max_wait_seconds = self.speech_boundary_max_wait.value()
-        
+        opts.mic_webrtc_ns = self.mic_webrtc_ns_cb.isChecked()
+
+
         # Debug dan log level hanya ada di development mode
         if self.debug_enabled:
             opts.debug_chunk_archive = self.debug_chunk_archive_cb.isChecked()
